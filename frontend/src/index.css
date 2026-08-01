@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+body {
+  font-family: 'Inter', sans-serif;
+}
+
+:root {
+  --mantine-color-placeholder: #6b7280;
+}
+
+input::placeholder {
+  color: #6b7280 !important;
+  opacity: 1 !important;
+}
+
+.m_8fb7ebe7:focus,
+.m_8fb7ebe7:focus-within {
+  border-width: 2px !important;
+  border-color: #818cf8 !important;
+}
+
+.m_92253aa5[data-checked="true"] {
+  background-color: var(--mantine-color-indigo-9) !important;
+  color: white !important;
+}
+
+

@@ -1,0 +1,6 @@
+# Puts the venv in backend/.venv instead of Poetry's default cached, hashed-name
+# location outside the project. Committed (not global config) so every clone/device
+# gets this automatically on `poetry install` — no need to run
+# `poetry config virtualenvs.in-project true` by hand on each machine.
+[virtualenvs]
+in-project = true

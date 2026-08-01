@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+.pytest_cache/
+**/*.pyc
+*.pyc
+
+# Credentials - NEVER commit
+credentials/
+
+# Spreadsheets - may contain private/real data; use `git add -f` to intentionally commit a test fixture
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.ods
+
+# Environment variables
+.env
+
+# Real seed data (student names/rates, personal calendar IDs) - see initialize_database.example.py for the template
+initialize_database.py
+
+# Database
+*.db
+
+# Distribution
+dist/
+build/
+*.egg-info/

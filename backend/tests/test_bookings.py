@@ -1,0 +1,585 @@
+from unittest.mock import patch, MagicMock
+
+tutor_payload = {"first_name": "Tutor", "last_name": "Test", "pay_rate": 0, "calendar_id": "tutor@calendar.com"}
+
+# Standalone — each POST creates exactly 1 Booking row
+event_type_standalone = {
+    "name": "One-off Session",
+    "duration_minutes": 90,
+    "recurring": False,
+}
+
+# Recurring indefinite (Mode C) — each POST creates 27 rows (week 0..26)
+event_type_recurring = {
+    "name": "Tutoring Session",
+    "duration_minutes": 90,
+    "recurring": True,
+}
+
+event_type_strict_notice = {
+    "name": "Strict Notice Session",
+    "duration_minutes": 90,
+    "recurring": False,
+    # 50M-minute notice: booking in 2099 (~38.4M min away) is always inside the window,
+    # so token endpoints queue a request instead of executing immediately
+    "cancel_mode": "auto_window_request",
+    "cancel_notice_minutes": 50000000,
+    "reschedule_mode": "auto_window_request",
+    "reschedule_notice_minutes": 50000000,
+}
+
+booking_payload = {
+    "tutor_id": None,
+    "event_type_id": None,
+    "start": "2099-06-10T16:00:00",
+    "end": "2099-06-10T17:30:00",
+    "timezone": "America/New_York",
+    "student_first": "Test",
+    "student_last": "Smith",
+    "student_email": "alex@example.com",
+    "student_phone": "555-1234",
+}
+
+reschedule_payload = {
+    "tutor_id": None,
+    "start": "2099-08-10T16:00:00",
+    "end": "2099-08-10T17:30:00",
+    "timezone": "America/New_York",
+}
+
+MOCK_EVENT_ID = "google_event_abc123"
+MOCK_INSTANCE_ID = "google_event_abc123_instance"
+
+
+def mock_calendar_service():
+    svc = MagicMock()
+    svc.events().insert().execute.return_value = {"id": MOCK_EVENT_ID}
+    svc.events().delete().execute.return_value = {}
+    svc.events().patch().execute.return_value = {"id": MOCK_EVENT_ID}
+    svc.events().get().execute.return_value = {"id": MOCK_EVENT_ID, "summary": "old"}
+    svc.events().instances().execute.return_value = {"items": [{"id": MOCK_INSTANCE_ID, "start": {"dateTime": "2099-06-10T20:00:00Z"}, "end": {"dateTime": "2099-06-10T21:30:00Z"}}]}
+    return svc
+
+
+_schedule = {
+    "name": "Default",
+    "is_default": True,
+    "timezone": "America/New_York",
+    "days": [{"day_of_week": 0, "start_time": "09:00:00", "end_time": "17:00:00"}],
+}
+
+
+def make_tutor_with_schedule(client):
+    tutor = client.post("/tutors/", json=tutor_payload).json()
+    schedule = client.post("/schedules/", json={**_schedule, "tutor_id": tutor["id"]}).json()
+    return tutor, [{"tutor_id": tutor["id"], "schedule_id": schedule["id"]}]
+
+
+def setup_standalone(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={**event_type_standalone, "availability": availability}).json()
+    return tutor, event_type
+
+
+def setup_recurring(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={**event_type_recurring, "availability": availability}).json()
+    return tutor, event_type
+
+
+def setup_strict_notice(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={**event_type_strict_notice, "availability": availability}).json()
+    return tutor, event_type
+
+
+# ── CREATE ──────────────────────────────────────────────────────────────────
+
+def test_create_standalone_booking(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 201
+    data = response.json()
+    assert data["student_first"] == "Test"
+    assert data["tutor_id"] == tutor["id"]
+    assert data["google_event_id"] == MOCK_EVENT_ID
+    assert data["series_id"] is None
+    assert data["status"] == "confirmed"
+    assert data["manage_token"] is not None
+    assert data["request"] is None
+
+
+def test_create_recurring_booking_creates_series(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 201
+    data = response.json()
+    assert data["series_id"] is not None
+    assert data["status"] == "confirmed"
+    # Mode C indefinite: 1 row created upfront; chained trigger generates the rest
+    assert len(client.get("/bookings/").json()) == 1
+
+
+def test_create_booking_mode_a_fixed_expiry(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={
+        "name": "Summer Class",
+        "duration_minutes": 60,
+        "recurring": True,
+        "expires_on": "2099-09-01",
+        "availability": availability,
+    }).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 201
+    assert response.json()["series_id"] is not None
+    all_bookings = client.get("/bookings/").json()
+    assert all(b["start"][:10] <= "2099-09-01" for b in all_bookings)
+    assert len(all_bookings) == 12  # Jun 10 .. Aug 26 (12 Tuesdays ≤ Sep 1)
+
+
+def test_create_booking_mode_b_locked(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={
+        "name": "8-Week Course",
+        "duration_minutes": 60,
+        "recurring": True,
+        "recur_weeks": 8,
+        "booker_can_set_recur_until": False,
+        "availability": availability,
+    }).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 201
+    assert len(client.get("/bookings/").json()) == 8  # weeks 0..7
+
+
+def test_create_booking_mode_b_booker_set(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={
+        "name": "Flexible Course",
+        "duration_minutes": 60,
+        "recurring": True,
+        "recur_weeks": 8,
+        "booker_can_set_recur_until": True,
+        "availability": availability,
+    }).json()
+    payload = {
+        **booking_payload,
+        "tutor_id": tutor["id"],
+        "event_type_id": event_type["id"],
+        "recur_until": "2099-07-08",  # Jun 10 + 4 weeks = Jul 8
+    }
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 201
+    assert len(client.get("/bookings/").json()) == 5  # Jun 10, 17, 24, Jul 1, 8
+
+
+def test_create_booking_tutor_not_found(client):
+    _, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": 9999, "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 404
+
+
+def test_create_booking_event_type_not_found(client):
+    tutor, _ = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": 9999}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 404
+
+
+def test_create_booking_tutor_no_calendar(client):
+    tutor = client.post("/tutors/", json={"first_name": "No", "last_name": "Cal", "pay_rate": 0}).json()
+    _, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={**event_type_standalone, "name": "No Cal ET", "availability": availability}).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 400
+
+
+def test_create_booking_no_email(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "student_email": None, "parent_email": None}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 422
+
+
+def test_create_booking_no_phone(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "student_phone": None, "parent_phone": None}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 422
+
+
+def test_create_booking_end_before_start(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "start": "2099-06-10T17:30:00", "end": "2099-06-10T16:00:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 422
+
+
+def test_create_booking_in_past(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "start": "2020-01-01T10:00:00", "end": "2020-01-01T11:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/", json=payload).status_code == 422
+
+
+def test_create_booking_calendar_failure_rolls_back(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    svc = mock_calendar_service()
+    svc.events().insert().execute.side_effect = Exception("Google API down")
+    with patch("routers.bookings.get_calendar_service", return_value=svc):
+        assert client.post("/bookings/", json=payload).status_code == 500
+    assert client.get("/bookings/").json() == []
+
+
+# ── GET ──────────────────────────────────────────────────────────────────────
+
+def test_get_bookings(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+        client.post("/bookings/", json={**payload, "start": "2099-07-10T16:00:00", "end": "2099-07-10T17:30:00"})
+    assert len(client.get("/bookings/").json()) == 2
+
+
+def test_get_booking_by_id(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+    response = client.get(f"/bookings/{created['id']}")
+    assert response.status_code == 200
+    assert response.json()["student_first"] == "Test"
+
+
+def test_get_booking_not_found(client):
+    assert client.get("/bookings/9999").status_code == 404
+
+
+def test_get_bookings_pending_only(client):
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel")
+    assert len(client.get("/bookings/").json()) == 1  # booking still exists (not executed)
+    pending = client.get("/bookings/?pending_only=true").json()
+    assert len(pending) == 1
+    assert pending[0]["request"]["type"] == "cancel_occurrence"
+    assert pending[0]["request"]["status"] == "pending"
+
+
+# ── CANCEL (soft-delete) ──────────────────────────────────────────────────────
+
+def test_cancel_booking(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.delete(f"/bookings/{created['id']}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert client.get(f"/bookings/{created['id']}").json()["status"] == "cancelled"
+
+
+def test_cancel_booking_blocked_not_allowed_policy(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={"name": "No Cancel ET", "duration_minutes": 60, "recurring": False, "cancel_mode": "not_allowed", "availability": availability}).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        assert client.delete(f"/bookings/{created['id']}").status_code == 400
+
+
+def test_cancel_booking_not_found(client):
+    assert client.delete("/bookings/9999").status_code == 404
+
+
+def test_cancel_already_cancelled(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.delete(f"/bookings/{created['id']}")
+        assert client.delete(f"/bookings/{created['id']}").status_code == 400
+
+
+# ── PERMANENT DELETE ──────────────────────────────────────────────────────────
+
+def test_permanent_delete(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.delete(f"/bookings/{created['id']}/permanent")
+    assert response.status_code == 204
+    assert client.get(f"/bookings/{created['id']}").status_code == 404
+
+
+def test_permanent_delete_cascade(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        original = client.post("/bookings/", json=payload).json()
+        rescheduled = client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).json()
+        assert client.delete(f"/bookings/{rescheduled['id']}/permanent").status_code == 409
+        assert client.delete(f"/bookings/{rescheduled['id']}/permanent?cascade=true").status_code == 204
+    assert client.get(f"/bookings/{rescheduled['id']}").status_code == 404
+    assert client.get(f"/bookings/{original['id']}").status_code == 404
+
+
+# ── UPDATE (contact + no-show) ────────────────────────────────────────────────
+
+def test_update_contact(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+    response = client.put(f"/bookings/{created['id']}", json={
+        "student_first": "Test",
+        "student_last": "Smith",
+        "student_email": "new@example.com",
+        "student_phone": "555-9999",
+    })
+    assert response.status_code == 200
+    assert response.json()["student_email"] == "new@example.com"
+
+
+def test_mark_no_show(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+    response = client.put(f"/bookings/{created['id']}", json={
+        "student_first": created["student_first"],
+        "student_last": created["student_last"],
+        "student_email": created["student_email"],
+        "student_phone": created["student_phone"],
+        "is_no_show": True,
+    })
+    assert response.status_code == 200
+    assert response.json()["is_no_show"] is True
+
+
+# ── RESCHEDULE ────────────────────────────────────────────────────────────────
+
+def test_reschedule_standalone(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        original = client.post("/bookings/", json=payload).json()
+        response = client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]})
+    assert response.status_code == 200
+    new_booking = response.json()
+    assert new_booking["status"] == "confirmed"
+    assert new_booking["series_id"] is None
+    original_updated = client.get(f"/bookings/{original['id']}").json()
+    assert original_updated["status"] == "rescheduled"
+    assert original_updated["rescheduled_to"] == new_booking["id"]
+
+
+def test_reschedule_not_found(client):
+    tutor = client.post("/tutors/", json=tutor_payload).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/9999/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 404
+
+
+def test_reschedule_not_confirmed(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        original = client.post("/bookings/", json=payload).json()
+        client.delete(f"/bookings/{original['id']}")
+        assert client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 400
+
+
+def test_reschedule_not_allowed_policy(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={"name": "No Reschedule ET", "duration_minutes": 60, "recurring": False, "reschedule_mode": "not_allowed", "availability": availability}).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        original = client.post("/bookings/", json=payload).json()
+        assert client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 400
+
+
+# ── SERIES CANCEL ─────────────────────────────────────────────────────────────
+
+def test_cancel_series(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first = client.post("/bookings/", json=payload).json()
+        series_id = first["series_id"]
+        response = client.delete(f"/bookings/booking-series/{series_id}")
+    assert response.status_code == 200
+    assert response.json()["is_active"] is False
+    # all 2099 occurrences are future → bulk-deleted
+    assert len(client.get("/bookings/").json()) == 0
+
+
+def test_cancel_series_not_found(client):
+    assert client.delete("/bookings/booking-series/9999").status_code == 404
+
+
+# ── MANAGE OCCURRENCE ─────────────────────────────────────────────────────────
+
+def test_manage_occurrence_get(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+    response = client.get(f"/bookings/manage-occurrence/{created['manage_token']}")
+    assert response.status_code == 200
+    assert response.json()["id"] == created["id"]
+
+
+def test_manage_occurrence_get_not_found(client):
+    assert client.get("/bookings/manage-occurrence/bad-token").status_code == 404
+
+
+def test_manage_occurrence_cancel_direct(client):
+    """min_notice=0 + far-future booking → executes cancel immediately."""
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+
+def test_manage_occurrence_cancel_not_allowed_policy(client):
+    """cancel_mode=not_allowed → 400."""
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={"name": "No Cancel Token ET", "duration_minutes": 60, "recurring": False, "cancel_mode": "not_allowed", "availability": availability}).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        assert client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel").status_code == 400
+
+
+def test_manage_occurrence_cancel_creates_request(client):
+    """min_notice > time until booking → queues cancel_occurrence request, booking stays confirmed."""
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "confirmed"
+    assert data["request"]["type"] == "cancel_occurrence"
+    assert data["request"]["status"] == "pending"
+
+
+def test_manage_occurrence_reschedule_direct(client):
+    """min_notice=0 → executes reschedule immediately, returns new booking."""
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(
+            f"/bookings/manage-occurrence/{created['manage_token']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        )
+    assert response.status_code == 200
+    new_booking = response.json()
+    assert new_booking["status"] == "confirmed"
+    assert new_booking["id"] != created["id"]
+    assert client.get(f"/bookings/{created['id']}").json()["status"] == "rescheduled"
+
+
+def test_manage_occurrence_reschedule_creates_request(client):
+    """min_notice > time until booking → queues reschedule_occurrence request."""
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(
+            f"/bookings/manage-occurrence/{created['manage_token']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "confirmed"
+    assert data["request"]["type"] == "reschedule_occurrence"
+    assert data["request"]["status"] == "pending"
+    assert data["request"]["requested_tutor_id"] == tutor["id"]
+
+
+# ── APPROVE / DENY ────────────────────────────────────────────────────────────
+
+def test_approve_cancel_request(client):
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel")
+        request_id = client.get(f"/bookings/{created['id']}").json()["request"]["id"]
+        response = client.post(f"/bookings/booking-request/{request_id}/approve")
+    assert response.status_code == 200
+    assert client.get(f"/bookings/{created['id']}").json()["status"] == "cancelled"
+
+
+def test_deny_cancel_request(client):
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel")
+    request_id = client.get(f"/bookings/{created['id']}").json()["request"]["id"]
+    response = client.post(f"/bookings/booking-request/{request_id}/deny")
+    assert response.status_code == 200
+    assert response.json()["status"] == "denied"
+    assert client.get(f"/bookings/{created['id']}").json()["status"] == "confirmed"
+
+
+def test_approve_reschedule_request(client):
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.post(
+            f"/bookings/manage-occurrence/{created['manage_token']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        )
+        request_id = client.get(f"/bookings/{created['id']}").json()["request"]["id"]
+        response = client.post(f"/bookings/booking-request/{request_id}/approve")
+    assert response.status_code == 200
+    assert client.get(f"/bookings/{created['id']}").json()["status"] == "rescheduled"
+
+
+def test_approve_request_not_found(client):
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.post("/bookings/booking-request/9999/approve").status_code == 404
+
+
+def test_deny_request_not_found(client):
+    assert client.post("/bookings/booking-request/9999/deny").status_code == 404
+
+
+def test_approve_already_processed(client):
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.post(f"/bookings/manage-occurrence/{created['manage_token']}/cancel")
+        request_id = client.get(f"/bookings/{created['id']}").json()["request"]["id"]
+        client.post(f"/bookings/booking-request/{request_id}/deny")
+        assert client.post(f"/bookings/booking-request/{request_id}/deny").status_code == 400
