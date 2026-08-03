@@ -11,7 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import _ensure_occurrence
+from booking_utils import resolve_ref
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -110,6 +110,10 @@ def _reschedule_blocked_detail(event_type) -> str:
 
 @router.get("/{booking_id}", response_model=BookingResponse)
 def get_booking(booking_id: str, db: Session = Depends(get_db)):
+    # Deliberately does NOT use resolve_ref — reads must never materialize a row.
+    # A ref pointing at a not-yet-materialized virtual occurrence simply 404s here;
+    # browsing virtual occurrences is the job of the (future) paginated list endpoint,
+    # which builds them in memory without writing to the DB.
     db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
@@ -227,6 +231,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                     end=occ_start + _duration,
                     status="confirmed",
                     manage_token=str(uuid4()),
+                    public_id=f"{series.public_id}:{int(occ_start.timestamp())}",
                 )
                 db.add(booking)
                 if first_booking is None:
@@ -272,6 +277,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     old_calendar_id = db_booking.tutor.calendar_id
     old_google_event_id = db_booking.google_event_id
     old_series_google_event_id = db_booking.series.google_event_id if is_series else None
+    series_public_id = db_booking.series.public_id if is_series else None
     event_type_name = db_booking.event_type.name
     event_type_description = db_booking.event_type.description
 
@@ -339,6 +345,8 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         "parent_phone": db_booking.parent_phone,
         "manage_token": new_manage_token,
     }
+    if is_series:
+        updated_booking["public_id"] = f"{series_public_id}:{int(booking_in.start.timestamp())}"
     new_booking = Booking(**updated_booking)
     db.add(new_booking)
     try:
@@ -402,10 +410,8 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
 
 
 @router.post("/{booking_id}/reschedule", response_model=BookingResponse)
-def reschedule_booking(booking_id: str, booking_in: BookingReschedule, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
-    if not db_booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+def reschedule_booking(booking_id: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(booking_id, db, settings)
     # Policy checks — admin path enforces strictly (no pending_request fallback)
     # TODO: skip these checks when is_admin=True once auth is in place
     if db_booking.status != "confirmed":
@@ -432,10 +438,8 @@ def update_booking_series(id: str, booking_in: BookingReschedule, db: Session = 
 
 """ Change contact info for booking """
 @router.put("/{booking_id}", response_model=BookingResponse)
-def update_booking(booking_id: str, booking_in: BookingUpdate, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
-    if not db_booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+def update_booking(booking_id: str, booking_in: BookingUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(booking_id, db, settings)
     for key, value in booking_in.model_dump().items():
         setattr(db_booking, key, value)
     try:
@@ -447,10 +451,8 @@ def update_booking(booking_id: str, booking_in: BookingUpdate, db: Session = Dep
 
 
 @router.delete("/{booking_id}/permanent", status_code=204)
-def permanently_delete_booking(booking_id: str, cascade: bool = False, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
-    if not db_booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+def permanently_delete_booking(booking_id: str, cascade: bool = False, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(booking_id, db, settings)
 
     # A rescheduled booking has a predecessor chain pointing to it via rescheduled_to FK.
     # First call (cascade=False): return 409 so the frontend can show a confirmation modal.
@@ -683,6 +685,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
         parent_email=db_series.parent_email,
         parent_phone=db_series.parent_phone,
         google_event_id=new_google_event["id"],
+        public_id=f"{db_series.public_id}:{int(booking_in.start.timestamp())}",
         start=booking_in.start,
         end=booking_in.end,
         manage_token=str(uuid4()),
@@ -788,10 +791,8 @@ def _cancel_booking(db_booking: Booking, db: Session, service) -> Booking:
 
 
 @router.delete("/{booking_id}", response_model=BookingResponse)
-def delete_booking(booking_id: str, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
-    if not db_booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+def delete_booking(booking_id: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(booking_id, db, settings)
     # Policy checks — admin path enforces strictly (no pending_request fallback)
     # TODO: skip these checks when is_admin=True once auth is in place
     if db_booking.status != "confirmed":

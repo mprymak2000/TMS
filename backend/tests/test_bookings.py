@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, UTC
 from unittest.mock import patch, MagicMock
 
 tutor_payload = {"first_name": "Tutor", "last_name": "Test", "pay_rate": 0, "calendar_id": "tutor@calendar.com"}
@@ -583,3 +584,107 @@ def test_approve_already_processed(client):
         request_id = client.get(f"/bookings/{created['id']}").json()["request"]["id"]
         client.post(f"/bookings/booking-request/{request_id}/deny")
         assert client.post(f"/bookings/booking-request/{request_id}/deny").status_code == 400
+
+
+# ── PUBLIC_ID REF RESOLUTION (resolve_ref) ──────────────────────────────────
+
+def _next_occurrence_ref(first_booking: dict) -> str:
+    """Given occurrence 1's response, build the ref for occurrence 2 (7 days later) —
+    a genuinely virtual occurrence, since indefinite series only materialize occurrence 1
+    at creation time. Booking.start is always UTC, but SQLite doesn't preserve tz-awareness,
+    so the parsed value may come back naive — treat it as UTC explicitly rather than let
+    .astimezone() assume the system's local timezone."""
+    start = datetime.fromisoformat(first_booking["start"])
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    next_start = start + timedelta(days=7)
+    return f"{first_booking['series_id']}:{int(next_start.timestamp())}"
+
+
+def test_standalone_id_has_no_colon(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        booking = client.post("/bookings/", json=payload).json()
+    assert ":" not in booking["id"]
+    assert booking["series_id"] is None
+
+
+def test_series_occurrence_id_matches_series_and_timestamp(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        booking = client.post("/bookings/", json=payload).json()
+    assert ":" in booking["id"]
+    series_part, ts_part = booking["id"].split(":")
+    assert series_part == booking["series_id"]
+    assert ts_part.isdigit()
+
+
+def test_get_virtual_occurrence_does_not_materialize(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first_booking = client.post("/bookings/", json=payload).json()
+    virtual_ref = _next_occurrence_ref(first_booking)
+
+    response = client.get(f"/bookings/{virtual_ref}")
+    assert response.status_code == 404
+
+    # Confirm nothing was written to the DB as a side effect of the read.
+    all_bookings = client.get("/bookings/").json()
+    assert len(all_bookings) == 1
+
+
+def test_cancel_virtual_occurrence_materializes_it(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first_booking = client.post("/bookings/", json=payload).json()
+        virtual_ref = _next_occurrence_ref(first_booking)
+
+        response = client.delete(f"/bookings/{virtual_ref}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["id"] == virtual_ref
+
+    # Now materialized — a plain GET (which never materializes) finds it directly.
+    fetched = client.get(f"/bookings/{virtual_ref}")
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "cancelled"
+
+    all_bookings = client.get("/bookings/").json()
+    assert len(all_bookings) == 2  # occurrence 1 + the newly materialized occurrence 2
+
+
+def test_action_on_virtual_occurrence_is_idempotent(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first_booking = client.post("/bookings/", json=payload).json()
+        virtual_ref = _next_occurrence_ref(first_booking)
+
+        first_cancel = client.delete(f"/bookings/{virtual_ref}")
+        assert first_cancel.status_code == 200
+
+        # Second call resolves the same (now real) row rather than materializing a duplicate —
+        # it correctly 400s since the row is no longer confirmed, not because it's missing.
+        second_cancel = client.delete(f"/bookings/{virtual_ref}")
+    assert second_cancel.status_code == 400
+
+    all_bookings = client.get("/bookings/").json()
+    assert len(all_bookings) == 2
+
+
+def test_resolve_ref_unknown_series(client):
+    response = client.delete("/bookings/00000000-0000-0000-0000-000000000000:1753952400")
+    assert response.status_code == 404
+
+
+def test_resolve_ref_invalid_timestamp(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first_booking = client.post("/bookings/", json=payload).json()
+    response = client.delete(f"/bookings/{first_booking['series_id']}:not-a-timestamp")
+    assert response.status_code == 400
