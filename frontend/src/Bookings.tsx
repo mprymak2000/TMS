@@ -23,7 +23,7 @@ interface LoadErrors {
     eventTypes?: string
 }
 
-type SeriesItem = { kind: 'series'; seriesId: number; bookings: Booking[]; sortKey: string }
+type SeriesItem = { kind: 'series'; seriesId: string; bookings: Booking[]; sortKey: string }
 type StandaloneItem = { kind: 'standalone'; dateLabel: string; bookings: Booking[]; sortKey: string }
 type DisplayItem = SeriesItem | StandaloneItem
 
@@ -41,9 +41,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [eventTypes, setEventTypes] = useState<EventType[]>([])
     const [activeTab, setActiveTab] = useState<'upcoming' | 'past' | 'all' | 'requests'>('upcoming')
     const [filters, setFilters] = useState<BookingFilters>({ tutorId: null, eventTypeId: null, dateFrom: null, dateTo: null, searchQuery: '', pendingOnly: false })
-    const [expandedId, setExpandedId] = useState<number | null>(null)
-    const [expandedSeries, setExpandedSeries] = useState<Set<number>>(new Set())
-    const [cancellingSeriesId, setCancellingSeriesId] = useState<number | null>(null)
+    const [expandedId, setExpandedId] = useState<string | null>(null)
+    const [expandedSeries, setExpandedSeries] = useState<Set<string>>(new Set())
+    const [cancellingSeriesId, setCancellingSeriesId] = useState<string | null>(null)
     const [isCancelling, setIsCancelling] = useState(false)
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [processingRequest, setProcessingRequest] = useState<Booking | null>(null)
@@ -116,7 +116,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         loadData(email.trim())
     }
 
-    const handleCancelSeries = async (seriesId: number) => {
+    const handleCancelSeries = async (seriesId: string) => {
         setIsCancelling(true)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${seriesId}`, { method: 'DELETE' })
@@ -184,7 +184,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const pendingBookings = bookings.filter(b => b.request?.status === 'pending')
 
     // Group recurring bookings by series; standalones into date groups
-    const seriesMap = new Map<number, Booking[]>()
+    const seriesMap = new Map<string, Booking[]>()
     const standaloneList: Booking[] = []
     for (const b of displayed) {
         if (b.series_id !== null) {
@@ -213,7 +213,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         ...standaloneGrouped.map(g => ({ kind: 'standalone' as const, dateLabel: g.dateLabel, bookings: g.bookings, sortKey: g.bookings[0].start })),
     ].sort((a, b) => a.sortKey.localeCompare(b.sortKey))
 
-    const toggleSeriesExpand = (seriesId: number) =>
+    const toggleSeriesExpand = (seriesId: string) =>
         setExpandedSeries(prev => {
             const next = new Set(prev)
             if (next.has(seriesId)) next.delete(seriesId)

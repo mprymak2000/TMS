@@ -102,8 +102,8 @@ export interface AvailableSlot {
 }
 
 export interface Booking {
-  id: number
-  series_id: number | null
+  id: string
+  series_id: string | null
   tutor_id: number
   event_type_id: number
   student_id: number | null
@@ -112,7 +112,7 @@ export interface Booking {
   timezone: string
   status: string
   is_no_show: boolean
-  rescheduled_to: number | null
+  rescheduled_to: string | null
   manage_token: string | null
   google_event_id: string
   series_manage_token: string | null
@@ -126,7 +126,7 @@ export interface Booking {
 }
 
 export interface BookingSeries {
-  id: number
+  id: string
   tutor_id: number
   event_type_id: number
   student_id: number | null

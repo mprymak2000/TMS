@@ -182,6 +182,7 @@ class BookingSeries(Base):
     __tablename__ = "booking_series"
 
     id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
     event_type_id = Column(Integer, ForeignKey("event_types.id"), nullable=False)
     start_day_of_week = Column(Integer, nullable=False)  # 0 Monday, 6 Sunday — local schedule timezone
@@ -232,6 +233,7 @@ class Booking(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
     series_id = Column(Integer, ForeignKey("booking_series.id"), nullable=True) # for recurrent bookings (series means every wed at 5pm for 5 months)
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
     event_type_id = Column(Integer, ForeignKey("event_types.id"), nullable=False)
@@ -264,11 +266,21 @@ class Booking(Base):
     student_record = relationship("Student")
     lesson = relationship("Lesson", back_populates="booking", uselist=False)
     request = relationship("BookingRequest", back_populates="booking", uselist=False)
+    rescheduled_to_booking = relationship("Booking", remote_side=[id], foreign_keys=[rescheduled_to])
+
+    # allow pydantic to inherit parent's (booking's series) public_id and manage_token fields
+    # from the model's relationship by @property and getattr(model_obj, field_name).
+    @property
+    def series_public_id(self) -> str | None:
+        return self.series.public_id if self.series else None
 
     @property
     def series_manage_token(self) -> str | None:
         return self.series.manage_token if self.series else None
 
+    @property
+    def rescheduled_to_public_id(self) -> str | None:
+        return self.rescheduled_to_booking.public_id if self.rescheduled_to_booking else None
 
 
 class Settings(Base):

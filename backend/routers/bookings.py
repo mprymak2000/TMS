@@ -109,8 +109,8 @@ def _reschedule_blocked_detail(event_type) -> str:
 
 
 @router.get("/{booking_id}", response_model=BookingResponse)
-def get_booking(booking_id: int, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.id == booking_id).first()
+def get_booking(booking_id: str, db: Session = Depends(get_db)):
+    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     return db_booking
@@ -402,8 +402,8 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
 
 
 @router.post("/{booking_id}/reschedule", response_model=BookingResponse)
-def reschedule_booking(booking_id: int, booking_in: BookingReschedule, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.id == booking_id).first()
+def reschedule_booking(booking_id: str, booking_in: BookingReschedule, db: Session = Depends(get_db)):
+    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     # Policy checks — admin path enforces strictly (no pending_request fallback)
@@ -417,11 +417,11 @@ def reschedule_booking(booking_id: int, booking_in: BookingReschedule, db: Sessi
 
 
 @router.put("/booking-series/{id}", response_model=BookingSeriesResponse)
-def update_booking_series(id: int, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+def update_booking_series(id: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
     # TODO: no notice-window check here — if the next upcoming occurrence is within
     # min_notice_reschedule_minutes, this still goes through. Consider whether to warn
     # or block when the series change affects an imminent session (requires auth to skip for admin).
-    db_series = db.query(BookingSeries).filter(BookingSeries.id == id).first()
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     if not db_series.is_active:
@@ -432,8 +432,8 @@ def update_booking_series(id: int, booking_in: BookingReschedule, db: Session = 
 
 """ Change contact info for booking """
 @router.put("/{booking_id}", response_model=BookingResponse)
-def update_booking(booking_id: int, booking_in: BookingUpdate, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.id == booking_id).first()
+def update_booking(booking_id: str, booking_in: BookingUpdate, db: Session = Depends(get_db)):
+    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     for key, value in booking_in.model_dump().items():
@@ -447,15 +447,17 @@ def update_booking(booking_id: int, booking_in: BookingUpdate, db: Session = Dep
 
 
 @router.delete("/{booking_id}/permanent", status_code=204)
-def permanently_delete_booking(booking_id: int, cascade: bool = False, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.id == booking_id).first()
+def permanently_delete_booking(booking_id: str, cascade: bool = False, db: Session = Depends(get_db)):
+    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
     # A rescheduled booking has a predecessor chain pointing to it via rescheduled_to FK.
     # First call (cascade=False): return 409 so the frontend can show a confirmation modal.
     # Second call (cascade=True): sent only after the user explicitly confirms — walks and deletes all predecessors.
-    immediate_predecessor = db.query(Booking).filter(Booking.rescheduled_to == booking_id).first()
+    # Note: rescheduled_to is an internal integer FK (not public_id), so we match against
+    # db_booking.id (the internal PK) here, not the public_id from the path param.
+    immediate_predecessor = db.query(Booking).filter(Booking.rescheduled_to == db_booking.id).first()
     if immediate_predecessor and not cascade:
         raise HTTPException(status_code=409, detail="This booking has a rescheduled predecessor.")
 
@@ -713,8 +715,8 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
 
 """All series deletes are "hard" deletes that permanently remove all future bookings. Series is soft-deleted."""
 @router.delete("/booking-series/{id}", response_model=BookingSeriesResponse)
-def delete_booking_series(id: int, db: Session = Depends(get_db)):
-    db_series = db.query(BookingSeries).filter(BookingSeries.id == id).first()
+def delete_booking_series(id: str, db: Session = Depends(get_db)):
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     service = get_calendar_service(SCOPES)
@@ -786,8 +788,8 @@ def _cancel_booking(db_booking: Booking, db: Session, service) -> Booking:
 
 
 @router.delete("/{booking_id}", response_model=BookingResponse)
-def delete_booking(booking_id: int, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.id == booking_id).first()
+def delete_booking(booking_id: str, db: Session = Depends(get_db)):
+    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     # Policy checks — admin path enforces strictly (no pending_request fallback)

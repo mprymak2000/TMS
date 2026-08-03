@@ -437,8 +437,8 @@ class BookingRequestResponse(BaseModel):
 class BookingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
-    series_id: int | None = None
+    id: str = Field(validation_alias="public_id")
+    series_id: str | None = Field(default=None, validation_alias="series_public_id")
     tutor_id: int
     event_type_id: int
     student_id: int | None = None
@@ -447,7 +447,7 @@ class BookingResponse(BaseModel):
     timezone: str
     status: str
     is_no_show: bool
-    rescheduled_to: int | None = None
+    rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
     manage_token: str | None = None
     google_event_id: str
     series_manage_token: str | None = None
@@ -464,7 +464,7 @@ class BookingResponse(BaseModel):
 class BookingSeriesResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: str = Field(validation_alias="public_id")
     tutor_id: int
     event_type_id: int
     student_id: int | None = None

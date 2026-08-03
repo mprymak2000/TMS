@@ -100,8 +100,8 @@ const localLongDateOf = (utcIso: string, tz: string) =>
 const BookingPage = () => {
     const { eventTypeId } = useParams<{ eventTypeId: string }>()
     const location = useLocation()
-    const [rescheduleFromId, setRescheduleFromId] = useState<number | null>(location.state?.rescheduleFromId ?? null)
-    const [rescheduleSeriesId, setRescheduleSeriesId] = useState<number | null>(location.state?.rescheduleSeriesId ?? null)
+    const [rescheduleFromId, setRescheduleFromId] = useState<string | null>(location.state?.rescheduleFromId ?? null)
+    const [rescheduleSeriesId, setRescheduleSeriesId] = useState<string | null>(location.state?.rescheduleSeriesId ?? null)
     const requestRescheduleToken = location.state?.requestRescheduleToken ?? null
     const originalStart = location.state?.originalStart ?? null
     const originalEnd = location.state?.originalEnd ?? null
