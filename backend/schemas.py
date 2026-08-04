@@ -448,9 +448,11 @@ class BookingResponse(BaseModel):
     status: str
     is_no_show: bool
     rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
-    manage_token: str | None = None
     google_event_id: str
-    series_manage_token: str | None = None
+    cancel_action: str
+    cancel_blocked_reason: str | None = None
+    reschedule_action: str
+    reschedule_blocked_reason: str | None = None
 
     student_first: str
     student_last: str
@@ -476,6 +478,10 @@ class BookingSeriesResponse(BaseModel):
     timezone: str | None = None  # redundant — always Settings.business_timezone; nullable pending refactor
     recur_until: date | None = None
     google_event_id: str | None = None
+    cancel_action: str
+    cancel_blocked_reason: str | None = None
+    reschedule_action: str
+    reschedule_blocked_reason: str | None = None
 
     student_first: str
     student_last: str
@@ -485,7 +491,10 @@ class BookingSeriesResponse(BaseModel):
     parent_phone: str | None = None
 
     bookings: list[BookingResponse]
-    manage_token: str | None = None
+
+
+class MyBookingsResponse(BaseModel):
+    items: list[BookingResponse]
     request: BookingRequestResponse | None = None
 
 

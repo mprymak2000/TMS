@@ -11,7 +11,7 @@ interface LoadErrors {
 const WINDOW_MODES = ['auto_window_block', 'auto_window_request', 'request_window']
 
 const ManageOccurrence = () => {
-    const { token } = useParams<{ token: string }>()
+    const { ref } = useParams<{ ref: string }>()
     const navigate = useNavigate()
     const [booking, setBooking] = useState<Booking | null>(null)
     const [eventType, setEventType] = useState<EventType | null>(null)
@@ -25,7 +25,7 @@ const ManageOccurrence = () => {
     const loadBooking = async () => {
         setIsLoading(true)
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${token}`)
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${ref}`)
             if (!res.ok) {
                 const err = await res.json()
                 setLoadErrors(prev => ({ ...prev, booking: extractError(err, 'Failed to load booking') }))
@@ -51,7 +51,7 @@ const ManageOccurrence = () => {
 
     useEffect(() => { loadBooking() },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [token])
+        [ref])
 
     const minutesUntil = booking ? (new Date(booking.start).getTime() - Date.now()) / 60000 : Infinity
 
@@ -78,7 +78,7 @@ const ManageOccurrence = () => {
     const confirmCancel = async () => {
         setIsSubmitting(true)
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${token}/cancel`, { method: 'POST' })
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${ref}/cancel`, { method: 'POST' })
             if (!res.ok) {
                 const err = await res.json()
                 setError(extractError(err, canCancelDirectly ? 'Failed to cancel booking' : 'Failed to submit cancellation request'))
@@ -252,7 +252,7 @@ const ManageOccurrence = () => {
                                         </p>
                                         <button
                                             onClick={() => navigate(`/book/${booking.event_type_id}`, { state: {
-                                                requestRescheduleToken: token,
+                                                requestRescheduleRef: ref,
                                                 originalStart: booking.start,
                                                 originalEnd: booking.end,
                                                 studentFirst: booking.student_first,
@@ -283,9 +283,9 @@ const ManageOccurrence = () => {
                 )}
 
                 {/* series link */}
-                {booking.series_id && booking.series_manage_token && (
+                {booking.series_id && (
                     <div className="mt-6 pt-5 border-t border-gray-100">
-                        <Link to={`/manage-series/${booking.series_manage_token}`} className="text-sm text-indigo-500 hover:text-indigo-700 transition-colors">
+                        <Link to={`/manage-series/${booking.series_id}`} className="text-sm text-indigo-500 hover:text-indigo-700 transition-colors">
                             Manage entire series →
                         </Link>
                     </div>

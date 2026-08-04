@@ -3,6 +3,13 @@ from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime, UTC
 from uuid import uuid4
+from policy import get_cancel_action, get_reschedule_action, cancel_blocked_detail, reschedule_blocked_detail
+
+
+def _minutes_until(start: datetime) -> float:
+    """Defensive against naive datetimes (SQLite in tests doesn't preserve tz-awareness)."""
+    start_tz = start if start.tzinfo else start.replace(tzinfo=UTC)
+    return (start_tz - datetime.now(UTC)).total_seconds() / 60
 
 class Student(Base):
     __tablename__ = "students"
@@ -208,13 +215,34 @@ class BookingSeries(Base):
     parent_email = Column(String, nullable=True)
     parent_phone = Column(String, nullable=True)
 
-    manage_token = Column(String, unique=True, nullable=True)  # series-level manage link — sent in confirmation email
-
     tutor = relationship("Tutor", back_populates="series")
     event_type = relationship("EventType")
     student_record = relationship("Student")
     bookings = relationship("Booking", back_populates="series")
     request = relationship("BookingRequest", back_populates="series", uselist=False)
+
+    @property
+    def _next_upcoming_minutes_until(self) -> float:
+        now = datetime.now(UTC)
+        starts = (b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC) for b in self.bookings if b.status == "confirmed")
+        upcoming = [s for s in starts if s >= now]
+        return (min(upcoming) - now).total_seconds() / 60 if upcoming else float('inf')
+
+    @property
+    def cancel_action(self) -> str:
+        return get_cancel_action(self.event_type, self._next_upcoming_minutes_until)
+
+    @property
+    def cancel_blocked_reason(self) -> str | None:
+        return None if self.cancel_action == 'auto' else cancel_blocked_detail(self.event_type)
+
+    @property
+    def reschedule_action(self) -> str:
+        return get_reschedule_action(self.event_type, self._next_upcoming_minutes_until)
+
+    @property
+    def reschedule_blocked_reason(self) -> str | None:
+        return None if self.reschedule_action == 'auto' else reschedule_blocked_detail(self.event_type)
 
 
 class Booking(Base):
@@ -250,7 +278,6 @@ class Booking(Base):
     # Alternative: remove SET NULL and collect predecessors with insert(0, ...) instead of append() so the
     # list is [furthest, ..., immediate] and deletes go referencing-side first — no FK violations, no SET NULL needed.
     rescheduled_to = Column(Integer, ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True)
-    manage_token = Column(String, unique=True, nullable=True) # for allowing bookers to cancel without auth — generated on booking creation and included in cancellation link in email
     student_id = Column(Integer, ForeignKey("students.id"), nullable=True)  # null for new one-off customers; linked when student record exists
 
     student_first = Column(String, nullable=False)
@@ -268,19 +295,31 @@ class Booking(Base):
     request = relationship("BookingRequest", back_populates="booking", uselist=False)
     rescheduled_to_booking = relationship("Booking", remote_side=[id], foreign_keys=[rescheduled_to])
 
-    # allow pydantic to inherit parent's (booking's series) public_id and manage_token fields
-    # from the model's relationship by @property and getattr(model_obj, field_name).
+    # allow pydantic to inherit parent's (booking's series) public_id field from the
+    # model's relationship by @property and getattr(model_obj, field_name).
     @property
     def series_public_id(self) -> str | None:
         return self.series.public_id if self.series else None
 
     @property
-    def series_manage_token(self) -> str | None:
-        return self.series.manage_token if self.series else None
-
-    @property
     def rescheduled_to_public_id(self) -> str | None:
         return self.rescheduled_to_booking.public_id if self.rescheduled_to_booking else None
+
+    @property
+    def cancel_action(self) -> str:
+        return get_cancel_action(self.event_type, _minutes_until(self.start))
+
+    @property
+    def cancel_blocked_reason(self) -> str | None:
+        return None if self.cancel_action == 'auto' else cancel_blocked_detail(self.event_type)
+
+    @property
+    def reschedule_action(self) -> str:
+        return get_reschedule_action(self.event_type, _minutes_until(self.start))
+
+    @property
+    def reschedule_blocked_reason(self) -> str | None:
+        return None if self.reschedule_action == 'auto' else reschedule_blocked_detail(self.event_type)
 
 
 class Settings(Base):

@@ -115,7 +115,6 @@ def _insert_series(db, tutor_id: int, event_type_id: int, *,
         google_event_id=str(uuid4()),
         student_first="A", student_last="B",
         student_email="a@b.com", student_phone="555-0000",
-        manage_token=str(uuid4()),
     )
     db.add(s)
     db.flush()
@@ -131,7 +130,7 @@ def _insert_booking(db, tutor_id: int, event_type_id: int,
         tutor_id=tutor_id, event_type_id=event_type_id,
         start=start, end=end,
         google_event_id=str(uuid4()), status=status,
-        timezone="UTC", manage_token=str(uuid4()),
+        timezone="UTC",
         student_first="A", student_last="B",
         student_email="a@b.com", student_phone="555-0000",
     )

@@ -113,9 +113,7 @@ export interface Booking {
   status: string
   is_no_show: boolean
   rescheduled_to: string | null
-  manage_token: string | null
   google_event_id: string
-  series_manage_token: string | null
   student_first: string
   student_last: string
   student_email: string | null
@@ -136,7 +134,6 @@ export interface BookingSeries {
   end_time: string
   recur_until: string | null
   google_event_id: string | null
-  manage_token: string | null
   student_first: string
   student_last: string
   student_email: string | null

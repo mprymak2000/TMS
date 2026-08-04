@@ -361,9 +361,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                     <span className="text-xs text-gray-400 shrink-0">No upcoming</span>
                                                 )}
                                                 <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
-                                                    {rep.series_manage_token && (
+                                                    {rep.series_id && (
                                                         <button
-                                                            onClick={() => navigate(`/manage-series/${rep.series_manage_token}`)}
+                                                            onClick={() => navigate(`/manage-series/${rep.series_id}`)}
                                                             className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
                                                         >
                                                             Manage
@@ -654,9 +654,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                         {/* actions */}
                                         <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
                                             {isCustomer ? (
-                                                rep.series_manage_token && (
+                                                rep.series_id && (
                                                     <button
-                                                        onClick={() => navigate(`/manage-series/${rep.series_manage_token}`)}
+                                                        onClick={() => navigate(`/manage-series/${rep.series_id}`)}
                                                         className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
                                                     >
                                                         Manage series

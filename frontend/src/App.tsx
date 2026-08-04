@@ -33,8 +33,8 @@ function App() {
     <MantineProvider theme={theme}>
       <Routes>
         <Route path="/book/:eventTypeId" element={<BookingPage />} />
-        <Route path="/manage-occurrence/:token" element={<ManageOccurrence />} />
-        <Route path="/manage-series/:token" element={<ManageSeries />} />
+        <Route path="/manage-occurrence/:ref" element={<ManageOccurrence />} />
+        <Route path="/manage-series/:ref" element={<ManageSeries />} />
         <Route path="/my-bookings" element={<Bookings isCustomer={true} />} />
         <Route path="/*" element={
       <div className="flex h-screen bg-gray-50">

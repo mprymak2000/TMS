@@ -11,7 +11,7 @@ interface LoadErrors {
 }
 
 const ManageSeries = () => {
-    const { token } = useParams<{ token: string }>()
+    const { ref } = useParams<{ ref: string }>()
     const navigate = useNavigate()
     const [series, setSeries] = useState<BookingSeries | null>(null)
     const [eventType, setEventType] = useState<EventType | null>(null)
@@ -25,7 +25,7 @@ const ManageSeries = () => {
     const loadSeries = async () => {
         setIsLoading(true)
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-series/${token}`)
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-series/${ref}`)
             if (!res.ok) {
                 const err = await res.json()
                 setLoadErrors(prev => ({ ...prev, series: extractError(err, 'Failed to load series') }))
@@ -51,7 +51,7 @@ const ManageSeries = () => {
 
     useEffect(() => { loadSeries() },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [token])
+        [ref])
 
     // start_time is "HH:MM:SS" UTC; day_of_week is 0=Mon..6=Sun
     const getNextOccurrenceMs = (dow: number, timeStr: string): number => {
@@ -82,7 +82,7 @@ const ManageSeries = () => {
     const handleConfirmCancel = async () => {
         setIsSubmitting(true)
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-series/${token}/cancel`, { method: 'POST' })
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-series/${ref}/cancel`, { method: 'POST' })
             if (!res.ok) {
                 const err = await res.json()
                 setError(extractError(err, canCancelDirectly ? 'Failed to cancel series' : 'Failed to submit cancellation request'))

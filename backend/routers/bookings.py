@@ -7,15 +7,21 @@
 
 import logging
 import os
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import resolve_ref
+from booking_utils import _virtual_occurrences, resolve_ref
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
 from models import Booking, BookingRequest, BookingSeries, EventType, Tutor
+from policy import (
+    get_cancel_action,
+    get_reschedule_action,
+    cancel_blocked_detail,
+    reschedule_blocked_detail,
+)
 from schemas import (
     BookingCreate,
     BookingRequestResponse,
@@ -23,98 +29,94 @@ from schemas import (
     BookingResponse,
     BookingSeriesResponse,
     BookingUpdate,
+    MyBookingsResponse,
 )
 from sqlalchemy.orm import Session
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+PAGE_SIZE = 10
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
 
-@router.get("/", response_model=list[BookingResponse])
-def get_bookings(
+@router.get("/my-bookings", response_model=MyBookingsResponse)
+def get_my_bookings(
     email: str | None = Query(default=None),
     tutor_id: int | None = Query(default=None),
+    status: str = Query(default="upcoming"),  # "upcoming" | "past"
     pending_only: bool = Query(default=False),
+    page: int = Query(default=1, ge=1),
     db: Session = Depends(get_db),
+    settings=Depends(get_settings),
 ):
-    q = db.query(Booking)
-    if email:
-        q = q.filter((Booking.student_email == email) | (Booking.parent_email == email))
-    if tutor_id:
-        q = q.filter(Booking.tutor_id == tutor_id)
+    """The one endpoint the frontend uses to display bookings, admin or customer alike —
+    email/tutor_id are optional scoping filters, not a different mode. Virtual occurrences
+    (not-yet-materialized series occurrences) are merged in identically regardless of who's
+    asking; there's no reason an admin should see a degraded, materialized-only view when a
+    customer sees the complete picture. GET /bookings/ (unfiltered, unpaginated) stays as a
+    separate lower-level endpoint — this one is specifically for the bookings-list UI."""
+    now = datetime.now(UTC)
+
     if pending_only:
-        q = q.filter(Booking.request.has(BookingRequest.status == 'pending'))
-    return q.all()
+        # a virtual occurrence can never have a pending BookingRequest (nothing to request
+        # approval on for a row that doesn't exist yet) — real rows only, no virtual merge.
+        q = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
+        if email:
+            q = q.filter((Booking.student_email == email) | (Booking.parent_email == email))
+        if tutor_id:
+            q = q.filter(Booking.tutor_id == tutor_id)
+        items = q.order_by(Booking.start.desc()).offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE).all()
+        return {"items": items}
+
+    if status == "past":
+        q = db.query(Booking).filter(Booking.start < now)
+        if email:
+            q = q.filter((Booking.student_email == email) | (Booking.parent_email == email))
+        if tutor_id:
+            q = q.filter(Booking.tutor_id == tutor_id)
+        items = q.order_by(Booking.start.desc()).offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE).all()
+        return {"items": items}
+
+    if status == "upcoming":
+        # generate needed_total per series (not minus real count) — a far-future real row
+        # shouldn't reduce how many near-term virtual occurrences we generate
+        needed_total = page * PAGE_SIZE
+
+        real_q = db.query(Booking).filter(Booking.start >= now, Booking.status == "confirmed")
+        if email:
+            real_q = real_q.filter((Booking.student_email == email) | (Booking.parent_email == email))
+        if tutor_id:
+            real_q = real_q.filter(Booking.tutor_id == tutor_id)
+        real_upcoming_bookings = real_q.all()
+
+        series_q = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+        if email:
+            series_q = series_q.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
+        if tutor_id:
+            series_q = series_q.filter(BookingSeries.tutor_id == tutor_id)
+        relevant_series = series_q.all()
+
+        virtual = []
+        for series in relevant_series:
+            virtual.extend(_virtual_occurrences(series, now, needed_total, settings))
+
+        # b.start may come back naive under SQLite even though it's always stored as UTC —
+        # normalize for sorting without mutating the objects themselves.
+        def _sort_key(b):
+            return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
+
+        merged = sorted([*real_upcoming_bookings, *virtual], key=_sort_key)
+        start_index = (page - 1) * PAGE_SIZE
+        return {"items": merged[start_index:start_index + PAGE_SIZE]}
 
 
-def _format_notice(minutes: int) -> str:
-    hours = minutes // 60
-    if hours <= 48:
-        return f"{hours} hours" if minutes % 60 == 0 else f"{minutes} minutes"
-    days, rem_hours = divmod(hours, 24)
-    return f"{days} days {rem_hours} hours" if rem_hours else f"{days} days"
-
-
-def _get_cancel_action(event_type, minutes_until: float) -> str:
-    """Returns 'auto', 'request', or 'blocked' based on event type cancel policy and minutes until booking."""
-    mode = event_type.cancel_mode if event_type else None
-    if mode is None or mode == 'auto':
-        return 'auto'
-    if mode == 'not_allowed':
-        return 'blocked'
-    if mode == 'request':
-        return 'request'
-    notice = event_type.cancel_notice_minutes or 0
-    outside_window = minutes_until >= notice
-    if mode == 'auto_window_block':
-        return 'auto' if outside_window else 'blocked'
-    if mode == 'auto_window_request':
-        return 'auto' if outside_window else 'request'
-    if mode == 'request_window':
-        return 'request' if outside_window else 'blocked'
-    return 'blocked'
-
-
-def _get_reschedule_action(event_type, minutes_until: float) -> str:
-    """Returns 'auto', 'request', or 'blocked' based on event type reschedule policy and minutes until booking."""
-    mode = event_type.reschedule_mode if event_type else None
-    if mode is None or mode == 'auto':
-        return 'auto'
-    if mode == 'not_allowed':
-        return 'blocked'
-    if mode == 'request':
-        return 'request'
-    notice = event_type.reschedule_notice_minutes or 0
-    outside_window = minutes_until >= notice
-    if mode == 'auto_window_block':
-        return 'auto' if outside_window else 'blocked'
-    if mode == 'auto_window_request':
-        return 'auto' if outside_window else 'request'
-    if mode == 'request_window':
-        return 'request' if outside_window else 'blocked'
-    return 'blocked'
-
-
-def _cancel_blocked_detail(event_type) -> str:
-    if event_type is None or event_type.cancel_mode == 'not_allowed':
-        return "Cancellation is not allowed for this event type"
-    return f"Cancellation requires at least {_format_notice(event_type.cancel_notice_minutes or 0)} notice"
-
-
-def _reschedule_blocked_detail(event_type) -> str:
-    if event_type is None or event_type.reschedule_mode == 'not_allowed':
-        return "Rescheduling is not allowed for this event type"
-    return f"Rescheduling requires at least {_format_notice(event_type.reschedule_notice_minutes or 0)} notice"
-
-
-@router.get("/{booking_id}", response_model=BookingResponse)
-def get_booking(booking_id: str, db: Session = Depends(get_db)):
+@router.get("/{ref}", response_model=BookingResponse)
+def get_booking(ref: str, db: Session = Depends(get_db)):
     # Deliberately does NOT use resolve_ref — reads must never materialize a row.
     # A ref pointing at a not-yet-materialized virtual occurrence simply 404s here;
     # browsing virtual occurrences is the job of the (future) paginated list endpoint,
     # which builds them in memory without writing to the DB.
-    db_booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
+    db_booking = db.query(Booking).filter(Booking.public_id == ref).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     return db_booking
@@ -179,9 +181,9 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
         elif db_event_type.recur_weeks is not None:
             recur_until_date = booking_in.start.date() + timedelta(weeks=db_event_type.recur_weeks - 1)
 
-    booking_manage_token = str(uuid4())
+    new_public_id = str(uuid4())
     manage_path = "manage-series" if db_event_type.recurring else "manage-occurrence"
-    manage_url = f"{FRONTEND_URL}/{manage_path}/{booking_manage_token}"
+    manage_url = f"{FRONTEND_URL}/{manage_path}/{new_public_id}"
     description_parts = [p for p in [db_event_type.description, f"Manage your booking: {manage_url}"] if p]
     new_event = {
             "summary": f"{db_event_type.name}: {booking_in.student_first} and {db_tutor.first_name}",
@@ -207,6 +209,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             local_start = booking_in.start.astimezone(BUSINESS_TZ)
             local_end = booking_in.end.astimezone(BUSINESS_TZ)
             series = BookingSeries(
+                public_id=new_public_id,
                 **booking_in.model_dump(exclude={"start", "end", "timezone", "recur_until"}),
                 start_day_of_week=local_start.weekday(),
                 end_day_of_week=local_end.weekday(),
@@ -214,7 +217,6 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                 end_time=local_end.time(),
                 recur_until=recur_until_date,
                 google_event_id=google_event["id"],
-                manage_token=booking_manage_token,
             )
             db.add(series)
             db.flush()
@@ -224,14 +226,13 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             first_booking = None
             while occ_start.date() <= _gen_through:
                 booking = Booking(
+                    public_id=f"{series.public_id}:{int(occ_start.timestamp())}",
                     **base_fields,
                     series_id=series.id,
                     google_event_id=google_event["id"],
                     start=occ_start,
                     end=occ_start + _duration,
                     status="confirmed",
-                    manage_token=str(uuid4()),
-                    public_id=f"{series.public_id}:{int(occ_start.timestamp())}",
                 )
                 db.add(booking)
                 if first_booking is None:
@@ -242,10 +243,10 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             return first_booking
 
         new_booking = Booking(
+            public_id=new_public_id,
             **booking_in.model_dump(exclude={"recur_until"}),
             google_event_id=google_event["id"],
             status="confirmed",
-            manage_token=booking_manage_token,
         )
         db.add(new_booking)
         db.commit()
@@ -284,7 +285,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     # --- Step 1: Calendar operation ---
     # Series: patch the specific RRULE instance (creates a Google Calendar exception, no new event)
     # Standalone: create a new calendar event and delete the old one later
-    new_manage_token = str(uuid4())
+    new_public_id = f"{series_public_id}:{int(booking_in.start.timestamp())}" if is_series else str(uuid4())
     if is_series:
         try:
             is_exception = old_google_event_id != old_series_google_event_id
@@ -313,7 +314,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
             raise HTTPException(status_code=500, detail="Failed to reschedule calendar event") from e
     else:
         #todo: allow custom event name templates per event type using dynamic tags e.g. "{student_first} {student_last} - {event_type}"
-        manage_url = f"{FRONTEND_URL}/manage-occurrence/{new_manage_token}"
+        manage_url = f"{FRONTEND_URL}/manage-occurrence/{new_public_id}"
         description_parts = [p for p in [event_type_description, f"Manage your booking: {manage_url}"] if p]
         new_event = {
             "summary": f"{event_type_name}: {db_booking.student_first} and {db_tutor.first_name}",
@@ -329,8 +330,9 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
             raise HTTPException(status_code=500, detail="Failed to create calendar event") from e
 
     # --- Step 2: Insert new booking row ---
-    # Inherits series_id, student info, event type from original; gets new time, token, google_event_id
+    # Inherits series_id, student info, event type from original; gets new time and google_event_id
     updated_booking = {
+        "public_id": new_public_id,
         **booking_in.model_dump(),
         "series_id": db_booking.series_id,
         "google_event_id": new_google_event_id,
@@ -343,10 +345,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         "student_phone": db_booking.student_phone,
         "parent_email": db_booking.parent_email,
         "parent_phone": db_booking.parent_phone,
-        "manage_token": new_manage_token,
     }
-    if is_series:
-        updated_booking["public_id"] = f"{series_public_id}:{int(booking_in.start.timestamp())}"
     new_booking = Booking(**updated_booking)
     db.add(new_booking)
     try:
@@ -409,9 +408,9 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     return new_booking
 
 
-@router.post("/{booking_id}/reschedule", response_model=BookingResponse)
-def reschedule_booking(booking_id: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    db_booking = resolve_ref(booking_id, db, settings)
+@router.post("/{ref}/reschedule", response_model=BookingResponse)
+def reschedule_booking(ref: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(ref, db, settings)
     # Policy checks — admin path enforces strictly (no pending_request fallback)
     # TODO: skip these checks when is_admin=True once auth is in place
     if db_booking.status != "confirmed":
@@ -437,9 +436,9 @@ def update_booking_series(id: str, booking_in: BookingReschedule, db: Session = 
 
 
 """ Change contact info for booking """
-@router.put("/{booking_id}", response_model=BookingResponse)
-def update_booking(booking_id: str, booking_in: BookingUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    db_booking = resolve_ref(booking_id, db, settings)
+@router.put("/{ref}", response_model=BookingResponse)
+def update_booking(ref: str, booking_in: BookingUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(ref, db, settings)
     for key, value in booking_in.model_dump().items():
         setattr(db_booking, key, value)
     try:
@@ -450,9 +449,9 @@ def update_booking(booking_id: str, booking_in: BookingUpdate, db: Session = Dep
     return db_booking
 
 
-@router.delete("/{booking_id}/permanent", status_code=204)
-def permanently_delete_booking(booking_id: str, cascade: bool = False, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    db_booking = resolve_ref(booking_id, db, settings)
+@router.delete("/{ref}/permanent", status_code=204)
+def permanently_delete_booking(ref: str, cascade: bool = False, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(ref, db, settings)
 
     # A rescheduled booking has a predecessor chain pointing to it via rescheduled_to FK.
     # First call (cascade=False): return 409 so the frontend can show a confirmation modal.
@@ -523,7 +522,7 @@ def permanently_delete_booking(booking_id: str, cascade: bool = False, db: Sessi
                     },
                 ).execute()
             except Exception as comp_err:
-                logging.warning(f"WARNING: DB commit failed and calendar compensation also failed for permanent delete of booking {booking_id}: {comp_err}")
+                logging.warning(f"WARNING: DB commit failed and calendar compensation also failed for permanent delete of booking {ref}: {comp_err}")
         raise HTTPException(status_code=500, detail="Failed to permanently delete booking") from e
     return Response(status_code=204)
 
@@ -630,7 +629,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
     rrule = "RRULE:FREQ=WEEKLY"
     if db_series.recur_until:
         rrule += f";UNTIL={db_series.recur_until.strftime('%Y%m%d')}"
-    series_manage_url = f"{FRONTEND_URL}/manage-series/{db_series.manage_token}"
+    series_manage_url = f"{FRONTEND_URL}/manage-series/{db_series.public_id}"
     series_description_parts = [p for p in [db_event_type.description, f"Manage your booking: {series_manage_url}"] if p]
     new_event = {
         "summary": f"{db_event_type.name}: {db_series.student_first} and {db_tutor.first_name}",
@@ -672,6 +671,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
     db_series.end_time = local_end.time()
     db_series.google_event_id = new_google_event["id"]
     db.add(Booking(
+        public_id=f"{db_series.public_id}:{int(booking_in.start.timestamp())}",
         series_id=db_series.id,
         tutor_id=booking_in.tutor_id,
         event_type_id=db_series.event_type_id,
@@ -685,10 +685,8 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
         parent_email=db_series.parent_email,
         parent_phone=db_series.parent_phone,
         google_event_id=new_google_event["id"],
-        public_id=f"{db_series.public_id}:{int(booking_in.start.timestamp())}",
         start=booking_in.start,
         end=booking_in.end,
-        manage_token=str(uuid4()),
     ))
 
     try:
@@ -790,9 +788,9 @@ def _cancel_booking(db_booking: Booking, db: Session, service) -> Booking:
     return db_booking
 
 
-@router.delete("/{booking_id}", response_model=BookingResponse)
-def delete_booking(booking_id: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    db_booking = resolve_ref(booking_id, db, settings)
+@router.delete("/{ref}", response_model=BookingResponse)
+def delete_booking(ref: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(ref, db, settings)
     # Policy checks — admin path enforces strictly (no pending_request fallback)
     # TODO: skip these checks when is_admin=True once auth is in place
     if db_booking.status != "confirmed":
@@ -803,26 +801,25 @@ def delete_booking(booking_id: str, db: Session = Depends(get_db), settings=Depe
     return _cancel_booking(db_booking, db, service)
 
 
-@router.get("/manage-occurrence/{token}", response_model=BookingResponse)
-def get_booking_by_token(token: str, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.manage_token == token).first()
+@router.get("/manage-occurrence/{ref}", response_model=BookingResponse)
+def get_booking_by_ref(ref: str, db: Session = Depends(get_db)):
+    # Plain lookup, same as GET /{ref} — reads never materialize a virtual occurrence.
+    db_booking = db.query(Booking).filter(Booking.public_id == ref).first()
     if not db_booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     return db_booking
 
 
-@router.post("/manage-occurrence/{token}/cancel", response_model=BookingResponse)
-def cancel_booking_by_token(token: str, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.manage_token == token).first()
-    if not db_booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+@router.post("/manage-occurrence/{ref}/cancel", response_model=BookingResponse)
+def cancel_booking_by_ref(ref: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(ref, db, settings)
     if db_booking.status != "confirmed":
         raise HTTPException(status_code=400, detail="Only confirmed bookings can be cancelled")
     booking_start_tz = db_booking.start if db_booking.start.tzinfo else db_booking.start.replace(tzinfo=UTC)
     minutes_until = (booking_start_tz - datetime.now(UTC)).total_seconds() / 60
-    action = _get_cancel_action(db_booking.event_type, minutes_until)
+    action = get_cancel_action(db_booking.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=_cancel_blocked_detail(db_booking.event_type))
+        raise HTTPException(status_code=400, detail=cancel_blocked_detail(db_booking.event_type))
     if action == 'request':
         request = BookingRequest(booking_id=db_booking.id, type='cancel_occurrence')
         db.add(request)
@@ -834,18 +831,16 @@ def cancel_booking_by_token(token: str, db: Session = Depends(get_db)):
     service = get_calendar_service(SCOPES)
     return _cancel_booking(db_booking, db, service)
 
-@router.post("/manage-occurrence/{token}/reschedule", response_model=BookingResponse)
-def reschedule_booking_by_token(token: str, booking_in: BookingReschedule, db: Session = Depends(get_db)):
-    db_booking = db.query(Booking).filter(Booking.manage_token == token).first()
-    if not db_booking:
-        raise HTTPException(status_code=404, detail="Booking not found")
+@router.post("/manage-occurrence/{ref}/reschedule", response_model=BookingResponse)
+def reschedule_booking_by_ref(ref: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_booking = resolve_ref(ref, db, settings)
     if db_booking.status != "confirmed":
         raise HTTPException(status_code=400, detail="Only confirmed bookings can be rescheduled")
     booking_start_tz = db_booking.start if db_booking.start.tzinfo else db_booking.start.replace(tzinfo=UTC)
     minutes_until = (booking_start_tz - datetime.now(UTC)).total_seconds() / 60
-    action = _get_reschedule_action(db_booking.event_type, minutes_until)
+    action = get_reschedule_action(db_booking.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=_reschedule_blocked_detail(db_booking.event_type))
+        raise HTTPException(status_code=400, detail=reschedule_blocked_detail(db_booking.event_type))
     if action == 'request':
         request = BookingRequest(
             booking_id=db_booking.id,
@@ -865,17 +860,17 @@ def reschedule_booking_by_token(token: str, booking_in: BookingReschedule, db: S
     return _reschedule_booking(db_booking, booking_in, db, service)
 
 
-@router.get("/manage-series/{token}", response_model=BookingSeriesResponse)
-def get_series_by_token(token: str, db: Session = Depends(get_db)):
-    db_series = db.query(BookingSeries).filter(BookingSeries.manage_token == token).first()
+@router.get("/manage-series/{ref}", response_model=BookingSeriesResponse)
+def get_series_by_ref(ref: str, db: Session = Depends(get_db)):
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == ref).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     return db_series
 
 
-@router.post("/manage-series/{token}/cancel", response_model=BookingSeriesResponse)
-def cancel_series_by_token(token: str, db: Session = Depends(get_db)):
-    db_series = db.query(BookingSeries).filter(BookingSeries.manage_token == token).first()
+@router.post("/manage-series/{ref}/cancel", response_model=BookingSeriesResponse)
+def cancel_series_by_ref(ref: str, db: Session = Depends(get_db)):
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == ref).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     if not db_series.is_active:
@@ -889,9 +884,9 @@ def cancel_series_by_token(token: str, db: Session = Depends(get_db)):
     minutes_until = (
         (next_booking.start if next_booking.start.tzinfo else next_booking.start.replace(tzinfo=UTC)) - datetime.now(UTC)
     ).total_seconds() / 60 if next_booking else float('inf')
-    action = _get_cancel_action(db_series.event_type, minutes_until)
+    action = get_cancel_action(db_series.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=_cancel_blocked_detail(db_series.event_type))
+        raise HTTPException(status_code=400, detail=cancel_blocked_detail(db_series.event_type))
     if action == 'request':
         request = BookingRequest(booking_series_id=db_series.id, type='cancel_series')
         db.add(request)
@@ -904,9 +899,9 @@ def cancel_series_by_token(token: str, db: Session = Depends(get_db)):
     return _cancel_series(db_series, db, service)
 
 
-@router.post("/manage-series/{token}/reschedule", response_model=BookingSeriesResponse)
-def reschedule_series_by_token(token: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    db_series = db.query(BookingSeries).filter(BookingSeries.manage_token == token).first()
+@router.post("/manage-series/{ref}/reschedule", response_model=BookingSeriesResponse)
+def reschedule_series_by_ref(ref: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == ref).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     if not db_series.is_active:
@@ -920,9 +915,9 @@ def reschedule_series_by_token(token: str, booking_in: BookingReschedule, db: Se
     minutes_until = (
         (next_booking.start if next_booking.start.tzinfo else next_booking.start.replace(tzinfo=UTC)) - datetime.now(UTC)
     ).total_seconds() / 60 if next_booking else float('inf')
-    action = _get_reschedule_action(db_series.event_type, minutes_until)
+    action = get_reschedule_action(db_series.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=_reschedule_blocked_detail(db_series.event_type))
+        raise HTTPException(status_code=400, detail=reschedule_blocked_detail(db_series.event_type))
     if action == 'request':
         request = BookingRequest(
             booking_series_id=db_series.id,

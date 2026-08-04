@@ -6,12 +6,6 @@ import { useLocation, useParams } from 'react-router'
 import { extractError, formatUTCTime } from './utils'
 
 /*
- BookingPage — Edit/cancel link
-  - Requires a public cancel endpoint — the existing DELETE /bookings/{id} is admin-only with no auth protection yet, so we need a manage_token (UUID) added to the Booking model, generated on create
-  - Backend: add manage_token column, expose POST /bookings/manage-occurrence/{token}/cancel that deletes the booking + Google Calendar event
-  - Frontend: done step shows "Cancel booking" link → /cancel/:token, a simple page that calls the endpoint and confirms
-  - DB migration needed (new column)
-
   BookingPage — Custom duration
   - If eventType.allow_custom_duration, show a duration slider/NumberInput on the contact step (between min and max)
   - selectedDuration state, defaults to min_duration_minutes
@@ -70,7 +64,7 @@ const buildOutlookUrl = (base: string, start: string, end: string, title: string
     return `${base}/calendar/0/action/compose?${p}`
 }
 
-const buildIcsBlobUrl = (start: string, end: string, title: string, description: string | null, uid: number | null) => {
+const buildIcsBlobUrl = (start: string, end: string, title: string, description: string | null, uid: string | null) => {
     const fmt = (iso: string) => new Date(iso).toISOString().replace(/[-:.]/g, '').slice(0, 15) + 'Z'
     const lines = [
         'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//TMS//TMS//EN', 'BEGIN:VEVENT',
@@ -102,7 +96,7 @@ const BookingPage = () => {
     const location = useLocation()
     const [rescheduleFromId, setRescheduleFromId] = useState<string | null>(location.state?.rescheduleFromId ?? null)
     const [rescheduleSeriesId, setRescheduleSeriesId] = useState<string | null>(location.state?.rescheduleSeriesId ?? null)
-    const requestRescheduleToken = location.state?.requestRescheduleToken ?? null
+    const requestRescheduleRef = location.state?.requestRescheduleRef ?? null
     const originalStart = location.state?.originalStart ?? null
     const originalEnd = location.state?.originalEnd ?? null
     const originalDayOfWeek: number | null = location.state?.originalDayOfWeek ?? null
@@ -132,7 +126,7 @@ const BookingPage = () => {
     const [touched, setTouched] = useState<ContactFormTouched>({})
     const [submitError, setSubmitError] = useState<string | null>(null)
     const [submitting, setSubmitting] = useState(false)
-    const [bookingId, setBookingId] = useState<number | null>(null)
+    const [bookingId, setBookingId] = useState<string | null>(null)
     const [requestSubmitted, setRequestSubmitted] = useState(false)
 
     const loadData = async () => {
@@ -265,7 +259,7 @@ const BookingPage = () => {
 
     const handleSlotSelect = (slot: AvailableSlot) => {
         setSelectedSlot(slot)
-        if (rescheduleFromId || rescheduleSeriesId || requestRescheduleToken) setConfirmingReschedule(true)
+        if (rescheduleFromId || rescheduleSeriesId || requestRescheduleRef) setConfirmingReschedule(true)
         else setStep('contact')
     }
 
@@ -317,11 +311,11 @@ const BookingPage = () => {
         }
     }
 
-    const handleTokenReschedule = async () => {
+    const handleRefReschedule = async () => {
         if (!selectedSlot || !eventType) return
         setSubmitting(true)
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${requestRescheduleToken}/reschedule`, {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${requestRescheduleRef}/reschedule`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(buildReschedulePayload()),
@@ -593,12 +587,12 @@ const BookingPage = () => {
                             </button>
 
                             <h2 className="text-xl font-bold text-gray-900 mb-1">
-                                {rescheduleSeriesId ? 'Confirm series change' : requestRescheduleToken ? 'Request reschedule' : 'Confirm reschedule'}
+                                {rescheduleSeriesId ? 'Confirm series change' : requestRescheduleRef ? 'Request reschedule' : 'Confirm reschedule'}
                             </h2>
                             <p className="text-sm text-gray-400 mb-8">
                                 {rescheduleSeriesId
                                     ? 'All future occurrences will move to the new time.'
-                                    : requestRescheduleToken
+                                    : requestRescheduleRef
                                     ? 'Your reschedule request will be submitted for admin review.'
                                     : 'Your booking will be moved to the new time below.'}
                             </p>
@@ -652,8 +646,8 @@ const BookingPage = () => {
                                 {submitError && <p className="text-sm text-red-500 mt-1">{submitError}</p>}
 
                                 <Button size="md" radius="xl" loading={submitting} className="mt-2"
-                                    onClick={rescheduleSeriesId ? handleSeriesReschedule : requestRescheduleToken ? handleTokenReschedule : handleReschedule}>
-                                    {rescheduleSeriesId ? 'Update series' : requestRescheduleToken ? 'Submit reschedule request' : 'Confirm reschedule'}
+                                    onClick={rescheduleSeriesId ? handleSeriesReschedule : requestRescheduleRef ? handleRefReschedule : handleReschedule}>
+                                    {rescheduleSeriesId ? 'Update series' : requestRescheduleRef ? 'Submit reschedule request' : 'Confirm reschedule'}
                                 </Button>
                             </div>
                         </>

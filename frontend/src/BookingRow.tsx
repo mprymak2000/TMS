@@ -333,9 +333,9 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                         {expanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
                     </button>
                     {isCustomer ? (
-                        booking.manage_token && (
+                        booking.id && (
                             <button
-                                onClick={() => navigate(`/manage-occurrence/${booking.manage_token}`)}
+                                onClick={() => navigate(`/manage-occurrence/${booking.id}`)}
                                 className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
                             >
                                 Manage
