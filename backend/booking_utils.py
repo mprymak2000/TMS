@@ -167,3 +167,29 @@ def _virtual_occurrences(series: BookingSeries, after: datetime, count: int, set
             )
         cursor_date += timedelta(days=7)
     return occurrences
+
+
+def resolve_series_occurrences(
+    relevant_series: list[BookingSeries],
+    real_q,
+    now: datetime,
+    page: int,
+    page_size: int,
+    settings,
+) -> list[BookingResponse]:
+    """Merge real + virtual upcoming occurrences across the given series, paginate to one page.
+    Shared by GET /bookings/my-bookings (many series, scoped by email/tutor_id) and
+    GET /bookings/booking-series/{id}/occurrences (exactly one series)."""
+    needed_total = page * page_size
+    real_bookings = real_q.filter(Booking.start >= now, Booking.status == "confirmed").all()
+
+    virtual = []
+    for series in relevant_series:
+        virtual.extend(_virtual_occurrences(series, now, needed_total, settings))
+
+    def _sort_key(b):
+        return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
+
+    merged = sorted([*real_bookings, *virtual], key=_sort_key)
+    start = (page - 1) * page_size
+    return [BookingResponse.model_validate(b) for b in merged[start:start + page_size]]

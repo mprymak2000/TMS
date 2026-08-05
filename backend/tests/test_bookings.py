@@ -939,3 +939,113 @@ def test_resolve_ref_rejects_occurrence_before_series_earliest(client):
     fabricated_ref = f"{first_booking['series_id']}:{int(earlier_start.timestamp())}"
     response = client.delete(f"/bookings/{fabricated_ref}")
     assert response.status_code == 400
+
+
+# ── BOOKING-SERIES LIST + PER-SERIES OCCURRENCES ────────────────────────────────
+
+def test_get_booking_series_lists_active_series(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    series_list = client.get("/bookings/booking-series").json()
+    assert len(series_list) == 1
+    assert series_list[0]["id"] == created["series_id"]
+
+
+def test_get_booking_series_excludes_standalone(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+
+    assert client.get("/bookings/booking-series").json() == []
+
+
+def test_get_booking_series_excludes_cancelled_series(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.delete(f"/bookings/booking-series/{created['series_id']}")
+
+    assert client.get("/bookings/booking-series").json() == []
+
+
+def test_get_booking_series_email_filter(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={**event_type_recurring, "availability": availability}).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    other_payload = {**payload, "student_email": "someone-else@example.com", "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+        client.post("/bookings/", json=other_payload)
+
+    items = client.get("/bookings/booking-series?email=someone-else@example.com").json()
+    assert len(items) == 1
+    assert items[0]["student_email"] == "someone-else@example.com"
+
+
+def test_booking_series_occurrences_upcoming_merges_real_and_virtual(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?page=1")
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) >= 2  # occurrence 1 (real) + at least one virtual occurrence
+    assert items[0]["id"] == created["id"]
+    starts = [i["start"] for i in items]
+    assert starts == sorted(starts)
+
+
+def test_booking_series_occurrences_never_writes_to_db(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?page=3")
+    all_bookings = _all_bookings()
+    assert len(all_bookings) == 1  # only the real occurrence 1 — nothing materialized by browsing
+
+
+def test_booking_series_occurrences_past(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    db = TestingSessionLocal()
+    booking = db.query(Booking).filter(Booking.public_id == created["id"]).first()
+    booking.start = datetime(2020, 1, 7, 16, 0, tzinfo=UTC)
+    booking.end = datetime(2020, 1, 7, 17, 0, tzinfo=UTC)
+    db.commit()
+    db.close()
+
+    upcoming = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?status=upcoming").json()["items"]
+    past = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?status=past").json()["items"]
+    assert created["id"] not in [i["id"] for i in upcoming]
+    assert created["id"] in [i["id"] for i in past]
+
+
+def test_booking_series_occurrences_not_found(client):
+    response = client.get("/bookings/booking-series/00000000-0000-0000-0000-000000000000/occurrences")
+    assert response.status_code == 404
+
+
+def test_booking_series_occurrences_excludes_other_series(client):
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={**event_type_recurring, "availability": availability}).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    other_payload = {**payload, "student_email": "someone-else@example.com", "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        other_created = client.post("/bookings/", json=other_payload).json()
+
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences").json()["items"]
+    ids = [i["id"] for i in items]
+    assert created["id"] in ids
+    assert other_created["id"] not in ids

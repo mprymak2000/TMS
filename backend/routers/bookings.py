@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import _virtual_occurrences, resolve_ref
+from booking_utils import _virtual_occurrences, resolve_ref, resolve_series_occurrences
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -76,36 +76,73 @@ def get_my_bookings(
         return {"items": items}
 
     if status == "upcoming":
-        # generate needed_total per series (not minus real count) — a far-future real row
-        # shouldn't reduce how many near-term virtual occurrences we generate
-        needed_total = page * PAGE_SIZE
-
-        real_q = db.query(Booking).filter(Booking.start >= now, Booking.status == "confirmed")
+        real_q = db.query(Booking)
         if email:
             real_q = real_q.filter((Booking.student_email == email) | (Booking.parent_email == email))
         if tutor_id:
             real_q = real_q.filter(Booking.tutor_id == tutor_id)
-        real_upcoming_bookings = real_q.all()
 
         series_q = db.query(BookingSeries).filter(BookingSeries.is_active == True)
         if email:
             series_q = series_q.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
         if tutor_id:
             series_q = series_q.filter(BookingSeries.tutor_id == tutor_id)
-        relevant_series = series_q.all()
 
-        virtual = []
-        for series in relevant_series:
-            virtual.extend(_virtual_occurrences(series, now, needed_total, settings))
+        items = resolve_series_occurrences(series_q.all(), real_q, now, page, PAGE_SIZE, settings)
+        return {"items": items}
 
-        # b.start may come back naive under SQLite even though it's always stored as UTC —
-        # normalize for sorting without mutating the objects themselves.
-        def _sort_key(b):
-            return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
 
-        merged = sorted([*real_upcoming_bookings, *virtual], key=_sort_key)
-        start_index = (page - 1) * PAGE_SIZE
-        return {"items": merged[start_index:start_index + PAGE_SIZE]}
+@router.get("/booking-series", response_model=list[BookingSeriesResponse])
+def get_booking_series(
+    email: str | None = Query(default=None),
+    tutor_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """Bare series list — no embedded occurrences. Expanding a series row on the frontend
+    calls GET /booking-series/{id}/occurrences separately, the same way GET /my-bookings does
+    it internally — one shared resolution path (resolve_series_occurrences) for all occurrence
+    reads, regardless of whether the caller wants everyone's occurrences or just one series'."""
+    q = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+    if email:
+        q = q.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
+    if tutor_id:
+        q = q.filter(BookingSeries.tutor_id == tutor_id)
+    results = []
+    for series in q.all():
+        resp = BookingSeriesResponse.model_validate(series)
+        resp.bookings = []  # unused here — occurrences are always fetched separately, paginated
+        results.append(resp)
+    return results
+
+
+@router.get("/booking-series/{id}/occurrences", response_model=MyBookingsResponse)
+def get_booking_series_occurrences(
+    id: str,
+    status: str = Query(default="upcoming"),  # "upcoming" | "past"
+    page: int = Query(default=1, ge=1),
+    db: Session = Depends(get_db),
+    settings=Depends(get_settings),
+):
+    series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
+    if not series:
+        raise HTTPException(status_code=404, detail="Booking series not found")
+
+    now = datetime.now(UTC)
+
+    if status == "past":
+        items = (
+            db.query(Booking)
+            .filter(Booking.series_id == series.id, Booking.start < now)
+            .order_by(Booking.start.desc())
+            .offset((page - 1) * PAGE_SIZE)
+            .limit(PAGE_SIZE)
+            .all()
+        )
+        return {"items": items}
+
+    real_q = db.query(Booking).filter(Booking.series_id == series.id)
+    items = resolve_series_occurrences([series], real_q, now, page, PAGE_SIZE, settings)
+    return {"items": items}
 
 
 @router.get("/{ref}", response_model=BookingResponse)
