@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Select, TextInput, Loader, Input, Button, Modal } from '@mantine/core'
-import { IconSearch, IconCalendar } from '@tabler/icons-react'
+import { TextInput, Loader, Input, Button, Modal, Popover, Menu, Switch } from '@mantine/core'
+import { IconSearch, IconCalendar, IconFilter, IconX, IconCheck, IconChevronDown } from '@tabler/icons-react'
 import type { Tutor, EventType, Booking, BookingSeries } from './types'
 import { extractError, formatDate, formatTime, tutorBubbleClass } from './utils'
 import { useToast } from './useToast'
@@ -9,8 +9,8 @@ import SeriesRow from './SeriesRow'
 import Toast from './Toast'
 
 interface BookingFilters {
-    tutorId: string | null
-    eventTypeId: string | null
+    tutorIds: string[]
+    eventTypeIds: string[]
     dateFrom: string | null
     dateTo: string | null
     searchQuery: string
@@ -23,12 +23,16 @@ interface LoadErrors {
     eventTypes?: string
 }
 
-type BookingsTab = 'upcoming' | 'past' | 'recurring' | 'requests'
+// Two independent axes, not one flat list: which VIEW (row shape/interaction model — flat
+// occurrence feed vs. series-grouped-with-manage vs. pending-decisions) is the outer tab,
+// since it changes the whole interaction paradigm; TIME SCOPE is just a filter within a view,
+// so it's an inner toggle instead — Requests has no time scope at all (nothing to filter).
+type BookingsTab = 'timeline' | 'recurring' | 'requests'
+type TimeScope = 'upcoming' | 'past'
 type FetchResult = { ok: true; items: Booking[]; hasMore: boolean } | { ok: false; error: any }
 
 const TABS = [
-    { key: 'upcoming', label: 'Upcoming' },
-    { key: 'past', label: 'Past' },
+    { key: 'timeline', label: 'Timeline' },
     { key: 'recurring', label: 'Recurring' },
     { key: 'requests', label: 'Requests' },
 ] as const
@@ -54,10 +58,10 @@ const formatGap = (minutes: number): string => {
     return `${hours}h ${mins}m`
 }
 
-const fetchMyBookings = async (tab: BookingsTab, pageNum: number, emailFilter?: string): Promise<FetchResult> => {
+const fetchMyBookings = async (tab: 'timeline' | 'requests', timeScope: TimeScope, pageNum: number, emailFilter?: string): Promise<FetchResult> => {
     const base = `${import.meta.env.VITE_API_URL}/bookings/my-bookings`
     const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
-    const query = tab === 'requests' ? `pending_only=true` : `status=${tab}`
+    const query = tab === 'requests' ? `pending_only=true` : `status=${timeScope}`
 
     const res = await fetch(`${base}?${query}&page=${pageNum}${emailParam}`)
     if (!res.ok) { return { ok: false, error: await res.json() } }
@@ -67,13 +71,69 @@ const fetchMyBookings = async (tab: BookingsTab, pageNum: number, emailFilter?: 
     return { ok: true, items, hasMore: items.length === PAGE_SIZE }
 }
 
+const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }) => (
+    <span className="inline-flex items-center gap-1 bg-indigo-50 text-indigo-700 text-xs font-medium pl-2.5 pr-1.5 py-1 rounded-full">
+        {label}
+        <button onClick={onRemove} className="hover:text-indigo-900 transition-colors">
+            <IconX size={12} />
+        </button>
+    </span>
+)
+
+interface CheckDropdownOption {
+    value: string
+    label: string
+}
+
+const CheckDropdown = ({
+    label,
+    options,
+    selected,
+    onToggle,
+}: {
+    label: string
+    options: CheckDropdownOption[]
+    selected: string[]
+    onToggle: (value: string) => void
+}) => (
+    <Menu closeOnItemClick={false} withinPortal={false} shadow="md" width={220} position="bottom-start">
+        <Menu.Target>
+            <Button
+                variant="default"
+                size="sm"
+                rightSection={<IconChevronDown size={14} />}
+                styles={{ root: { borderRadius: '8px', borderColor: '#e5e7eb' }, label: { fontWeight: 400 } }}
+            >
+                {label}{selected.length > 0 ? ` · ${selected.length}` : ''}
+            </Button>
+        </Menu.Target>
+        <Menu.Dropdown>
+            {options.length === 0 && <Menu.Item disabled>None available</Menu.Item>}
+            {options.map(opt => {
+                const checked = selected.includes(opt.value)
+                return (
+                    <Menu.Item
+                        key={opt.value}
+                        onClick={() => onToggle(opt.value)}
+                        leftSection={checked ? <IconCheck size={14} className="text-indigo-600" /> : <span style={{ display: 'inline-block', width: 14 }} />}
+                    >
+                        {opt.label}
+                    </Menu.Item>
+                )
+            })}
+        </Menu.Dropdown>
+    </Menu>
+)
+
 
 const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [bookings, setBookings] = useState<Booking[]>([])
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [eventTypes, setEventTypes] = useState<EventType[]>([])
-    const [activeTab, setActiveTab] = useState<BookingsTab>('upcoming')
-    const [filters, setFilters] = useState<BookingFilters>({ tutorId: null, eventTypeId: null, dateFrom: null, dateTo: null, searchQuery: '', pendingOnly: false })
+    const [activeTab, setActiveTab] = useState<BookingsTab>('timeline')
+    const [timeScope, setTimeScope] = useState<TimeScope>('upcoming')
+    const [filters, setFilters] = useState<BookingFilters>({ tutorIds: [], eventTypeIds: [], dateFrom: null, dateTo: null, searchQuery: '', pendingOnly: false })
+    const [filtersOpen, setFiltersOpen] = useState(false)
     const [expandedId, setExpandedId] = useState<string | null>(null)
     const [cancellingSeriesId, setCancellingSeriesId] = useState<string | null>(null)
     const [isCancelling, setIsCancelling] = useState(false)
@@ -107,13 +167,13 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         ].filter(Boolean).join(' ').toLowerCase()
     }
 
-    const loadData = async (options: { emailFilter?: string; tab?: BookingsTab; pageNum?: number; append?: boolean } = {}) => {
-        const { emailFilter, tab = activeTab, pageNum = 1, append = false } = options
+    const loadData = async (options: { emailFilter?: string; tab?: 'timeline' | 'requests'; timeScope?: TimeScope; pageNum?: number; append?: boolean } = {}) => {
+        const { emailFilter, tab = (activeTab === 'requests' ? 'requests' : 'timeline'), timeScope: scope = timeScope, pageNum = 1, append = false } = options
         if (append) setIsLoadingMore(true)
         else setIsLoading(true)
         try {
             const [bookingsRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetchMyBookings(tab, pageNum, emailFilter),
+                fetchMyBookings(tab, scope, pageNum, emailFilter),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/event_types`),
             ])
@@ -183,14 +243,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     }
 
     useEffect(() => {
-        if (!isCustomer) { loadData({ tab: activeTab }); return }
+        if (!isCustomer) { loadData({ tab: 'timeline' }); return }
         const saved = sessionStorage.getItem('customer_email')
-        if (saved) loadData({ emailFilter: saved, tab: activeTab })
+        if (saved) loadData({ emailFilter: saved, tab: 'timeline' })
     }, [])
 
     const refresh = () => {
         if (activeTab === 'recurring') loadSeries(isCustomer ? email : undefined)
-        else loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab })
+        else loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline' })
     }
 
     const handleTabChange = (tab: BookingsTab) => {
@@ -199,13 +259,18 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         else loadData({ emailFilter: isCustomer ? email : undefined, tab })
     }
 
-    const handleLoadMore = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab, pageNum: page + 1, append: true })
+    const handleTimeScopeChange = (scope: TimeScope) => {
+        setTimeScope(scope)
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', timeScope: scope })
+    }
+
+    const handleLoadMore = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', timeScope, pageNum: page + 1, append: true })
 
     const handleEmailSubmit = () => {
         if (!email.trim()) return
         sessionStorage.setItem('customer_email', email.trim())
         setSubmitted(true)
-        loadData({ emailFilter: email.trim(), tab: activeTab })
+        loadData({ emailFilter: email.trim(), tab: 'timeline' })
     }
 
     const handleCancelSeries = async (seriesId: string) => {
@@ -261,14 +326,25 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         }
     }
 
+    const activeFilterCount = [
+        filters.tutorIds.length > 0,
+        filters.eventTypeIds.length > 0,
+        filters.dateFrom !== null,
+        filters.dateTo !== null,
+        filters.pendingOnly,
+    ].filter(Boolean).length
+
     const displayed = bookings
-        .filter(b => !filters.tutorId || b.tutor_id === Number(filters.tutorId))
-        .filter(b => !filters.eventTypeId || b.event_type_id === Number(filters.eventTypeId))
+        .filter(b => filters.tutorIds.length === 0 || filters.tutorIds.includes(String(b.tutor_id)))
+        .filter(b => filters.eventTypeIds.length === 0 || filters.eventTypeIds.includes(String(b.event_type_id)))
         .filter(b => !filters.dateFrom || b.start.slice(0, 10) >= filters.dateFrom)
         .filter(b => !filters.dateTo || b.start.slice(0, 10) <= filters.dateTo)
         .filter(b => getSearchString(b).includes(filters.searchQuery.trim().toLowerCase()))
         .filter(b => !filters.pendingOnly || b.request?.status === 'pending')
-        .sort((a, b) => a.start.localeCompare(b.start))
+        // Past is reverse-chronological (most recent first) — matches the backend's own
+        // ORDER BY start DESC for that scope. Without this, appending an older "Load more"
+        // page and re-sorting ascending would put older items above newer ones, backwards.
+        .sort((a, b) => timeScope === 'past' ? b.start.localeCompare(a.start) : a.start.localeCompare(b.start))
 
     if (isCustomer && !submitted) {
         return (
@@ -389,13 +465,30 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         </>
                     ) : (
                         <>
+                            {/* time-scope toggle — inner axis, only relevant to the timeline view */}
+                            <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit mb-4">
+                                {(['upcoming', 'past'] as const).map(scope => (
+                                    <button
+                                        key={scope}
+                                        onClick={() => handleTimeScopeChange(scope)}
+                                        className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+                                            timeScope === scope
+                                                ? 'bg-white text-gray-800 shadow-sm'
+                                                : 'text-gray-500 hover:text-gray-700'
+                                        }`}
+                                    >
+                                        {scope === 'upcoming' ? 'Upcoming' : 'Past'}
+                                    </button>
+                                ))}
+                            </div>
+
                             {isLoading && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
 
                             {!isLoading && (
                                 <div className="flex flex-col">
                                     {displayed.map((b, i) => {
                                         const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
-                                        const gapMinutes = !isNewDate ? gapMinutesBetween(displayed[i - 1].end, b.start) : 0
+                                        const gapMinutes = !isNewDate ? (timeScope === 'past' ? gapMinutesBetween(b.end, displayed[i - 1].start) : gapMinutesBetween(displayed[i - 1].end, b.start)) : 0
                                         const showGap = !isNewDate && gapMinutes > 30
                                         return (
                                             <div key={b.id} className={isNewDate ? 'mt-5 first:mt-0' : 'mt-1.5'}>
@@ -430,7 +523,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                             </div>
                                             <p className="text-sm font-medium text-gray-500">No bookings found</p>
                                             <p className="text-xs text-gray-400 mt-1">
-                                                {activeTab === 'upcoming' ? 'No upcoming sessions.' : 'No past sessions.'}
+                                                {timeScope === 'upcoming' ? 'No upcoming sessions.' : 'No past sessions.'}
                                             </p>
                                         </div>
                                     )}
@@ -488,58 +581,138 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 ))}
             </div>
 
-            {/* filter bar */}
-            {activeTab !== 'requests' && activeTab !== 'recurring' && !isCustomer && <div className="flex flex-wrap gap-3 mb-5">
-                <TextInput
-                    placeholder="Search..."
-                    leftSection={<IconSearch size={14} />}
-                    value={filters.searchQuery}
-                    onChange={e => setFilters(f => ({ ...f, searchQuery: e.target.value }))}
-                    styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                    size="sm"
-                />
-                <Select
-                    placeholder="All tutors"
-                    data={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
-                    value={filters.tutorId}
-                    onChange={v => setFilters(f => ({ ...f, tutorId: v }))}
-                    clearable
-                    size="sm"
-                    styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                />
-                <Select
-                    placeholder="All event types"
-                    data={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
-                    value={filters.eventTypeId}
-                    onChange={v => setFilters(f => ({ ...f, eventTypeId: v }))}
-                    clearable
-                    size="sm"
-                    styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                />
-                <Input
-                    type="date"
-                    size="sm"
-                    onChange={e => setFilters(f => ({ ...f, dateFrom: e.target.value || null }))}
-                    styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                />
-                <span className="text-gray-400 text-sm self-center">to</span>
-                <Input
-                    type="date"
-                    size="sm"
-                    onChange={e => setFilters(f => ({ ...f, dateTo: e.target.value || null }))}
-                    styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                />
-                <button
-                    onClick={() => setFilters(f => ({ ...f, pendingOnly: !f.pendingOnly }))}
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${
-                        filters.pendingOnly
-                            ? 'bg-amber-50 text-amber-700 border-amber-200'
-                            : 'bg-white text-gray-500 border-gray-200 hover:border-gray-300'
-                    }`}
-                >
-                    Pending requests
-                </button>
-            </div>}
+            {/* time-scope toggle — inner axis, only relevant to the timeline view */}
+            {activeTab === 'timeline' && (
+                <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit mb-4">
+                    {(['upcoming', 'past'] as const).map(scope => (
+                        <button
+                            key={scope}
+                            onClick={() => handleTimeScopeChange(scope)}
+                            className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
+                                timeScope === scope
+                                    ? 'bg-white text-gray-800 shadow-sm'
+                                    : 'text-gray-500 hover:text-gray-700'
+                            }`}
+                        >
+                            {scope === 'upcoming' ? 'Upcoming' : 'Past'}
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            {/* filters */}
+            {activeTab !== 'requests' && activeTab !== 'recurring' && !isCustomer && (
+                <div className="mb-5">
+                    <div className="flex flex-wrap gap-2">
+                        <TextInput
+                            placeholder="Search..."
+                            leftSection={<IconSearch size={14} />}
+                            value={filters.searchQuery}
+                            onChange={(e) => {
+                                const value = e.target.value
+                                setFilters(f => ({ ...f, searchQuery: value }))
+                            }}
+                            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
+                            size="sm"
+                        />
+                        <Popover opened={filtersOpen} onChange={setFiltersOpen} position="bottom-start" shadow="md" width={300}>
+                            <Popover.Target>
+                                <Button
+                                    variant="default"
+                                    size="sm"
+                                    leftSection={<IconFilter size={14} />}
+                                    onClick={() => setFiltersOpen(o => !o)}
+                                    styles={{ root: { borderRadius: '8px', borderColor: '#e5e7eb' } }}
+                                >
+                                    Filters{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ''}
+                                </Button>
+                            </Popover.Target>
+                            <Popover.Dropdown>
+                                <div className="flex flex-col gap-3">
+                                    <CheckDropdown
+                                        label="Tutors"
+                                        options={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                                        selected={filters.tutorIds}
+                                        onToggle={id => setFilters(f => ({
+                                            ...f,
+                                            tutorIds: f.tutorIds.includes(id) ? f.tutorIds.filter(x => x !== id) : [...f.tutorIds, id],
+                                        }))}
+                                    />
+                                    <CheckDropdown
+                                        label="Event types"
+                                        options={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
+                                        selected={filters.eventTypeIds}
+                                        onToggle={id => setFilters(f => ({
+                                            ...f,
+                                            eventTypeIds: f.eventTypeIds.includes(id) ? f.eventTypeIds.filter(x => x !== id) : [...f.eventTypeIds, id],
+                                        }))}
+                                    />
+                                    <div className="flex gap-2 items-center">
+                                        <Input
+                                            type="date"
+                                            size="sm"
+                                            value={filters.dateFrom ?? ''}
+                                            onChange={(e) => {
+                                                const value = e.target.value || null
+                                                setFilters(f => ({ ...f, dateFrom: value }))
+                                            }}
+                                            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
+                                        />
+                                        <span className="text-gray-400 text-sm shrink-0">to</span>
+                                        <Input
+                                            type="date"
+                                            size="sm"
+                                            value={filters.dateTo ?? ''}
+                                            onChange={(e) => {
+                                                const value = e.target.value || null
+                                                setFilters(f => ({ ...f, dateTo: value }))
+                                            }}
+                                            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
+                                        />
+                                    </div>
+                                    <Switch
+                                        label="Pending requests only"
+                                        checked={filters.pendingOnly}
+                                        onChange={(e) => {
+                                            const checked = e.currentTarget.checked
+                                            setFilters(f => ({ ...f, pendingOnly: checked }))
+                                        }}
+                                        size="sm"
+                                    />
+                                </div>
+                            </Popover.Dropdown>
+                        </Popover>
+                    </div>
+
+                    {activeFilterCount > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-3">
+                            {filters.tutorIds.map(id => (
+                                <FilterChip
+                                    key={`tutor-${id}`}
+                                    label={`Tutor: ${tutors.find(t => String(t.id) === id)?.first_name ?? ''}`}
+                                    onRemove={() => setFilters(f => ({ ...f, tutorIds: f.tutorIds.filter(x => x !== id) }))}
+                                />
+                            ))}
+                            {filters.eventTypeIds.map(id => (
+                                <FilterChip
+                                    key={`event-${id}`}
+                                    label={`Event: ${eventTypes.find(e => String(e.id) === id)?.name ?? ''}`}
+                                    onRemove={() => setFilters(f => ({ ...f, eventTypeIds: f.eventTypeIds.filter(x => x !== id) }))}
+                                />
+                            ))}
+                            {filters.dateFrom && (
+                                <FilterChip label={`From: ${filters.dateFrom}`} onRemove={() => setFilters(f => ({ ...f, dateFrom: null }))} />
+                            )}
+                            {filters.dateTo && (
+                                <FilterChip label={`To: ${filters.dateTo}`} onRemove={() => setFilters(f => ({ ...f, dateTo: null }))} />
+                            )}
+                            {filters.pendingOnly && (
+                                <FilterChip label="Pending only" onRemove={() => setFilters(f => ({ ...f, pendingOnly: false }))} />
+                            )}
+                        </div>
+                    )}
+                </div>
+            )}
 
             {/* spinner */}
             {(activeTab === 'recurring' ? isLoadingSeries : isLoading) && <div className="flex justify-center py-12"><Loader size="sm" /></div>}
@@ -624,7 +797,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 <div className="flex flex-col">
                     {displayed.map((b, i) => {
                         const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
-                        const gapMinutes = !isNewDate ? gapMinutesBetween(displayed[i - 1].end, b.start) : 0
+                        const gapMinutes = !isNewDate ? (timeScope === 'past' ? gapMinutesBetween(b.end, displayed[i - 1].start) : gapMinutesBetween(displayed[i - 1].end, b.start)) : 0
                         const showGap = !isNewDate && gapMinutes > 30
                         return (
                             <div key={b.id} className={isNewDate ? 'mt-5 first:mt-0' : 'mt-1.5'}>
