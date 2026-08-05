@@ -19,8 +19,6 @@ from models import Booking, BookingRequest, BookingSeries, EventType, Tutor
 from policy import (
     get_cancel_action,
     get_reschedule_action,
-    cancel_blocked_detail,
-    reschedule_blocked_detail,
 )
 from schemas import (
     BookingCreate,
@@ -819,7 +817,7 @@ def cancel_booking_by_ref(ref: str, db: Session = Depends(get_db), settings=Depe
     minutes_until = (booking_start_tz - datetime.now(UTC)).total_seconds() / 60
     action = get_cancel_action(db_booking.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=cancel_blocked_detail(db_booking.event_type))
+        raise HTTPException(status_code=400, detail="Cancellation is not currently available for this booking")
     if action == 'request':
         request = BookingRequest(booking_id=db_booking.id, type='cancel_occurrence')
         db.add(request)
@@ -840,7 +838,7 @@ def reschedule_booking_by_ref(ref: str, booking_in: BookingReschedule, db: Sessi
     minutes_until = (booking_start_tz - datetime.now(UTC)).total_seconds() / 60
     action = get_reschedule_action(db_booking.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=reschedule_blocked_detail(db_booking.event_type))
+        raise HTTPException(status_code=400, detail="Rescheduling is not currently available for this booking")
     if action == 'request':
         request = BookingRequest(
             booking_id=db_booking.id,
@@ -886,7 +884,7 @@ def cancel_series_by_ref(ref: str, db: Session = Depends(get_db)):
     ).total_seconds() / 60 if next_booking else float('inf')
     action = get_cancel_action(db_series.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=cancel_blocked_detail(db_series.event_type))
+        raise HTTPException(status_code=400, detail="Cancellation is not currently available for this series")
     if action == 'request':
         request = BookingRequest(booking_series_id=db_series.id, type='cancel_series')
         db.add(request)
@@ -917,7 +915,7 @@ def reschedule_series_by_ref(ref: str, booking_in: BookingReschedule, db: Sessio
     ).total_seconds() / 60 if next_booking else float('inf')
     action = get_reschedule_action(db_series.event_type, minutes_until)
     if action == 'blocked':
-        raise HTTPException(status_code=400, detail=reschedule_blocked_detail(db_series.event_type))
+        raise HTTPException(status_code=400, detail="Rescheduling is not currently available for this series")
     if action == 'request':
         request = BookingRequest(
             booking_series_id=db_series.id,

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Button, Modal, Menu, TextInput } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff } from '@tabler/icons-react'
+import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, Tutor, EventType } from './types'
 import { formatDate, formatTime, extractError, tutorBubbleClass } from './utils'
@@ -13,6 +13,7 @@ interface BookingRowProps {
     onExpand: () => void
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
+    onReviewRequest?: (booking: Booking) => void
     isCustomer?: boolean
     compact?: boolean
 }
@@ -31,7 +32,7 @@ const statusConfig = (b: Booking) => {
     return { dot: 'bg-emerald-400', label: null, chip: '' }
 }
 
-const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, onError, isCustomer = false, compact = false }: BookingRowProps) => {
+const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, onError, onReviewRequest, isCustomer = false, compact = false }: BookingRowProps) => {
     const navigate = useNavigate()
     const [confirmingDelete, setConfirmingDelete] = useState(false)
     const [confirmingPermanentDelete, setConfirmingPermanentDelete] = useState(false)
@@ -66,29 +67,6 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
             setContactError(null)
         }
     }, [editingContact])
-
-    const formatNotice = (minutes: number): string => {
-        const hours = minutes / 60
-        if (hours <= 48) return minutes % 60 === 0 ? `${hours} hours` : `${minutes} minutes`
-        const days = Math.floor(hours / 24)
-        const remHours = hours % 24
-        return remHours ? `${days} days ${remHours} hours` : `${days} days`
-    }
-
-    const checkNotice = (mode: string | null, noticeMinutes: number | null, label: string): boolean => {
-        if (mode === 'not_allowed') {
-            onError(`${label} is not allowed for this event type`)
-            return false
-        }
-        if (noticeMinutes && noticeMinutes > 0) {
-            const noticeGiven = (new Date(booking.start).getTime() - Date.now()) / 60000
-            if (noticeGiven < noticeMinutes) {
-                onError(`${label} requires at least ${formatNotice(noticeMinutes)} notice`)
-                return false
-            }
-        }
-        return true
-    }
 
     const handleDelete = async () => {
         setIsSubmitting(true)
@@ -199,6 +177,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
 
     const status = statusConfig(booking)
     const startDate = new Date(booking.start)
+    const dayName = startDate.toLocaleDateString('en-US', { weekday: 'short' })
     const monthStr = startDate.toLocaleDateString('en-US', { month: 'short' })
     const dayNum = startDate.getDate()
 
@@ -210,12 +189,23 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                 </button>
             </Menu.Target>
             <Menu.Dropdown>
+                {booking.request?.status === 'pending' && (
+                    <>
+                        <Menu.Item
+                            leftSection={<IconAlertCircle size={14} />}
+                            color="amber"
+                            onClick={() => onReviewRequest?.(booking)}
+                        >
+                            Review request
+                        </Menu.Item>
+                        <Menu.Divider />
+                    </>
+                )}
                 {booking.series_id !== null ? (
                     <Menu.Item
                         leftSection={<IconCalendarEvent size={14} />}
                         disabled={booking.status !== 'confirmed'}
                         onClick={() => {
-                            if (!checkNotice(eventType.reschedule_mode, eventType.reschedule_notice_minutes, 'Reschedule')) return
                             navigate(`/book/${eventType.id}`, {
                                 state: {
                                     rescheduleFromId: booking.id,
@@ -239,7 +229,6 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                             leftSection={<IconCalendarEvent size={14} />}
                             disabled={booking.status !== 'confirmed'}
                             onClick={() => {
-                                if (!checkNotice(eventType.reschedule_mode, eventType.reschedule_notice_minutes, 'Reschedule')) return
                                 navigate(`/book/${eventType.id}`, {
                                     state: {
                                         rescheduleFromId: booking.id,
@@ -275,7 +264,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                         leftSection={<IconBan size={14} />}
                         color="red"
                         disabled={booking.status !== 'confirmed'}
-                        onClick={() => { if (checkNotice(eventType.cancel_mode, eventType.cancel_notice_minutes, 'Cancellation')) setConfirmingDelete(true) }}
+                        onClick={() => setConfirmingDelete(true)}
                     >
                         Cancel booking
                     </Menu.Item>
@@ -295,17 +284,18 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                 {/* status dot */}
                 <div className={`w-2 h-2 rounded-full shrink-0 ${status.dot}`} />
 
-                {/* date block */}
-                <div className="w-10 shrink-0 text-center leading-none">
-                    <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">{monthStr}</div>
-                    <div className="text-xl font-bold text-gray-800">{dayNum}</div>
+                {/* date/time block */}
+                <div className="w-20 shrink-0 text-center leading-tight">
+                    <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">{dayName}, {monthStr} {dayNum}</div>
+                    <div className="text-sm font-bold text-gray-800 mt-0.5">{formatTime(booking.start)}</div>
+                    <div className="text-[10px] text-gray-400 mt-0.5">{formatTime(booking.end)}</div>
                 </div>
 
-                {/* student + event info */}
+                {/* tutor + student + event info */}
                 <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="font-medium text-gray-800">
-                            {booking.student_first} {booking.student_last}
+                            {tutor.first_name} {tutor.last_name} · {booking.student_first} {booking.student_last}
                         </span>
                         {status.label && (
                             <span className={`text-xs px-2 py-0.5 rounded-full ${status.chip}`}>{status.label}</span>
@@ -315,7 +305,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                         )}
                     </div>
                     <div className="text-xs text-gray-400 mt-0.5">
-                        {eventType.name} · {formatTime(booking.start)}
+                        {eventType.name}
                     </div>
                 </div>
 

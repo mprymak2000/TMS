@@ -642,9 +642,7 @@ def test_booking_response_exposes_auto_policy(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     assert created["cancel_action"] == "auto"
-    assert created["cancel_blocked_reason"] is None
     assert created["reschedule_action"] == "auto"
-    assert created["reschedule_blocked_reason"] is None
 
 
 def test_booking_response_exposes_blocked_policy(client):
@@ -657,21 +655,17 @@ def test_booking_response_exposes_blocked_policy(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     assert created["cancel_action"] == "blocked"
-    assert created["cancel_blocked_reason"] == "Cancellation is not allowed for this event type"
     assert created["reschedule_action"] == "blocked"
-    assert created["reschedule_blocked_reason"] == "Rescheduling is not allowed for this event type"
 
 
 def test_booking_response_exposes_request_policy(client):
-    """Inside the strict notice window → 'request', with the notice-window reason text."""
+    """Inside the strict notice window → 'request'."""
     tutor, event_type = setup_strict_notice(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     assert created["cancel_action"] == "request"
-    assert "notice" in created["cancel_blocked_reason"]
     assert created["reschedule_action"] == "request"
-    assert "notice" in created["reschedule_blocked_reason"]
 
 
 def test_booking_series_response_exposes_policy_from_next_upcoming(client):

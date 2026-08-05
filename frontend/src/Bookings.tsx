@@ -1,10 +1,9 @@
 import { useState, useEffect } from 'react'
-import { Select, TextInput, Loader, Input, Button, Modal, Menu } from '@mantine/core'
-import { IconSearch, IconChevronDown, IconChevronUp, IconDotsVertical, IconBan, IconCalendarStats, IconRepeat, IconCalendar } from '@tabler/icons-react'
+import { Select, TextInput, Loader, Input, Button, Modal } from '@mantine/core'
+import { IconSearch, IconCalendar } from '@tabler/icons-react'
 import type { Tutor, EventType, Booking } from './types'
-import { extractError, formatDate, formatTime, tutorBubbleClass, tutorInitials } from './utils'
+import { extractError, formatDate, formatTime, tutorBubbleClass } from './utils'
 import { useToast } from './useToast'
-import { useNavigate } from 'react-router-dom'
 import BookingRow from './BookingRow'
 import Toast from './Toast'
 
@@ -23,26 +22,57 @@ interface LoadErrors {
     eventTypes?: string
 }
 
-type SeriesItem = { kind: 'series'; seriesId: string; bookings: Booking[]; sortKey: string }
-type StandaloneItem = { kind: 'standalone'; dateLabel: string; bookings: Booking[]; sortKey: string }
-type DisplayItem = SeriesItem | StandaloneItem
+type BookingsTab = 'upcoming' | 'past' | 'requests'
+type FetchResult = { ok: true; items: Booking[]; hasMore: boolean } | { ok: false; error: any }
 
 const TABS = [
     { key: 'upcoming', label: 'Upcoming' },
     { key: 'past', label: 'Past' },
-    { key: 'all', label: 'All' },
     { key: 'requests', label: 'Requests' },
 ] as const
 
+const PAGE_SIZE = 10
+
+// Exact-day comparison key (ISO date, unambiguous across years) vs. the subtle
+// display label shown above the first booking of each new day — WhatsApp-style
+// date pill, not a full grouped card.
+const dateKeyOf = (iso: string) => iso.slice(0, 10)
+const dateLabelOf = (iso: string) => new Date(iso).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
+
+// Same-day only — a gap indicator is only meaningful within one day's flow;
+// crossing into a new day is already communicated by the date pill above.
+const gapMinutesBetween = (prevEndIso: string, nextStartIso: string): number =>
+    (new Date(nextStartIso).getTime() - new Date(prevEndIso).getTime()) / 60000
+
+const formatGap = (minutes: number): string => {
+    const hours = Math.floor(minutes / 60)
+    const mins = Math.round(minutes % 60)
+    if (hours === 0) return `${mins}m`
+    if (mins === 0) return `${hours}h`
+    return `${hours}h ${mins}m`
+}
+
+const fetchMyBookings = async (tab: BookingsTab, pageNum: number, emailFilter?: string): Promise<FetchResult> => {
+    const base = `${import.meta.env.VITE_API_URL}/bookings/my-bookings`
+    const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
+    const query = tab === 'requests' ? `pending_only=true` : `status=${tab}`
+
+    const res = await fetch(`${base}?${query}&page=${pageNum}${emailParam}`)
+    if (!res.ok) { return { ok: false, error: await res.json() } }
+    const items = (await res.json()).items as Booking[]
+    // If the number of items returned is less than PAGE_SIZE, it means there are no more items to fetch.
+    // TODO: this behavior needs to be revisited and formalized but ok for now.
+    return { ok: true, items, hasMore: items.length === PAGE_SIZE }
+}
+
+
 const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
-    const navigate = useNavigate()
     const [bookings, setBookings] = useState<Booking[]>([])
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [eventTypes, setEventTypes] = useState<EventType[]>([])
-    const [activeTab, setActiveTab] = useState<'upcoming' | 'past' | 'all' | 'requests'>('upcoming')
+    const [activeTab, setActiveTab] = useState<BookingsTab>('upcoming')
     const [filters, setFilters] = useState<BookingFilters>({ tutorId: null, eventTypeId: null, dateFrom: null, dateTo: null, searchQuery: '', pendingOnly: false })
     const [expandedId, setExpandedId] = useState<string | null>(null)
-    const [expandedSeries, setExpandedSeries] = useState<Set<string>>(new Set())
     const [cancellingSeriesId, setCancellingSeriesId] = useState<string | null>(null)
     const [isCancelling, setIsCancelling] = useState(false)
     const [isSubmitting, setIsSubmitting] = useState(false)
@@ -52,6 +82,11 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [email, setEmail] = useState(() => isCustomer ? (sessionStorage.getItem('customer_email') ?? '') : '')
     const [submitted, setSubmitted] = useState(() => isCustomer ? !!sessionStorage.getItem('customer_email') : false)
     const { toast, showToast } = useToast()
+
+    //pagination state
+    const [isLoadingMore, setIsLoadingMore] = useState(false)
+    const [page, setPage] = useState(1)
+    const [hasMore, setHasMore] = useState(false)
 
     const getSearchString = (b: Booking) => {
         const tutor = tutors.find(t => t.id === b.tutor_id)
@@ -66,20 +101,18 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         ].filter(Boolean).join(' ').toLowerCase()
     }
 
-    const loadData = async (emailFilter?: string) => {
-        setIsLoading(true)
+    const loadData = async (options: { emailFilter?: string; tab?: BookingsTab; pageNum?: number; append?: boolean } = {}) => {
+        const { emailFilter, tab = activeTab, pageNum = 1, append = false } = options
+        if (append) setIsLoadingMore(true)
+        else setIsLoading(true)
         try {
-            const bookingsUrl = emailFilter
-                ? `${import.meta.env.VITE_API_URL}/bookings?email=${encodeURIComponent(emailFilter)}`
-                : `${import.meta.env.VITE_API_URL}/bookings`
             const [bookingsRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetch(bookingsUrl),
+                fetchMyBookings(tab, pageNum, emailFilter),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/event_types`),
             ])
             if (!bookingsRes.ok) {
-                const err = await bookingsRes.json()
-                setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load bookings.') }))
+                setLoadErrors(prev => ({ ...prev, bookings: extractError(bookingsRes.error, 'Failed to load bookings.') }))
                 return
             }
             if (!tutorsRes.ok) {
@@ -92,28 +125,41 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 setLoadErrors(prev => ({ ...prev, eventTypes: extractError(err, 'Failed to load event types.') }))
                 return
             }
-            setBookings(await bookingsRes.json())
+            setBookings(prev => append ? [...prev, ...bookingsRes.items] : bookingsRes.items)
             setTutors(await tutorsRes.json())
             setEventTypes(await eventTypesRes.json())
+            setPage(pageNum)
+            setHasMore(bookingsRes.hasMore)
+            setLoadErrors({})
         } catch (error) {
             console.error(error)
             setLoadErrors(prev => ({ ...prev, bookings: 'An unknown error occurred while loading bookings.' }))
         } finally {
             setIsLoading(false)
+            setIsLoadingMore(false)
         }
     }
 
     useEffect(() => {
-        if (!isCustomer) { loadData(); return }
+        if (!isCustomer) { loadData({ tab: activeTab }); return }
         const saved = sessionStorage.getItem('customer_email')
-        if (saved) loadData(saved)
+        if (saved) loadData({ emailFilter: saved, tab: activeTab })
     }, [])
+
+    const refresh = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab})
+
+    const handleTabChange = (tab: BookingsTab) => {
+        setActiveTab(tab)
+        loadData({ emailFilter: isCustomer ? email : undefined, tab })
+    }
+
+    const handleLoadMore = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab, pageNum: page + 1, append: true })
 
     const handleEmailSubmit = () => {
         if (!email.trim()) return
         sessionStorage.setItem('customer_email', email.trim())
         setSubmitted(true)
-        loadData(email.trim())
+        loadData({ emailFilter: email.trim(), tab: activeTab })
     }
 
     const handleCancelSeries = async (seriesId: string) => {
@@ -126,7 +172,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 return
             }
             setCancellingSeriesId(null)
-            loadData()
+            refresh()
             showToast('Series cancelled')
         } catch (error) {
             console.error(error)
@@ -143,7 +189,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-request/${requestId}/approve`, { method: 'POST' })
             if (!res.ok) { showToast(extractError(await res.json(), 'Failed to approve request.'), 'error'); return }
             setProcessingRequest(null)
-            loadData()
+            refresh()
             showToast('Request approved')
         } catch (error) {
             console.error(error)
@@ -159,7 +205,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-request/${requestId}/deny`, { method: 'POST' })
             if (!res.ok) { showToast(extractError(await res.json(), 'Failed to deny request.'), 'error'); return }
             setProcessingRequest(null)
-            loadData()
+            refresh()
             showToast('Request denied')
         } catch (error) {
             console.error(error)
@@ -176,50 +222,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         .filter(b => !filters.dateTo || b.start.slice(0, 10) <= filters.dateTo)
         .filter(b => getSearchString(b).includes(filters.searchQuery.trim().toLowerCase()))
         .filter(b => !filters.pendingOnly || b.request?.status === 'pending')
-        .filter(b => activeTab === 'all' || activeTab === 'requests' || (activeTab === 'upcoming'
-            ? b.start > new Date().toISOString()
-            : b.start <= new Date().toISOString()))
         .sort((a, b) => a.start.localeCompare(b.start))
-
-    const pendingBookings = bookings.filter(b => b.request?.status === 'pending')
-
-    // Group recurring bookings by series; standalones into date groups
-    const seriesMap = new Map<string, Booking[]>()
-    const standaloneList: Booking[] = []
-    for (const b of displayed) {
-        if (b.series_id !== null) {
-            const arr = seriesMap.get(b.series_id) ?? []
-            arr.push(b)
-            seriesMap.set(b.series_id, arr)
-        } else {
-            standaloneList.push(b)
-        }
-    }
-
-    const seriesItems: DisplayItem[] = [...seriesMap.entries()].map(([seriesId, bookings]) => ({
-        kind: 'series', seriesId, bookings, sortKey: bookings[0].start,
-    }))
-
-    const standaloneGrouped = standaloneList.reduce<{ dateLabel: string; bookings: Booking[] }[]>((acc, b) => {
-        const label = new Date(b.start).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
-        const last = acc[acc.length - 1]
-        if (last?.dateLabel === label) last.bookings.push(b)
-        else acc.push({ dateLabel: label, bookings: [b] })
-        return acc
-    }, [])
-
-    const displayItems: DisplayItem[] = [
-        ...seriesItems,
-        ...standaloneGrouped.map(g => ({ kind: 'standalone' as const, dateLabel: g.dateLabel, bookings: g.bookings, sortKey: g.bookings[0].start })),
-    ].sort((a, b) => a.sortKey.localeCompare(b.sortKey))
-
-    const toggleSeriesExpand = (seriesId: string) =>
-        setExpandedSeries(prev => {
-            const next = new Set(prev)
-            if (next.has(seriesId)) next.delete(seriesId)
-            else next.add(seriesId)
-            return next
-        })
 
     if (isCustomer && !submitted) {
         return (
@@ -298,7 +301,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         {TABS.filter(t => t.key !== 'requests').map(tab => (
                             <button
                                 key={tab.key}
-                                onClick={() => setActiveTab(tab.key)}
+                                onClick={() => handleTabChange(tab.key)}
                                 className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
                                     activeTab === tab.key
                                         ? 'bg-white text-gray-800 shadow-sm'
@@ -313,115 +316,38 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     {isLoading && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
 
                     {!isLoading && (
-                        <div className="flex flex-col gap-4">
-                            {displayItems.map(item => {
-                                if (item.kind === 'series') {
-                                    const rep = item.bookings[0]
-                                    const tutor = tutors.find(t => t.id === rep.tutor_id)!
-                                    const eventType = eventTypes.find(e => e.id === rep.event_type_id)!
-                                    const isExpanded = expandedSeries.has(item.seriesId)
-                                    const firstStart = new Date(rep.start)
-                                    const dayName = firstStart.toLocaleDateString('en-US', { weekday: 'long' })
-                                    const timeStr = firstStart.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-                                    const lastStart = new Date(item.bookings[item.bookings.length - 1].start)
-                                    const dateRange = `${firstStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${lastStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
-                                    const now = new Date()
-                                    const nextBooking = item.bookings.find(b => b.status === 'confirmed' && new Date(b.start) >= now)
-                                    const nextDateStr = nextBooking
-                                        ? new Date(nextBooking.start).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-                                        : null
-
-                                    return (
-                                        <div key={`series-${item.seriesId}`} className="bg-white rounded-xl shadow-sm border border-gray-200 border-l-4 border-l-indigo-400 overflow-hidden">
-                                            <div
-                                                className="flex items-center px-5 py-4 gap-4 cursor-pointer hover:bg-gray-50 transition-colors"
-                                                onClick={() => toggleSeriesExpand(item.seriesId)}
-                                            >
-                                                <div className="w-8 h-8 rounded-lg bg-indigo-50 flex items-center justify-center shrink-0">
-                                                    <IconRepeat size={16} className="text-indigo-500" />
-                                                </div>
-                                                {tutor && (
-                                                    <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${tutorBubbleClass(tutor)}`}>
-                                                        {tutorInitials(tutor)}
-                                                    </div>
-                                                )}
-                                                <div className="flex-1 min-w-0">
-                                                    <div className="flex items-center gap-2 mb-0.5">
-                                                        <span className="font-medium text-gray-800 truncate">{rep.student_first} {rep.student_last}</span>
-                                                        <span className="shrink-0 text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-medium">{eventType?.name}</span>
-                                                    </div>
-                                                    <p className="text-xs text-gray-400">{dayName}s · {timeStr} · {item.bookings.length} sessions · {dateRange}</p>
-                                                </div>
-                                                {nextDateStr ? (
-                                                    <div className="text-right shrink-0">
-                                                        <div className="text-[10px] text-gray-400 uppercase tracking-wide">Next</div>
-                                                        <div className="text-sm font-medium text-gray-700">{nextDateStr}</div>
-                                                    </div>
-                                                ) : (
-                                                    <span className="text-xs text-gray-400 shrink-0">No upcoming</span>
-                                                )}
-                                                <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
-                                                    {rep.series_id && (
-                                                        <button
-                                                            onClick={() => navigate(`/manage-series/${rep.series_id}`)}
-                                                            className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
-                                                        >
-                                                            Manage
-                                                        </button>
-                                                    )}
-                                                    <span className="flex items-center justify-center w-7 h-7 text-gray-400 pointer-events-none">
-                                                        {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
-                                                    </span>
-                                                </div>
-                                            </div>
-                                            {isExpanded && (
-                                                <div className="divide-y divide-gray-100 border-t border-gray-100">
-                                                    {item.bookings.map(b => (
-                                                        <BookingRow
-                                                            key={b.id}
-                                                            booking={b}
-                                                            tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                                            eventType={eventTypes.find(e => e.id === b.event_type_id)!}
-                                                            expanded={expandedId === b.id}
-                                                            onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
-                                                            onRefresh={msg => { loadData(); showToast(msg) }}
-                                                            onError={msg => showToast(msg, 'error')}
-                                                            isCustomer={true}
-                                                            compact={true}
-                                                        />
-                                                    ))}
-                                                </div>
-                                            )}
-                                        </div>
-                                    )
-                                }
-
+                        <div className="flex flex-col">
+                            {displayed.map((b, i) => {
+                                const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
+                                const gapMinutes = !isNewDate ? gapMinutesBetween(displayed[i - 1].end, b.start) : 0
+                                const showGap = !isNewDate && gapMinutes > 30
                                 return (
-                                    <div key={`standalone-${item.dateLabel}`}>
-                                        <div className="flex items-center gap-3 mb-2.5">
-                                            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider whitespace-nowrap">{item.dateLabel}</span>
-                                            <div className="flex-1 border-t border-gray-100" />
-                                        </div>
-                                        <div className="flex flex-col gap-2.5">
-                                            {item.bookings.map(b => (
-                                                <BookingRow
-                                                    key={b.id}
-                                                    booking={b}
-                                                    tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                                    eventType={eventTypes.find(e => e.id === b.event_type_id)!}
-                                                    expanded={expandedId === b.id}
-                                                    onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
-                                                    onRefresh={msg => { loadData(); showToast(msg) }}
-                                                    onError={msg => showToast(msg, 'error')}
-                                                    isCustomer={true}
-                                                />
-                                            ))}
-                                        </div>
+                                    <div key={b.id} className={isNewDate ? 'mt-5 first:mt-0' : 'mt-1.5'}>
+                                        {isNewDate && (
+                                            <div className="flex justify-center mb-2">
+                                                <span className="text-[11px] text-gray-400 font-medium tracking-wide">{dateLabelOf(b.start)}</span>
+                                            </div>
+                                        )}
+                                        {showGap && (
+                                            <div className="flex justify-center my-1">
+                                                <span className="text-[10px] text-gray-400 font-medium tracking-wide">···· {formatGap(gapMinutes)} gap ····</span>
+                                            </div>
+                                        )}
+                                        <BookingRow
+                                            booking={b}
+                                            tutor={tutors.find(t => t.id === b.tutor_id)!}
+                                            eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                                            expanded={expandedId === b.id}
+                                            onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
+                                            onRefresh={msg => { refresh(); showToast(msg) }}
+                                            onError={msg => showToast(msg, 'error')}
+                                            isCustomer={true}
+                                        />
                                     </div>
                                 )
                             })}
 
-                            {displayItems.length === 0 && (
+                            {displayed.length === 0 && (
                                 <div className="text-center py-16">
                                     <div className="w-12 h-12 rounded-xl bg-gray-100 flex items-center justify-center mx-auto mb-4">
                                         <IconCalendar size={22} className="text-gray-400" />
@@ -430,6 +356,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     <p className="text-xs text-gray-400 mt-1">
                                         {activeTab === 'upcoming' ? 'No upcoming sessions.' : activeTab === 'past' ? 'No past sessions.' : 'No sessions found.'}
                                     </p>
+                                </div>
+                            )}
+
+                            {hasMore && (
+                                <div className="flex justify-center pt-2">
+                                    <Button variant="default" size="sm" loading={isLoadingMore} onClick={handleLoadMore}>
+                                        Load more
+                                    </Button>
                                 </div>
                             )}
                         </div>
@@ -464,7 +398,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 {TABS.filter(t => !isCustomer || t.key !== 'requests').map(tab => (
                     <button
                         key={tab.key}
-                        onClick={() => setActiveTab(tab.key)}
+                        onClick={() => handleTabChange(tab.key)}
                         className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
                             activeTab === tab.key
                                 ? 'bg-white text-gray-800 shadow-sm'
@@ -535,7 +469,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             {/* requests tab */}
             {!isLoading && activeTab === 'requests' && (
                 <div className="flex flex-col gap-3">
-                    {pendingBookings.map(b => {
+                    {bookings.map(b => {
                         const req = b.request!
                         const tutor = tutors.find(t => t.id === b.tutor_id)
                         const eventType = eventTypes.find(e => e.id === b.event_type_id)
@@ -580,187 +514,57 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             </div>
                         )
                     })}
-                    {pendingBookings.length === 0 && (
+                    {bookings.length === 0 && (
                         <p className="text-sm text-gray-400 text-center py-12">No pending requests.</p>
                     )}
                 </div>
             )}
 
-            {/* booking groups */}
+            {/* booking list */}
             {!isLoading && activeTab !== 'requests' && (
-                <div className="flex flex-col gap-4">
-                    {displayItems.map(item => {
-                        if (item.kind === 'series') {
-                            const rep = item.bookings[0]
-                            const tutor = tutors.find(t => t.id === rep.tutor_id)!
-                            const eventType = eventTypes.find(e => e.id === rep.event_type_id)!
-                            const isExpanded = expandedSeries.has(item.seriesId)
-                            const firstStart = new Date(rep.start)
-                            const dayName = firstStart.toLocaleDateString('en-US', { weekday: 'long' })
-                            const timeStr = firstStart.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-                            const lastStart = new Date(item.bookings[item.bookings.length - 1].start)
-                            const dateRange = `${firstStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${lastStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
-                            const now = new Date()
-                            const nextBooking = item.bookings.find(b => b.status === 'confirmed' && new Date(b.start) >= now)
-                            const nextDateStr = nextBooking
-                                ? new Date(nextBooking.start).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-                                : null
-
-                            return (
-                                <div key={`series-${item.seriesId}`} className="bg-white rounded-xl shadow-sm border border-gray-200 border-l-4 border-l-indigo-400 overflow-hidden">
-
-                                    {/* series header — full row is clickable */}
-                                    <div
-                                        className="flex items-center px-5 py-4 gap-4 cursor-pointer hover:bg-gray-50 transition-colors"
-                                        onClick={() => toggleSeriesExpand(item.seriesId)}
-                                    >
-                                        {/* recurring icon */}
-                                        <div className="w-8 h-8 rounded-lg bg-indigo-50 flex items-center justify-center shrink-0">
-                                            <IconRepeat size={16} className="text-indigo-500" />
-                                        </div>
-
-                                        {/* two-line info */}
-                                        <div className="flex-1 min-w-0">
-                                            <div className="flex items-center gap-2 mb-0.5">
-                                                <span className="font-medium text-gray-800 truncate">
-                                                    {rep.student_first} {rep.student_last}
-                                                </span>
-                                                <span className="shrink-0 text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-medium">
-                                                    {eventType?.name}
-                                                </span>
-                                            </div>
-                                            <p className="text-xs text-gray-400">
-                                                {dayName}s · {timeStr} · {item.bookings.length} sessions · {dateRange}
-                                            </p>
-                                        </div>
-
-                                        {/* tutor bubble */}
-                                        <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${tutorBubbleClass(tutor)}`}>
-                                            {tutor?.first_name[0]}{tutor?.last_name[0]}
-                                        </div>
-
-                                        {/* next session */}
-                                        <div className="text-right shrink-0 w-24">
-                                            {nextDateStr ? (
-                                                <>
-                                                    <div className="text-[10px] text-gray-400 uppercase tracking-wide">Next</div>
-                                                    <div className="text-sm font-medium text-gray-700">{nextDateStr}</div>
-                                                </>
-                                            ) : (
-                                                <span className="text-xs text-gray-400">No upcoming</span>
-                                            )}
-                                        </div>
-
-                                        {/* actions */}
-                                        <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
-                                            {isCustomer ? (
-                                                rep.series_id && (
-                                                    <button
-                                                        onClick={() => navigate(`/manage-series/${rep.series_id}`)}
-                                                        className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
-                                                    >
-                                                        Manage series
-                                                    </button>
-                                                )
-                                            ) : (
-                                                <Menu shadow="md" width={210} position="bottom-end">
-                                                    <Menu.Target>
-                                                        <button className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors">
-                                                            <IconDotsVertical size={16} />
-                                                        </button>
-                                                    </Menu.Target>
-                                                    <Menu.Dropdown>
-                                                        <Menu.Item
-                                                            leftSection={<IconCalendarStats size={14} />}
-                                                            onClick={() => navigate(`/book/${eventType.id}`, {
-                                                                state: {
-                                                                    rescheduleSeriesId: item.seriesId,
-                                                                    tutorId: rep.tutor_id,
-                                                                    originalStart: rep.start,
-                                                                    originalEnd: rep.end,
-                                                                    studentFirst: rep.student_first,
-                                                                    studentLast: rep.student_last,
-                                                                    studentEmail: rep.student_email,
-                                                                    studentPhone: rep.student_phone,
-                                                                    parentEmail: rep.parent_email,
-                                                                    parentPhone: rep.parent_phone,
-                                                                }
-                                                            })}
-                                                        >
-                                                            Change schedule
-                                                        </Menu.Item>
-                                                        <Menu.Divider />
-                                                        <Menu.Item
-                                                            leftSection={<IconBan size={14} />}
-                                                            color="red"
-                                                            onClick={() => setCancellingSeriesId(item.seriesId)}
-                                                        >
-                                                            Cancel series
-                                                        </Menu.Item>
-                                                    </Menu.Dropdown>
-                                                </Menu>
-                                            )}
-                                            <span className="flex items-center justify-center w-7 h-7 text-gray-400 pointer-events-none">
-                                                {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
-                                            </span>
-                                        </div>
-                                    </div>
-
-                                    {/* occurrence rows — compact flat rows, no nested cards */}
-                                    {isExpanded && (
-                                        <div className="divide-y divide-gray-100 border-t border-gray-100">
-                                            {item.bookings.map(b => (
-                                                <BookingRow
-                                                    key={b.id}
-                                                    booking={b}
-                                                    tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                                    eventType={eventTypes.find(e => e.id === b.event_type_id)!}
-                                                    expanded={expandedId === b.id}
-                                                    onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
-                                                    onRefresh={msg => { loadData(); showToast(msg) }}
-                                                    onError={msg => showToast(msg, 'error')}
-                                                    isCustomer={isCustomer}
-                                                    compact={true}
-                                                />
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                            )
-                        }
-
-                        // standalone date group
+                <div className="flex flex-col">
+                    {displayed.map((b, i) => {
+                        const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
+                        const gapMinutes = !isNewDate ? gapMinutesBetween(displayed[i - 1].end, b.start) : 0
+                        const showGap = !isNewDate && gapMinutes > 30
                         return (
-                            <div key={`standalone-${item.dateLabel}`}>
-                                {/* date divider */}
-                                <div className="flex items-center gap-3 mb-2.5">
-                                    <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider whitespace-nowrap">
-                                        {item.dateLabel}
-                                    </span>
-                                    <div className="flex-1 border-t border-gray-100" />
-                                </div>
-                                <div className="flex flex-col gap-2.5">
-                                    {item.bookings.map(b => (
-                                        <BookingRow
-                                            key={b.id}
-                                            booking={b}
-                                            tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                            eventType={eventTypes.find(e => e.id === b.event_type_id)!}
-                                            expanded={expandedId === b.id}
-                                            onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
-                                            onRefresh={msg => { loadData(); showToast(msg) }}
-                                            onError={msg => showToast(msg, 'error')}
-                                            isCustomer={isCustomer}
-                                        />
-                                    ))}
-                                </div>
+                            <div key={b.id} className={isNewDate ? 'mt-5 first:mt-0' : 'mt-1.5'}>
+                                {isNewDate && (
+                                    <div className="flex justify-center mb-2">
+                                        <span className="text-[11px] text-gray-400 font-medium tracking-wide">{dateLabelOf(b.start)}</span>
+                                    </div>
+                                )}
+                                {showGap && (
+                                    <div className="flex justify-center my-1">
+                                        <span className="text-[10px] text-gray-400 font-medium tracking-wide">···· {formatGap(gapMinutes)} gap ····</span>
+                                    </div>
+                                )}
+                                <BookingRow
+                                    booking={b}
+                                    tutor={tutors.find(t => t.id === b.tutor_id)!}
+                                    eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                                    expanded={expandedId === b.id}
+                                    onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
+                                    onRefresh={msg => { refresh(); showToast(msg) }}
+                                    onError={msg => showToast(msg, 'error')}
+                                    onReviewRequest={setProcessingRequest}
+                                    isCustomer={isCustomer}
+                                />
                             </div>
                         )
                     })}
 
-                    {displayItems.length === 0 && (
+                    {displayed.length === 0 && (
                         <p className="text-sm text-gray-400 text-center py-12">No bookings found.</p>
                     )}
+                </div>
+            )}
+
+            {!isLoading && hasMore && (
+                <div className="flex justify-center pt-4">
+                    <Button variant="default" size="sm" loading={isLoadingMore} onClick={handleLoadMore}>
+                        Load more
+                    </Button>
                 </div>
             )}
 
@@ -827,3 +631,227 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 }
 
 export default Bookings
+
+/*
+── REMOVED: series/standalone grouping for Upcoming/Past (kept for reference — likely reused for a future "Recurring" tab) ──
+
+Upcoming/Past now render `displayed` as a flat, chronological list of every booking
+(standalone and series occurrences mixed), one row each, no expand/collapse, no
+date grouping. This is what used to sit between it and the render:
+
+Types (were at module scope, alongside BookingsTab):
+
+type SeriesItem = { kind: 'series'; seriesId: string; bookings: Booking[]; sortKey: string }
+type StandaloneItem = { kind: 'standalone'; dateLabel: string; bookings: Booking[]; sortKey: string }
+type DisplayItem = SeriesItem | StandaloneItem
+
+State (alongside the other useState calls):
+
+const [expandedSeries, setExpandedSeries] = useState<Set<string>>(new Set())
+
+const toggleSeriesExpand = (seriesId: string) =>
+    setExpandedSeries(prev => {
+        const next = new Set(prev)
+        if (next.has(seriesId)) next.delete(seriesId)
+        else next.add(seriesId)
+        return next
+    })
+
+Derivation (computed right after `displayed`):
+
+const seriesMap = new Map<string, Booking[]>()
+const standaloneList: Booking[] = []
+for (const b of displayed) {
+    if (b.series_id !== null) {
+        const arr = seriesMap.get(b.series_id) ?? []
+        arr.push(b)
+        seriesMap.set(b.series_id, arr)
+    } else {
+        standaloneList.push(b)
+    }
+}
+
+const seriesItems: DisplayItem[] = [...seriesMap.entries()].map(([seriesId, bookings]) => ({
+    kind: 'series', seriesId, bookings, sortKey: bookings[0].start,
+}))
+
+const standaloneGrouped = standaloneList.reduce<{ dateLabel: string; bookings: Booking[] }[]>((acc, b) => {
+    const label = new Date(b.start).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
+    const last = acc[acc.length - 1]
+    if (last?.dateLabel === label) last.bookings.push(b)
+    else acc.push({ dateLabel: label, bookings: [b] })
+    return acc
+}, [])
+
+const displayItems: DisplayItem[] = [
+    ...seriesItems,
+    ...standaloneGrouped.map(g => ({ kind: 'standalone' as const, dateLabel: g.dateLabel, bookings: g.bookings, sortKey: g.bookings[0].start })),
+].sort((a, b) => a.sortKey.localeCompare(b.sortKey))
+
+Rendering — customer branch (admin branch was identical except the actions
+block, included separately below):
+
+{displayItems.map(item => {
+    if (item.kind === 'series') {
+        const rep = item.bookings[0]
+        const tutor = tutors.find(t => t.id === rep.tutor_id)!
+        const eventType = eventTypes.find(e => e.id === rep.event_type_id)!
+        const isExpanded = expandedSeries.has(item.seriesId)
+        const firstStart = new Date(rep.start)
+        const dayName = firstStart.toLocaleDateString('en-US', { weekday: 'long' })
+        const timeStr = firstStart.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+        const lastStart = new Date(item.bookings[item.bookings.length - 1].start)
+        const dateRange = `${firstStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${lastStart.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+        const now = new Date()
+        const nextBooking = item.bookings.find(b => b.status === 'confirmed' && new Date(b.start) >= now)
+        const nextDateStr = nextBooking
+            ? new Date(nextBooking.start).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+            : null
+
+        return (
+            <div key={`series-${item.seriesId}`} className="bg-white rounded-xl shadow-sm border border-gray-200 border-l-4 border-l-indigo-400 overflow-hidden">
+                <div
+                    className="flex items-center px-5 py-4 gap-4 cursor-pointer hover:bg-gray-50 transition-colors"
+                    onClick={() => toggleSeriesExpand(item.seriesId)}
+                >
+                    <div className="w-8 h-8 rounded-lg bg-indigo-50 flex items-center justify-center shrink-0">
+                        <IconRepeat size={16} className="text-indigo-500" />
+                    </div>
+                    {tutor && (
+                        <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${tutorBubbleClass(tutor)}`}>
+                            {tutorInitials(tutor)}
+                        </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-0.5">
+                            <span className="font-medium text-gray-800 truncate">{rep.student_first} {rep.student_last}</span>
+                            <span className="shrink-0 text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-medium">{eventType?.name}</span>
+                        </div>
+                        <p className="text-xs text-gray-400">{dayName}s - {timeStr} - {item.bookings.length} sessions - {dateRange}</p>
+                    </div>
+                    {nextDateStr ? (
+                        <div className="text-right shrink-0">
+                            <div className="text-[10px] text-gray-400 uppercase tracking-wide">Next</div>
+                            <div className="text-sm font-medium text-gray-700">{nextDateStr}</div>
+                        </div>
+                    ) : (
+                        <span className="text-xs text-gray-400 shrink-0">No upcoming</span>
+                    )}
+                    <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
+                        {rep.series_id && (
+                            <button
+                                onClick={() => navigate(`/manage-series/${rep.series_id}`)}
+                                className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
+                            >
+                                Manage
+                            </button>
+                        )}
+                        <span className="flex items-center justify-center w-7 h-7 text-gray-400 pointer-events-none">
+                            {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
+                        </span>
+                    </div>
+                </div>
+                {isExpanded && (
+                    <div className="divide-y divide-gray-100 border-t border-gray-100">
+                        {item.bookings.map(b => (
+                            <BookingRow
+                                key={b.id}
+                                booking={b}
+                                tutor={tutors.find(t => t.id === b.tutor_id)!}
+                                eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                                expanded={expandedId === b.id}
+                                onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
+                                onRefresh={msg => { refresh(); showToast(msg) }}
+                                onError={msg => showToast(msg, 'error')}
+                                isCustomer={true}
+                                compact={true}
+                            />
+                        ))}
+                    </div>
+                )}
+            </div>
+        )
+    }
+
+    return (
+        <div key={`standalone-${item.dateLabel}`}>
+            <div className="flex items-center gap-3 mb-2.5">
+                <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider whitespace-nowrap">{item.dateLabel}</span>
+                <div className="flex-1 border-t border-gray-100" />
+            </div>
+            <div className="flex flex-col gap-2.5">
+                {item.bookings.map(b => (
+                    <BookingRow
+                        key={b.id}
+                        booking={b}
+                        tutor={tutors.find(t => t.id === b.tutor_id)!}
+                        eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                        expanded={expandedId === b.id}
+                        onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
+                        onRefresh={msg => { refresh(); showToast(msg) }}
+                        onError={msg => showToast(msg, 'error')}
+                        isCustomer={true}
+                    />
+                ))}
+            </div>
+        </div>
+    )
+})}
+
+Admin branch's actions block differed only here — instead of the single
+"Manage" link, it showed a dots-menu with two items:
+
+<div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
+    {isCustomer ? (
+        rep.series_id && (
+            <button onClick={() => navigate(`/manage-series/${rep.series_id}`)} className="...">
+                Manage series
+            </button>
+        )
+    ) : (
+        <Menu shadow="md" width={210} position="bottom-end">
+            <Menu.Target>
+                <button className="...">
+                    <IconDotsVertical size={16} />
+                </button>
+            </Menu.Target>
+            <Menu.Dropdown>
+                <Menu.Item
+                    leftSection={<IconCalendarStats size={14} />}
+                    onClick={() => navigate(`/book/${eventType.id}`, {
+                        state: {
+                            rescheduleSeriesId: item.seriesId,
+                            tutorId: rep.tutor_id,
+                            originalStart: rep.start,
+                            originalEnd: rep.end,
+                            studentFirst: rep.student_first,
+                            studentLast: rep.student_last,
+                            studentEmail: rep.student_email,
+                            studentPhone: rep.student_phone,
+                            parentEmail: rep.parent_email,
+                            parentPhone: rep.parent_phone,
+                        }
+                    })}
+                >
+                    Change schedule
+                </Menu.Item>
+                <Menu.Divider />
+                <Menu.Item
+                    leftSection={<IconBan size={14} />}
+                    color="red"
+                    onClick={() => setCancellingSeriesId(item.seriesId)}
+                >
+                    Cancel series
+                </Menu.Item>
+            </Menu.Dropdown>
+        </Menu>
+    )}
+    <span className="flex items-center justify-center w-7 h-7 text-gray-400 pointer-events-none">
+        {isExpanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
+    </span>
+</div>
+
+Reviving this needs: useNavigate back, and the icon/Menu imports
+(IconRepeat, IconChevronDown, IconChevronUp, IconDotsVertical, IconBan,
+IconCalendarStats, Menu, tutorInitials) restored to the top imports.
+*/

@@ -114,6 +114,8 @@ export interface Booking {
   is_no_show: boolean
   rescheduled_to: string | null
   google_event_id: string
+  cancel_action: 'auto' | 'request' | 'blocked'
+  reschedule_action: 'auto' | 'request' | 'blocked'
   student_first: string
   student_last: string
   student_email: string | null
@@ -129,11 +131,15 @@ export interface BookingSeries {
   event_type_id: number
   student_id: number | null
   is_active: boolean
-  day_of_week: number
+  start_day_of_week: number
+  end_day_of_week: number
   start_time: string
   end_time: string
+  timezone: string | null
   recur_until: string | null
   google_event_id: string | null
+  cancel_action: 'auto' | 'request' | 'blocked'
+  reschedule_action: 'auto' | 'request' | 'blocked'
   student_first: string
   student_last: string
   student_email: string | null

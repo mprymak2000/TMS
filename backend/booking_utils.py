@@ -4,7 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 from models import Booking, BookingSeries
 from schemas import BookingResponse
-from policy import get_cancel_action, get_reschedule_action, cancel_blocked_detail, reschedule_blocked_detail
+from policy import get_cancel_action, get_reschedule_action
 from fastapi import HTTPException
      
 
@@ -155,9 +155,7 @@ def _virtual_occurrences(series: BookingSeries, after: datetime, count: int, set
                     is_no_show=False,
                     google_event_id=series.google_event_id,
                     cancel_action=cancel_action,
-                    cancel_blocked_reason=None if cancel_action == 'auto' else cancel_blocked_detail(series.event_type),
                     reschedule_action=reschedule_action,
-                    reschedule_blocked_reason=None if reschedule_action == 'auto' else reschedule_blocked_detail(series.event_type),
                     student_first=series.student_first,
                     student_last=series.student_last,
                     student_email=series.student_email,

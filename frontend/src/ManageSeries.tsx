@@ -53,29 +53,15 @@ const ManageSeries = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [ref])
 
-    // start_time is "HH:MM:SS" UTC; day_of_week is 0=Mon..6=Sun
-    const getNextOccurrenceMs = (dow: number, timeStr: string): number => {
-        const [h, m] = timeStr.split(':').map(Number)
-        const jsDay = dow === 6 ? 0 : dow + 1  // convert to JS 0=Sun..6=Sat
-        const now = new Date()
-        const candidate = new Date(now)
-        candidate.setUTCHours(h, m, 0, 0)
-        let daysUntil = (jsDay - now.getUTCDay() + 7) % 7
-        if (daysUntil === 0 && now.getTime() >= candidate.getTime()) daysUntil = 7
-        candidate.setUTCDate(candidate.getUTCDate() + daysUntil)
-        return candidate.getTime()
-    }
-    const minutesUntilNext = series ? (getNextOccurrenceMs(series.day_of_week, series.start_time) - Date.now()) / 60000 : Infinity
-    const WINDOW_MODES = ['auto_window_block', 'auto_window_request', 'request_window']
-    const cancelMode = eventType?.cancel_mode ?? 'auto'
-    const cancelInWindow = WINDOW_MODES.includes(cancelMode) && minutesUntilNext < (eventType?.cancel_notice_minutes ?? 0) 
-    const canCancelDirectly = cancelMode === 'auto' || ((cancelMode === 'auto_window_block' || cancelMode === 'auto_window_request') && !cancelInWindow)
-    const canRequestCancel = cancelMode === 'request' || (cancelMode === 'auto_window_request' && cancelInWindow) || (cancelMode === 'request_window' && !cancelInWindow)
-
-    const rescheduleMode = eventType?.reschedule_mode ?? 'auto'
-    const rescheduleInWindow = WINDOW_MODES.includes(rescheduleMode) && minutesUntilNext < (eventType?.reschedule_notice_minutes ?? 0)
-    const canRescheduleDirectly = rescheduleMode === 'auto' || ((rescheduleMode === 'auto_window_block' || rescheduleMode === 'auto_window_request') && !rescheduleInWindow)
-    const canRequestReschedule = rescheduleMode === 'request' || (rescheduleMode === 'auto_window_request' && rescheduleInWindow) || (rescheduleMode === 'request_window' && !rescheduleInWindow)
+    // Server already decided the verdict — frontend just reads it and authors its own copy,
+    // no re-derivation of *why* (that would need minutes_until, which stays server-side).
+    const cancelAction = series?.cancel_action ?? 'blocked'
+    const rescheduleAction = series?.reschedule_action ?? 'blocked'
+    // Same fix as ManageOccurrence.tsx — collapse the two near-identical "within window,
+    // submit for review" sentences into one shared line when both land on the same verdict.
+    const sameAction = cancelAction === rescheduleAction
+    const cancelNoticeHours = Math.round((eventType?.cancel_notice_minutes ?? 0) / 60)
+    const rescheduleNoticeHours = Math.round((eventType?.reschedule_notice_minutes ?? 0) / 60)
 
     const handleCancel = () => setConfirming('cancel')
 
@@ -85,14 +71,14 @@ const ManageSeries = () => {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-series/${ref}/cancel`, { method: 'POST' })
             if (!res.ok) {
                 const err = await res.json()
-                setError(extractError(err, canCancelDirectly ? 'Failed to cancel series' : 'Failed to submit cancellation request'))
+                setError(extractError(err, cancelAction === 'auto' ? 'Failed to cancel series' : 'Failed to submit cancellation request'))
                 return
             }
             const data: BookingSeries = await res.json()
             setDone(data.request ? 'requested_cancel' : 'cancelled')
         } catch (err) {
             console.error('Error cancelling series:', err)
-            setError(canCancelDirectly ? 'An unknown error occurred while cancelling the series' : 'An unknown error occurred while submitting the cancellation request')
+            setError(cancelAction === 'auto' ? 'An unknown error occurred while cancelling the series' : 'An unknown error occurred while submitting the cancellation request')
         } finally {
             setIsSubmitting(false)
             setConfirming(null)
@@ -160,7 +146,7 @@ const ManageSeries = () => {
                 {/* series details */}
                 <div className="bg-gray-50 rounded-xl px-5 py-4 mb-6">
                     <p className="text-sm font-semibold text-gray-900">
-                        Every {DAY_NAMES[series.day_of_week]} at {formatUTCTime(series.start_time)}
+                        Every {DAY_NAMES[series.start_day_of_week]} at {formatUTCTime(series.start_time)}
                     </p>
                     {series.recur_until && (
                         <p className="text-sm text-gray-500 mt-0.5">Until {formatDate(series.recur_until)}</p>
@@ -172,15 +158,26 @@ const ManageSeries = () => {
                     <p className="text-sm text-gray-400">This series has been cancelled.</p>
                 ) : (
                     <>
+                        {sameAction && cancelAction === 'request' && !confirming && (
+                            <p className="text-sm text-amber-600 mb-3">
+                                Cancelling or rescheduling isn't available directly right now — you can submit a request for admin review below.
+                            </p>
+                        )}
+                        {sameAction && cancelAction === 'blocked' && !confirming && (
+                            <p className="text-sm text-gray-400 mb-3">
+                                Neither cancelling nor rescheduling is available for this series right now.
+                            </p>
+                        )}
+
                         {/* change schedule */}
-                        {(canRescheduleDirectly || canRequestReschedule) && !confirming && (
-                            <div className="mb-4">
-                                {canRescheduleDirectly ? (
+                        {!confirming && (
+                            rescheduleAction === 'auto' ? (
+                                <div className="mb-4">
                                     <button
                                         onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
-                                            originalDayOfWeek: series.day_of_week,
+                                            originalDayOfWeek: series.start_day_of_week,
                                             originalStartTime: series.start_time,
                                             studentFirst: series.student_first,
                                             studentLast: series.student_last,
@@ -193,64 +190,86 @@ const ManageSeries = () => {
                                     >
                                         Change schedule
                                     </button>
-                                ) : (
-                                    <div>
+                                </div>
+                            ) : rescheduleAction === 'request' ? (
+                                <div className="mb-4">
+                                    {!sameAction && (
                                         <p className="text-sm text-amber-600 mb-2">
-                                            You're within the reschedule window ({Math.round((eventType.reschedule_notice_minutes ?? 0) / 60)}h notice required). You can submit a request for admin review.
+                                            You're within the reschedule window ({rescheduleNoticeHours}h notice required). You can submit a request for admin review.
                                         </p>
-                                        <button
-                                            onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
-                                                rescheduleSeriesId: series.id,
-                                                tutorId: series.tutor_id,
-                                                originalDayOfWeek: series.day_of_week,
-                                                originalStartTime: series.start_time,
-                                                studentFirst: series.student_first,
-                                                studentLast: series.student_last,
-                                                studentEmail: series.student_email,
-                                                studentPhone: series.student_phone,
-                                                parentEmail: series.parent_email,
-                                                parentPhone: series.parent_phone,
-                                            }})}
-                                            className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
-                                        >
-                                            Request schedule change
-                                        </button>
-                                    </div>
-                                )}
-                            </div>
+                                    )}
+                                    <button
+                                        onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
+                                            rescheduleSeriesId: series.id,
+                                            tutorId: series.tutor_id,
+                                            originalDayOfWeek: series.start_day_of_week,
+                                            originalStartTime: series.start_time,
+                                            studentFirst: series.student_first,
+                                            studentLast: series.student_last,
+                                            studentEmail: series.student_email,
+                                            studentPhone: series.student_phone,
+                                            parentEmail: series.parent_email,
+                                            parentPhone: series.parent_phone,
+                                        }})}
+                                        className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
+                                    >
+                                        Request schedule change
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="mb-4">
+                                    {!sameAction && (
+                                        <p className="text-sm text-gray-400 mb-2">Rescheduling isn't available for this series right now.</p>
+                                    )}
+                                    <button disabled className="w-full py-2.5 rounded-xl border border-gray-200 text-gray-300 text-sm font-medium cursor-not-allowed">
+                                        Change schedule
+                                    </button>
+                                </div>
+                            )
                         )}
 
                         {/* cancel */}
-                        {(canCancelDirectly || canRequestCancel) && !confirming && (
-                            <div className="mb-4">
-                                {canCancelDirectly ? (
+                        {!confirming && (
+                            cancelAction === 'auto' ? (
+                                <div className="mb-4">
                                     <button
                                         onClick={handleCancel}
                                         className="w-full py-2.5 rounded-xl border border-red-200 text-red-600 text-sm font-medium hover:bg-red-50 transition-colors"
                                     >
                                         Cancel series
                                     </button>
-                                ) : (
-                                    <div>
+                                </div>
+                            ) : cancelAction === 'request' ? (
+                                <div className="mb-4">
+                                    {!sameAction && (
                                         <p className="text-sm text-amber-600 mb-2">
-                                            You're within the cancellation window ({Math.round((eventType.cancel_notice_minutes ?? 0) / 60)}h notice required). You can submit a request for admin review.
+                                            You're within the cancellation window ({cancelNoticeHours}h notice required). You can submit a request for admin review.
                                         </p>
-                                        <button
-                                            onClick={handleCancel}
-                                            className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
-                                        >
-                                            Request cancellation
-                                        </button>
-                                    </div>
-                                )}
-                            </div>
+                                    )}
+                                    <button
+                                        onClick={handleCancel}
+                                        className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
+                                    >
+                                        Request cancellation
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="mb-4">
+                                    {!sameAction && (
+                                        <p className="text-sm text-gray-400 mb-2">Cancellation isn't available for this series right now.</p>
+                                    )}
+                                    <button disabled className="w-full py-2.5 rounded-xl border border-gray-200 text-gray-300 text-sm font-medium cursor-not-allowed">
+                                        Cancel series
+                                    </button>
+                                </div>
+                            )
                         )}
 
                         {/* confirm cancel */}
                         {confirming === 'cancel' && (
                             <div className="mb-4 p-4 rounded-xl border border-red-100 bg-red-50">
                                 <p className="text-sm font-medium text-red-800 mb-3">
-                                    {canCancelDirectly ? 'Are you sure you want to cancel this entire series? All future sessions will be removed.' : 'Submit a cancellation request for admin review?'}
+                                    {cancelAction === 'auto' ? 'Are you sure you want to cancel this entire series? All future sessions will be removed.' : 'Submit a cancellation request for admin review?'}
                                 </p>
                                 {error && <p className="text-sm text-red-600 mb-2">{error}</p>}
                                 <div className="flex gap-2">

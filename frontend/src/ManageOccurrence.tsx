@@ -8,8 +8,6 @@ interface LoadErrors {
     eventType?: string
 }
 
-const WINDOW_MODES = ['auto_window_block', 'auto_window_request', 'request_window']
-
 const ManageOccurrence = () => {
     const { ref } = useParams<{ ref: string }>()
     const navigate = useNavigate()
@@ -53,25 +51,17 @@ const ManageOccurrence = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [ref])
 
-    const minutesUntil = booking ? (new Date(booking.start).getTime() - Date.now()) / 60000 : Infinity
-
-    const cancelMode = eventType?.cancel_mode ?? 'auto'
-    const cancelInWindow = WINDOW_MODES.includes(cancelMode) && minutesUntil < (eventType?.cancel_notice_minutes ?? 0)
-    const canCancelDirectly = cancelMode === 'auto' || ((cancelMode === 'auto_window_block' || cancelMode === 'auto_window_request') && !cancelInWindow)
-    const canRequestCancel = cancelMode === 'request' || (cancelMode === 'auto_window_request' && cancelInWindow) || (cancelMode === 'request_window' && !cancelInWindow)
-    const cancelBlocked = !canCancelDirectly && !canRequestCancel
-    const cancelBlockedReason = cancelMode === 'not_allowed'
-        ? 'Cancellation is not allowed for this event type.'
-        : `You're within the ${Math.round((eventType?.cancel_notice_minutes ?? 0) / 60)}h cancellation cutoff — cancellation is no longer available.`
-
-    const rescheduleMode = eventType?.reschedule_mode ?? 'auto'
-    const rescheduleInWindow = WINDOW_MODES.includes(rescheduleMode) && minutesUntil < (eventType?.reschedule_notice_minutes ?? 0)
-    const canRescheduleDirectly = rescheduleMode === 'auto' || ((rescheduleMode === 'auto_window_block' || rescheduleMode === 'auto_window_request') && !rescheduleInWindow)
-    const canRequestReschedule = rescheduleMode === 'request' || (rescheduleMode === 'auto_window_request' && rescheduleInWindow) || (rescheduleMode === 'request_window' && !rescheduleInWindow)
-    const rescheduleBlocked = !canRescheduleDirectly && !canRequestReschedule
-    const rescheduleBlockedReason = rescheduleMode === 'not_allowed'
-        ? 'Rescheduling is not allowed for this event type.'
-        : `You're within the ${Math.round((eventType?.reschedule_notice_minutes ?? 0) / 60)}h reschedule cutoff — rescheduling is no longer available.`
+    // Server already decided the verdict — frontend just reads it and authors its own copy,
+    // no re-derivation of *why* (that would need minutes_until, which stays server-side).
+    const cancelAction = booking?.cancel_action ?? 'blocked'
+    const rescheduleAction = booking?.reschedule_action ?? 'blocked'
+    // Cancel and reschedule render independently, so when both land on the same verdict
+    // (commonly both 'request'), showing each one's own near-identical explanation reads as
+    // a duplicate — collapse into one shared line then, fall back to per-action wording
+    // otherwise.
+    const sameAction = cancelAction === rescheduleAction
+    const cancelNoticeHours = Math.round((eventType?.cancel_notice_minutes ?? 0) / 60)
+    const rescheduleNoticeHours = Math.round((eventType?.reschedule_notice_minutes ?? 0) / 60)
 
     const handleCancel = () => setConfirming('cancel')
 
@@ -81,14 +71,14 @@ const ManageOccurrence = () => {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${ref}/cancel`, { method: 'POST' })
             if (!res.ok) {
                 const err = await res.json()
-                setError(extractError(err, canCancelDirectly ? 'Failed to cancel booking' : 'Failed to submit cancellation request'))
+                setError(extractError(err, cancelAction === 'auto' ? 'Failed to cancel booking' : 'Failed to submit cancellation request'))
                 return
             }
             const data: Booking = await res.json()
             setDone(data.request ? 'requested_cancel' : 'cancelled')
         } catch (err) {
             console.error(err)
-            setError(canCancelDirectly ? 'An unknown error occurred while cancelling the booking' : 'An unknown error occurred while submitting the cancellation request')
+            setError(cancelAction === 'auto' ? 'An unknown error occurred while cancelling the booking' : 'An unknown error occurred while submitting the cancellation request')
         } finally {
             setIsSubmitting(false)
             setConfirming(null)
@@ -166,44 +156,59 @@ const ManageOccurrence = () => {
                     <p className="text-sm text-gray-400 capitalize">This booking is {booking.status}.</p>
                 ) : (
                     <>
+                        {sameAction && cancelAction === 'request' && !confirming && (
+                            <p className="text-sm text-amber-600 mb-3">
+                                Cancelling or rescheduling isn't available directly right now — you can submit a request for admin review below.
+                            </p>
+                        )}
+                        {sameAction && cancelAction === 'blocked' && !confirming && (
+                            <p className="text-sm text-gray-400 mb-3">
+                                Neither cancelling nor rescheduling is available for this booking right now.
+                            </p>
+                        )}
+
                         {/* cancel */}
-                        {(canCancelDirectly || canRequestCancel || cancelBlocked) && !confirming && (
-                            <div className="mb-4">
-                                {canCancelDirectly ? (
+                        {!confirming && (
+                            cancelAction === 'auto' ? (
+                                <div className="mb-4">
                                     <button
                                         onClick={handleCancel}
                                         className="w-full py-2.5 rounded-xl border border-red-200 text-red-600 text-sm font-medium hover:bg-red-50 transition-colors"
                                     >
                                         Cancel booking
                                     </button>
-                                ) : canRequestCancel ? (
-                                    <div>
+                                </div>
+                            ) : cancelAction === 'request' ? (
+                                <div className="mb-4">
+                                    {!sameAction && (
                                         <p className="text-sm text-amber-600 mb-2">
-                                            You're within the cancellation window ({Math.round((eventType.cancel_notice_minutes ?? 0) / 60)}h notice required). You can submit a request for admin review.
+                                            You're within the cancellation window ({cancelNoticeHours}h notice required). You can submit a request for admin review.
                                         </p>
-                                        <button
-                                            onClick={handleCancel}
-                                            className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
-                                        >
-                                            Request cancellation
-                                        </button>
-                                    </div>
-                                ) : (
-                                    <div>
-                                        <p className="text-sm text-gray-400 mb-2">{cancelBlockedReason}</p>
-                                        <button disabled className="w-full py-2.5 rounded-xl border border-gray-200 text-gray-300 text-sm font-medium cursor-not-allowed">
-                                            Cancel booking
-                                        </button>
-                                    </div>
-                                )}
-                            </div>
+                                    )}
+                                    <button
+                                        onClick={handleCancel}
+                                        className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
+                                    >
+                                        Request cancellation
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="mb-4">
+                                    {!sameAction && (
+                                        <p className="text-sm text-gray-400 mb-2">Cancellation isn't available for this booking right now.</p>
+                                    )}
+                                    <button disabled className="w-full py-2.5 rounded-xl border border-gray-200 text-gray-300 text-sm font-medium cursor-not-allowed">
+                                        Cancel booking
+                                    </button>
+                                </div>
+                            )
                         )}
 
                         {/* confirm cancel */}
                         {confirming === 'cancel' && (
                             <div className="mb-4 p-4 rounded-xl border border-red-100 bg-red-50">
                                 <p className="text-sm font-medium text-red-800 mb-3">
-                                    {canCancelDirectly ? 'Are you sure you want to cancel this booking?' : 'Submit a cancellation request for admin review?'}
+                                    {cancelAction === 'auto' ? 'Are you sure you want to cancel this booking?' : 'Submit a cancellation request for admin review?'}
                                 </p>
                                 {error && <p className="text-sm text-red-600 mb-2">{error}</p>}
                                 <div className="flex gap-2">
@@ -226,9 +231,9 @@ const ManageOccurrence = () => {
                         )}
 
                         {/* reschedule */}
-                        {(canRescheduleDirectly || canRequestReschedule || rescheduleBlocked) && !confirming && (
-                            <div className="mb-4">
-                                {canRescheduleDirectly ? (
+                        {!confirming && (
+                            rescheduleAction === 'auto' ? (
+                                <div className="mb-4">
                                     <button
                                         onClick={() => navigate(`/book/${booking.event_type_id}`, { state: {
                                             rescheduleFromId: booking.id,
@@ -245,37 +250,41 @@ const ManageOccurrence = () => {
                                     >
                                         Reschedule
                                     </button>
-                                ) : canRequestReschedule ? (
-                                    <div>
+                                </div>
+                            ) : rescheduleAction === 'request' ? (
+                                <div className="mb-4">
+                                    {!sameAction && (
                                         <p className="text-sm text-amber-600 mb-2">
-                                            You're within the reschedule window ({Math.round((eventType.reschedule_notice_minutes ?? 0) / 60)}h notice required). You can submit a request for admin review.
+                                            You're within the reschedule window ({rescheduleNoticeHours}h notice required). You can submit a request for admin review.
                                         </p>
-                                        <button
-                                            onClick={() => navigate(`/book/${booking.event_type_id}`, { state: {
-                                                requestRescheduleRef: ref,
-                                                originalStart: booking.start,
-                                                originalEnd: booking.end,
-                                                studentFirst: booking.student_first,
-                                                studentLast: booking.student_last,
-                                                studentEmail: booking.student_email,
-                                                studentPhone: booking.student_phone,
-                                                parentEmail: booking.parent_email,
-                                                parentPhone: booking.parent_phone,
-                                            }})}
-                                            className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
-                                        >
-                                            Request reschedule
-                                        </button>
-                                    </div>
-                                ) : (
-                                    <div>
-                                        <p className="text-sm text-gray-400 mb-2">{rescheduleBlockedReason}</p>
-                                        <button disabled className="w-full py-2.5 rounded-xl border border-gray-200 text-gray-300 text-sm font-medium cursor-not-allowed">
-                                            Reschedule
-                                        </button>
-                                    </div>
-                                )}
-                            </div>
+                                    )}
+                                    <button
+                                        onClick={() => navigate(`/book/${booking.event_type_id}`, { state: {
+                                            requestRescheduleRef: ref,
+                                            originalStart: booking.start,
+                                            originalEnd: booking.end,
+                                            studentFirst: booking.student_first,
+                                            studentLast: booking.student_last,
+                                            studentEmail: booking.student_email,
+                                            studentPhone: booking.student_phone,
+                                            parentEmail: booking.parent_email,
+                                            parentPhone: booking.parent_phone,
+                                        }})}
+                                        className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
+                                    >
+                                        Request reschedule
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="mb-4">
+                                    {!sameAction && (
+                                        <p className="text-sm text-gray-400 mb-2">Rescheduling isn't available for this booking right now.</p>
+                                    )}
+                                    <button disabled className="w-full py-2.5 rounded-xl border border-gray-200 text-gray-300 text-sm font-medium cursor-not-allowed">
+                                        Reschedule
+                                    </button>
+                                </div>
+                            )
                         )}
 
                         {error && !confirming && <p className="text-sm text-red-500 mt-2">{error}</p>}

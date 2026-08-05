@@ -450,9 +450,7 @@ class BookingResponse(BaseModel):
     rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
     google_event_id: str
     cancel_action: str
-    cancel_blocked_reason: str | None = None
     reschedule_action: str
-    reschedule_blocked_reason: str | None = None
 
     student_first: str
     student_last: str
@@ -479,9 +477,7 @@ class BookingSeriesResponse(BaseModel):
     recur_until: date | None = None
     google_event_id: str | None = None
     cancel_action: str
-    cancel_blocked_reason: str | None = None
     reschedule_action: str
-    reschedule_blocked_reason: str | None = None
 
     student_first: str
     student_last: str
@@ -489,6 +485,7 @@ class BookingSeriesResponse(BaseModel):
     student_phone: str | None = None
     parent_email: str | None = None
     parent_phone: str | None = None
+    request: BookingRequestResponse | None = None
 
     bookings: list[BookingResponse]
 

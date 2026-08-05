@@ -3,7 +3,7 @@ from sqlalchemy.orm import relationship
 from database import Base
 from datetime import datetime, UTC
 from uuid import uuid4
-from policy import get_cancel_action, get_reschedule_action, cancel_blocked_detail, reschedule_blocked_detail
+from policy import get_cancel_action, get_reschedule_action
 
 
 def _minutes_until(start: datetime) -> float:
@@ -233,16 +233,8 @@ class BookingSeries(Base):
         return get_cancel_action(self.event_type, self._next_upcoming_minutes_until)
 
     @property
-    def cancel_blocked_reason(self) -> str | None:
-        return None if self.cancel_action == 'auto' else cancel_blocked_detail(self.event_type)
-
-    @property
     def reschedule_action(self) -> str:
         return get_reschedule_action(self.event_type, self._next_upcoming_minutes_until)
-
-    @property
-    def reschedule_blocked_reason(self) -> str | None:
-        return None if self.reschedule_action == 'auto' else reschedule_blocked_detail(self.event_type)
 
 
 class Booking(Base):
@@ -310,16 +302,8 @@ class Booking(Base):
         return get_cancel_action(self.event_type, _minutes_until(self.start))
 
     @property
-    def cancel_blocked_reason(self) -> str | None:
-        return None if self.cancel_action == 'auto' else cancel_blocked_detail(self.event_type)
-
-    @property
     def reschedule_action(self) -> str:
         return get_reschedule_action(self.event_type, _minutes_until(self.start))
-
-    @property
-    def reschedule_blocked_reason(self) -> str | None:
-        return None if self.reschedule_action == 'auto' else reschedule_blocked_detail(self.event_type)
 
 
 class Settings(Base):
