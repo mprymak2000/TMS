@@ -109,6 +109,7 @@ def _insert_series(db, tutor_id: int, event_type_id: int, *,
                    recur_until: date | None = None) -> BookingSeries:
     s = BookingSeries(
         tutor_id=tutor_id, event_type_id=event_type_id,
+        start_date=MON + timedelta(days=start_dow),  # value doesn't matter to available_slots
         start_day_of_week=start_dow, start_time=start_t,
         end_day_of_week=end_dow, end_time=end_t,
         timezone=timezone, is_active=True, recur_until=recur_until,

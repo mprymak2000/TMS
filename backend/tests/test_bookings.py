@@ -1,13 +1,13 @@
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
 from unittest.mock import patch, MagicMock
 from conftest import TestingSessionLocal
-from models import Booking
+from models import Booking, BookingSeries
 from schemas import BookingResponse
 
 
 def _all_bookings():
-    """Raw DB truth (all rows, any status) — the old GET /bookings/ endpoint existed
-    only for this, and tests are the only remaining consumer now that it's gone."""
+    """Raw DB truth (all rows, any status) — direct DB query, distinct from GET /bookings/
+    (which merges in virtual occurrences and applies time_min/time_max filtering)."""
     with TestingSessionLocal() as db:
         rows = db.query(Booking).order_by(Booking.id).all()
         return [BookingResponse.model_validate(b).model_dump(mode="json") for b in rows]
@@ -70,6 +70,24 @@ MOCK_EVENT_ID = "google_event_abc123"
 MOCK_INSTANCE_ID = "google_event_abc123_instance"
 
 
+class _FakeBatch:
+    """Minimal stand-in for google-api-python-client's BatchHttpRequest — real success responses
+    for each added request, so batched-delete code paths are genuinely exercised in tests
+    instead of silently no-op'd by a generic MagicMock."""
+    def __init__(self, callback=None):
+        self._callback = callback
+        self._requests = []
+
+    def add(self, request, request_id=None, callback=None):
+        self._requests.append((request_id, callback or self._callback))
+        return self
+
+    def execute(self):
+        for request_id, cb in self._requests:
+            if cb:
+                cb(request_id, {}, None)
+
+
 def mock_calendar_service():
     svc = MagicMock()
     svc.events().insert().execute.return_value = {"id": MOCK_EVENT_ID}
@@ -77,6 +95,7 @@ def mock_calendar_service():
     svc.events().patch().execute.return_value = {"id": MOCK_EVENT_ID}
     svc.events().get().execute.return_value = {"id": MOCK_EVENT_ID, "summary": "old"}
     svc.events().instances().execute.return_value = {"items": [{"id": MOCK_INSTANCE_ID, "start": {"dateTime": "2099-06-10T20:00:00Z"}, "end": {"dateTime": "2099-06-10T21:30:00Z"}}]}
+    svc.new_batch_http_request.side_effect = lambda callback=None: _FakeBatch(callback)
     return svc
 
 
@@ -294,10 +313,25 @@ def test_get_bookings_pending_only(client):
         created = client.post("/bookings/", json=payload).json()
         client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
     assert len(_all_bookings()) == 1  # booking still exists (not executed)
-    pending = client.get("/bookings/my-bookings?pending_only=true").json()["items"]
+    pending = client.get("/bookings/?pending_only=true").json()
     assert len(pending) == 1
     assert pending[0]["request"]["type"] == "cancel_occurrence"
     assert pending[0]["request"]["status"] == "pending"
+
+
+def test_pending_only_ignores_time_range_params(client):
+    """pending_only has no time dimension — time_min/time_max are silently irrelevant there,
+    not an error and don't change the result. Deliberately passing an inverted range
+    (time_min after time_max) to prove they're truly ignored, not just coincidentally satisfied."""
+    tutor, event_type = setup_strict_notice(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
+
+    items = client.get("/bookings/?pending_only=true&time_min=2099-01-01T00:00:00&time_max=2000-01-01T00:00:00").json()
+    assert len(items) == 1
+    assert items[0]["request"]["type"] == "cancel_occurrence"
 
 
 # ── CANCEL (soft-delete) ──────────────────────────────────────────────────────
@@ -448,6 +482,26 @@ def test_cancel_series(client):
     assert len(_all_bookings()) == 0
 
 
+def test_cancel_series_batches_instance_deletes(client):
+    """Deleting more than one batch's worth of instances (50) must chunk into multiple batch
+    requests rather than one oversized batch or falling back to per-instance calls — this is
+    the fix for cancel-series hanging on an indefinite series with many future instances."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    many_instances = {"items": [
+        {"id": f"inst-{i}", "start": {"dateTime": "2099-06-10T20:00:00Z"}, "end": {"dateTime": "2099-06-10T21:30:00Z"}}
+        for i in range(120)
+    ]}
+    svc = mock_calendar_service()
+    svc.events().instances().execute.return_value = many_instances
+    with patch("routers.bookings.get_calendar_service", return_value=svc):
+        first = client.post("/bookings/", json=payload).json()
+        response = client.delete(f"/bookings/booking-series/{first['series_id']}")
+    assert response.status_code == 200
+    # 120 instances / 50 per batch = 3 batch calls, not 120 individual delete() calls
+    assert svc.new_batch_http_request.call_count == 3
+
+
 def test_cancel_series_not_found(client):
     assert client.delete("/bookings/booking-series/9999").status_code == 404
 
@@ -548,9 +602,9 @@ def test_my_bookings_upcoming_merges_real_and_virtual(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/my-bookings?email={created['student_email']}&page=1")
+    response = client.get(f"/bookings/?email={created['student_email']}&time_min=2099-01-01T00:00:00&page=1")
     assert response.status_code == 200
-    items = response.json()["items"]
+    items = response.json()
     assert len(items) >= 2  # occurrence 1 (real) + at least one virtual occurrence
     assert items[0]["id"] == created["id"]  # sorted chronologically, real occurrence 1 comes first
     starts = [i["start"] for i in items]
@@ -565,7 +619,7 @@ def test_my_bookings_upcoming_excludes_other_customers(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
         client.post("/bookings/", json=other_payload)
-    items = client.get("/bookings/my-bookings?email=someone-else@example.com").json()["items"]
+    items = client.get("/bookings/?email=someone-else@example.com&time_min=2099-01-01T00:00:00").json()
     assert len(items) == 1
     assert items[0]["student_email"] == "someone-else@example.com"
 
@@ -579,7 +633,7 @@ def test_my_bookings_no_email_shows_everyone(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
         client.post("/bookings/", json=other_payload)
-    items = client.get("/bookings/my-bookings").json()["items"]
+    items = client.get("/bookings/?time_min=2099-01-01T00:00:00").json()
     emails = {i["student_email"] for i in items}
     assert "alex@example.com" in emails
     assert "someone-else@example.com" in emails
@@ -596,7 +650,7 @@ def test_my_bookings_tutor_id_filters_scope(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
-    items = client.get(f"/bookings/my-bookings?tutor_id={tutor_a['id']}").json()["items"]
+    items = client.get(f"/bookings/?tutor_id={tutor_a['id']}&time_min=2099-01-01T00:00:00").json()
     assert len(items) == 1
     assert items[0]["tutor_id"] == tutor_a["id"]
 
@@ -616,8 +670,9 @@ def test_my_bookings_past(client):
     db.commit()
     db.close()
 
-    upcoming = client.get(f"/bookings/my-bookings?email={created['student_email']}&status=upcoming").json()["items"]
-    past = client.get(f"/bookings/my-bookings?email={created['student_email']}&status=past").json()["items"]
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    upcoming = client.get(f"/bookings/?email={created['student_email']}&time_min={now_iso}").json()
+    past = client.get(f"/bookings/?email={created['student_email']}&time_max={now_iso}").json()
     assert created["id"] not in [i["id"] for i in upcoming]
     assert created["id"] in [i["id"] for i in past]
 
@@ -628,9 +683,98 @@ def test_my_bookings_never_writes_to_db(client):
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
-        client.get(f"/bookings/my-bookings?email={created['student_email']}&page=3")
+        client.get(f"/bookings/?email={created['student_email']}&time_min=2099-01-01T00:00:00&page=3")
     all_bookings = _all_bookings()
     assert len(all_bookings) == 1  # only the real occurrence 1 — nothing materialized by browsing
+
+
+def test_my_bookings_no_bounds_returns_since_inception(client):
+    """Omitting time_min entirely must not implicitly default to 'now' — it means unbounded,
+    starting from the series' actual start_date, however far in the past that is."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    db = TestingSessionLocal()
+    series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+    series.start_date = date(2020, 1, 8)  # well before "now" and far before the booking's 2099 start
+    db.commit()
+    db.close()
+
+    items = client.get(f"/bookings/?email={created['student_email']}").json()
+    assert items[0]["start"] < "2021-01-01"  # earliest item comes from 2020, not "now" (~2026)
+
+
+def test_my_bookings_time_max_stops_virtual_generation(client):
+    """time_max, when given, stops virtual generation early — independent of page/page_size."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    # weekly occurrences land on 06-10 (real), 06-17, 06-24, 07-01, ... — time_max cuts off after 06-24
+    items = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-06-24T23:59:59").json()
+    assert len(items) == 3
+    assert items[-1]["start"].startswith("2099-06-24")
+
+
+def test_my_bookings_time_min_narrows_real_rows(client):
+    """time_min narrows real rows too, not just virtual generation — a genuinely new capability,
+    since the floor used to be hardcoded to 'now'."""
+    tutor, event_type = setup_standalone(client)
+    early_payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    late_payload = {**early_payload, "start": "2099-08-10T16:00:00", "end": "2099-08-10T17:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        early = client.post("/bookings/", json=early_payload).json()
+        late = client.post("/bookings/", json=late_payload).json()
+
+    items = client.get(f"/bookings/?email={early['student_email']}&time_min=2099-07-01T00:00:00").json()
+    ids = [i["id"] for i in items]
+    assert early["id"] not in ids
+    assert late["id"] in ids
+
+
+def test_virtual_occurrences_anchored_to_start_date_not_earliest_booking(client):
+    """The lower bound for virtual generation must come from series.start_date, not from
+    scanning for the earliest surviving real row — proven by deleting that row entirely."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    db = TestingSessionLocal()
+    db.query(Booking).filter(Booking.public_id == created["id"]).delete()
+    db.commit()
+    db.close()
+    assert _all_bookings() == []  # no real rows left for this series at all
+
+    items = client.get(f"/bookings/?email={created['student_email']}").json()
+    assert len(items) > 0
+    assert items[0]["start"].startswith("2099-06-10")  # still anchored correctly, purely virtual now
+
+
+def test_rescheduled_occurrence_not_double_counted(client):
+    """Rescheduling one occurrence must not leave a phantom virtual duplicate at the original
+    slot, and must not disrupt virtual generation for the following week."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        series_id = created["series_id"]
+
+        # occurrence 2 (06-17, 16:00 America/New_York = 20:00 UTC) is virtual until acted on by ref
+        ref = f"{series_id}:{int(datetime(2099, 6, 17, 20, 0, tzinfo=UTC).timestamp())}"
+        reschedule_body = {**reschedule_payload, "tutor_id": tutor["id"], "start": "2099-06-18T16:00:00", "end": "2099-06-18T17:30:00"}
+        rescheduled = client.post(f"/bookings/{ref}/reschedule", json=reschedule_body).json()
+
+        items = client.get(f"/bookings/?email={created['student_email']}&time_min=2099-01-01T00:00:00").json()
+
+    starts = [i["start"] for i in items]
+    ids = [i["id"] for i in items]
+    assert not any(s.startswith("2099-06-17") for s in starts)  # original slot gone entirely
+    assert ids.count(rescheduled["id"]) == 1  # new slot appears exactly once
+    assert any(s.startswith("2099-06-24") for s in starts)  # following week's occurrence still generates
 
 
 # ── SERVER-COMPUTED POLICY VERDICTS ─────────────────────────────────────────────
@@ -993,9 +1137,9 @@ def test_booking_series_occurrences_upcoming_merges_real_and_virtual(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?page=1")
+    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-01-01T00:00:00&page=1")
     assert response.status_code == 200
-    items = response.json()["items"]
+    items = response.json()
     assert len(items) >= 2  # occurrence 1 (real) + at least one virtual occurrence
     assert items[0]["id"] == created["id"]
     starts = [i["start"] for i in items]
@@ -1007,7 +1151,7 @@ def test_booking_series_occurrences_never_writes_to_db(client):
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
-        client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?page=3")
+        client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-01-01T00:00:00&page=3")
     all_bookings = _all_bookings()
     assert len(all_bookings) == 1  # only the real occurrence 1 — nothing materialized by browsing
 
@@ -1022,11 +1166,18 @@ def test_booking_series_occurrences_past(client):
     booking = db.query(Booking).filter(Booking.public_id == created["id"]).first()
     booking.start = datetime(2020, 1, 7, 16, 0, tzinfo=UTC)
     booking.end = datetime(2020, 1, 7, 17, 0, tzinfo=UTC)
+    # series.start_date must move too — otherwise the series still legitimately claims to start
+    # in 2099, the floor stays clamped there regardless of time_min, and virtual generation
+    # regenerates a phantom duplicate of the now-orphaned 2099 slot (existing_starts no longer
+    # contains it once the row's start moved away from it).
+    series = db.query(BookingSeries).filter(BookingSeries.id == booking.series_id).first()
+    series.start_date = date(2020, 1, 7)
     db.commit()
     db.close()
 
-    upcoming = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?status=upcoming").json()["items"]
-    past = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?status=past").json()["items"]
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    upcoming = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min={now_iso}").json()
+    past = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max={now_iso}").json()
     assert created["id"] not in [i["id"] for i in upcoming]
     assert created["id"] in [i["id"] for i in past]
 
@@ -1045,7 +1196,49 @@ def test_booking_series_occurrences_excludes_other_series(client):
         created = client.post("/bookings/", json=payload).json()
         other_created = client.post("/bookings/", json=other_payload).json()
 
-    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences").json()["items"]
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-01-01T00:00:00").json()
     ids = [i["id"] for i in items]
     assert created["id"] in ids
     assert other_created["id"] not in ids
+
+
+def test_booking_series_occurrences_no_bounds_returns_since_inception(client):
+    """Same guarantee as the flat list endpoint: omitting time_min doesn't default to 'now'."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    db = TestingSessionLocal()
+    series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+    series.start_date = date(2020, 1, 8)
+    db.commit()
+    db.close()
+
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences").json()
+    assert items[0]["start"] < "2021-01-01"
+
+
+def test_booking_series_occurrences_time_max_stops_virtual_generation(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max=2099-06-24T23:59:59").json()
+    assert len(items) == 3
+    assert items[-1]["start"].startswith("2099-06-24")
+
+
+def test_booking_series_occurrences_time_min_narrows(client):
+    """time_min excludes an earlier real occurrence while keeping a later virtual one."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-15T00:00:00").json()
+    ids = [i["id"] for i in items]
+    starts = [i["start"] for i in items]
+    assert created["id"] not in ids  # occurrence 1 (06-10) excluded, before time_min
+    assert any(s.startswith("2099-06-17") for s in starts)  # occurrence 2 included

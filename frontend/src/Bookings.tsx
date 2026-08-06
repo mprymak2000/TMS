@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { TextInput, Loader, Input, Button, Modal, Popover, Menu, Switch } from '@mantine/core'
 import { IconSearch, IconCalendar, IconFilter, IconX, IconCheck, IconChevronDown } from '@tabler/icons-react'
 import type { Tutor, EventType, Booking, BookingSeries } from './types'
@@ -58,14 +58,16 @@ const formatGap = (minutes: number): string => {
     return `${hours}h ${mins}m`
 }
 
-const fetchMyBookings = async (tab: 'timeline' | 'requests', timeScope: TimeScope, pageNum: number, emailFilter?: string): Promise<FetchResult> => {
-    const base = `${import.meta.env.VITE_API_URL}/bookings/my-bookings`
+const fetchMyBookings = async (tab: 'timeline' | 'requests', timeScope: TimeScope, pageNum: number, boundary: string, emailFilter?: string): Promise<FetchResult> => {
+    const base = `${import.meta.env.VITE_API_URL}/bookings/`
     const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
-    const query = tab === 'requests' ? `pending_only=true` : `status=${timeScope}`
+    const query = tab === 'requests'
+        ? `pending_only=true`
+        : timeScope === 'upcoming' ? `time_min=${boundary}` : `time_max=${boundary}`
 
     const res = await fetch(`${base}?${query}&page=${pageNum}${emailParam}`)
     if (!res.ok) { return { ok: false, error: await res.json() } }
-    const items = (await res.json()).items as Booking[]
+    const items = (await res.json()) as Booking[]
     // If the number of items returned is less than PAGE_SIZE, it means there are no more items to fetch.
     // TODO: this behavior needs to be revisited and formalized but ok for now.
     return { ok: true, items, hasMore: items.length === PAGE_SIZE }
@@ -149,6 +151,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [isLoadingMore, setIsLoadingMore] = useState(false)
     const [page, setPage] = useState(1)
     const [hasMore, setHasMore] = useState(false)
+    // frozen once per fresh (non-append) load, reused across "Load more" clicks so the
+    // time_min/time_max window doesn't drift between pages of the same browsing session
+    const boundaryRef = useRef<string>(new Date().toISOString())
 
     // recurring tab — separate state, separate shape (BookingSeries, not Booking), unpaginated
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
@@ -169,11 +174,12 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
     const loadData = async (options: { emailFilter?: string; tab?: 'timeline' | 'requests'; timeScope?: TimeScope; pageNum?: number; append?: boolean } = {}) => {
         const { emailFilter, tab = (activeTab === 'requests' ? 'requests' : 'timeline'), timeScope: scope = timeScope, pageNum = 1, append = false } = options
+        if (!append) boundaryRef.current = new Date().toISOString()
         if (append) setIsLoadingMore(true)
         else setIsLoading(true)
         try {
             const [bookingsRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetchMyBookings(tab, scope, pageNum, emailFilter),
+                fetchMyBookings(tab, scope, pageNum, boundaryRef.current, emailFilter),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/event_types`),
             ])

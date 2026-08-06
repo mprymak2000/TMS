@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { Button, Loader, Menu } from '@mantine/core'
 import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconRepeat } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
@@ -29,17 +29,20 @@ const SeriesRow = ({ series, tutor, eventType, onRefresh, onError, onCancelSerie
     const [isLoading, setIsLoading] = useState(false)
     const [isLoadingMore, setIsLoadingMore] = useState(false)
     const [expandedOccurrenceId, setExpandedOccurrenceId] = useState<string | null>(null)
+    // frozen at mount — a series row only has one pagination lifetime per mount, no tab/scope
+    // switching within it, so this stays fixed for the row's whole expanded lifetime
+    const boundaryRef = useRef<string>(new Date().toISOString())
 
     const loadOccurrences = async (pageNum: number, append: boolean) => {
         if (append) setIsLoadingMore(true)
         else setIsLoading(true)
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}/occurrences?status=upcoming&page=${pageNum}`)
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}/occurrences?time_min=${boundaryRef.current}&page=${pageNum}`)
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to load occurrences.'))
                 return
             }
-            const items: Booking[] = (await res.json()).items
+            const items: Booking[] = await res.json()
             setOccurrences(prev => append ? [...prev, ...items] : items)
             setPage(pageNum)
             setHasMore(items.length === PAGE_SIZE)

@@ -192,6 +192,7 @@ class BookingSeries(Base):
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
     event_type_id = Column(Integer, ForeignKey("event_types.id"), nullable=False)
+    start_date = Column(Date, nullable=False)
     start_day_of_week = Column(Integer, nullable=False)  # 0 Monday, 6 Sunday — local schedule timezone
     end_day_of_week = Column(Integer, nullable=False)    # usually same as start; differs only for midnight-crossing sessions
     # stored as local time (schedule timezone) — intentionally NOT UTC, same reasoning as ScheduleDay:

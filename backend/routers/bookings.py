@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import _virtual_occurrences, resolve_ref, resolve_series_occurrences
+from booking_utils import resolve_ref, merge_occurrences
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -27,7 +27,6 @@ from schemas import (
     BookingResponse,
     BookingSeriesResponse,
     BookingUpdate,
-    MyBookingsResponse,
 )
 from sqlalchemy.orm import Session
 
@@ -37,61 +36,6 @@ PAGE_SIZE = 10
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
 
-@router.get("/my-bookings", response_model=MyBookingsResponse)
-def get_my_bookings(
-    email: str | None = Query(default=None),
-    tutor_id: int | None = Query(default=None),
-    status: str = Query(default="upcoming"),  # "upcoming" | "past"
-    pending_only: bool = Query(default=False),
-    page: int = Query(default=1, ge=1),
-    db: Session = Depends(get_db),
-    settings=Depends(get_settings),
-):
-    """The one endpoint the frontend uses to display bookings, admin or customer alike —
-    email/tutor_id are optional scoping filters, not a different mode. Virtual occurrences
-    (not-yet-materialized series occurrences) are merged in identically regardless of who's
-    asking; there's no reason an admin should see a degraded, materialized-only view when a
-    customer sees the complete picture. GET /bookings/ (unfiltered, unpaginated) stays as a
-    separate lower-level endpoint — this one is specifically for the bookings-list UI."""
-    now = datetime.now(UTC)
-
-    if pending_only:
-        # a virtual occurrence can never have a pending BookingRequest (nothing to request
-        # approval on for a row that doesn't exist yet) — real rows only, no virtual merge.
-        q = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
-        if email:
-            q = q.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        if tutor_id:
-            q = q.filter(Booking.tutor_id == tutor_id)
-        items = q.order_by(Booking.start.desc()).offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE).all()
-        return {"items": items}
-
-    if status == "past":
-        q = db.query(Booking).filter(Booking.start < now)
-        if email:
-            q = q.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        if tutor_id:
-            q = q.filter(Booking.tutor_id == tutor_id)
-        items = q.order_by(Booking.start.desc()).offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE).all()
-        return {"items": items}
-
-    if status == "upcoming":
-        real_q = db.query(Booking)
-        if email:
-            real_q = real_q.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        if tutor_id:
-            real_q = real_q.filter(Booking.tutor_id == tutor_id)
-
-        series_q = db.query(BookingSeries).filter(BookingSeries.is_active == True)
-        if email:
-            series_q = series_q.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
-        if tutor_id:
-            series_q = series_q.filter(BookingSeries.tutor_id == tutor_id)
-
-        items = resolve_series_occurrences(series_q.all(), real_q, now, page, PAGE_SIZE, settings)
-        return {"items": items}
-
-
 @router.get("/booking-series", response_model=list[BookingSeriesResponse])
 def get_booking_series(
     email: str | None = Query(default=None),
@@ -99,9 +43,9 @@ def get_booking_series(
     db: Session = Depends(get_db),
 ):
     """Bare series list — no embedded occurrences. Expanding a series row on the frontend
-    calls GET /booking-series/{id}/occurrences separately, the same way GET /my-bookings does
-    it internally — one shared resolution path (resolve_series_occurrences) for all occurrence
-    reads, regardless of whether the caller wants everyone's occurrences or just one series'."""
+    calls GET /booking-series/{id}/occurrences separately, the same way GET / does it
+    internally — one shared resolution path (merge_occurrences) for all occurrence reads,
+    regardless of whether the caller wants everyone's occurrences or just one series'."""
     q = db.query(BookingSeries).filter(BookingSeries.is_active == True)
     if email:
         q = q.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
@@ -115,34 +59,69 @@ def get_booking_series(
     return results
 
 
-@router.get("/booking-series/{id}/occurrences", response_model=MyBookingsResponse)
+@router.get("/booking-series/{id}/occurrences", response_model=list[BookingResponse])
 def get_booking_series_occurrences(
     id: str,
-    status: str = Query(default="upcoming"),  # "upcoming" | "past"
+    time_min: datetime | None = Query(default=None),
+    time_max: datetime | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
+    """Returns a paginated list of all occurrences (materialized + virtual) for a given series."""
+    
     series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not series:
         raise HTTPException(status_code=404, detail="Booking series not found")
 
-    now = datetime.now(UTC)
+    materialized_query = db.query(Booking).filter(Booking.series_id == series.id) # materialized occurrences only part of a series
+    return merge_occurrences([series], materialized_query, time_min, time_max, page, PAGE_SIZE, settings)
 
-    if status == "past":
-        items = (
-            db.query(Booking)
-            .filter(Booking.series_id == series.id, Booking.start < now)
-            .order_by(Booking.start.desc())
-            .offset((page - 1) * PAGE_SIZE)
-            .limit(PAGE_SIZE)
-            .all()
-        )
-        return {"items": items}
+@router.get("/", response_model=list[BookingResponse])
+def list_bookings(
+    email: str | None = Query(default=None),
+    tutor_id: int | None = Query(default=None),
+    time_min: datetime | None = Query(default=None),
+    time_max: datetime | None = Query(default=None),
+    pending_only: bool = Query(default=False),
+    page: int = Query(default=1, ge=1),
+    db: Session = Depends(get_db),
+    settings=Depends(get_settings),
+):
+    """Returns a paginated, flat list of all bookings (materialized + virtual occurrences).
+    Optionally filtered to a student/parent email or a tutor_id. Optionally filtered to only pending requests.
+    Virtual ocurrences (from series rules) are generated in memory and merged with real rows, then the combined list is paginated.
+    Min and max optional filters are used to scope the time window for ocurrences. The default floor is to start from the first occurrence, 
+    while max is dynamically calculated based on the number of pages requested (pagination).
+    
+    Returned list represents a real timeline of all bookings."""
 
-    real_q = db.query(Booking).filter(Booking.series_id == series.id)
-    items = resolve_series_occurrences([series], real_q, now, page, PAGE_SIZE, settings)
-    return {"items": items}
+    if pending_only:
+        # a virtual occurrence can never have a pending BookingRequest (nothing to request
+        # approval on for a row that doesn't exist yet) — real rows only, no virtual merge.
+        query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
+        if email:
+            query = query.filter((Booking.student_email == email) | (Booking.parent_email == email))
+        if tutor_id:
+            query = query.filter(Booking.tutor_id == tutor_id)
+        return query.order_by(Booking.start.desc()).offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE).all()
+
+    # Get booking rows that already exist in db (materialized occurrences). Filter if needed.
+    materialized_query = db.query(Booking)
+    if email:
+        materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
+    if tutor_id:
+        materialized_query = materialized_query.filter(Booking.tutor_id == tutor_id)
+
+    # Get series rows in db (BookingSeries - rules). Filter if needed.
+    series_query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+    if email:
+        series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
+    if tutor_id:
+        series_query = series_query.filter(BookingSeries.tutor_id == tutor_id)
+
+    # Merge materialized + resolved virtual occurrences across all series, then paginate the combined list.
+    return merge_occurrences(series_query.all(), materialized_query, time_min, time_max, page, PAGE_SIZE, settings)
 
 
 @router.get("/{ref}", response_model=BookingResponse)
@@ -246,6 +225,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             series = BookingSeries(
                 public_id=new_public_id,
                 **booking_in.model_dump(exclude={"start", "end", "timezone", "recur_until"}),
+                start_date=local_start.date(),
                 start_day_of_week=local_start.weekday(),
                 end_day_of_week=local_end.weekday(),
                 start_time=local_start.time(),
@@ -561,6 +541,25 @@ def permanently_delete_booking(ref: str, cascade: bool = False, db: Session = De
         raise HTTPException(status_code=500, detail="Failed to permanently delete booking") from e
     return Response(status_code=204)
 
+def _batch_delete_instances(service, calendar_id: str, instance_ids: list[str], series_id: int) -> None:
+    """Delete calendar event instances via batched requests instead of one HTTP round-trip per
+    instance — an indefinite series with no timeMax on the instances() lookup can return up to
+    250 future instances, and 250 sequential delete() calls at ~0.3-0.5s each can take minutes.
+    Google Calendar API caps batch size at 50 sub-requests, so chunk into batches of that size."""
+    BATCH_SIZE = 50
+
+    def _on_response(request_id, response, exception):
+        if exception is not None:
+            logging.warning(f"Failed to delete instance {request_id} for series {series_id}: {exception}")
+
+    for i in range(0, len(instance_ids), BATCH_SIZE):
+        chunk = instance_ids[i:i + BATCH_SIZE]
+        batch = service.new_batch_http_request(callback=_on_response)
+        for inst_id in chunk:
+            batch.add(service.events().delete(calendarId=calendar_id, eventId=inst_id), request_id=inst_id)
+        batch.execute()
+
+
 def _cancel_series(db_series: BookingSeries, db: Session, service) -> BookingSeries:
     """Cancel series saga — truncates RRULE to today, deletes future occurrence rows, soft-deletes series.
     Caller is responsible for all policy checks (is_active, etc.) before calling this."""
@@ -580,11 +579,7 @@ def _cancel_series(db_series: BookingSeries, db: Session, service) -> BookingSer
             timeMin=datetime.now(UTC).isoformat(),
         ).execute().get("items", [])
     ]
-    for inst_id, _, _ in future_instances:
-        try:
-            service.events().delete(calendarId=calendar_id, eventId=inst_id).execute()
-        except Exception as e:
-            logging.warning(f"Failed to delete instance {inst_id} for series {db_series.id}: {e}")
+    _batch_delete_instances(service, calendar_id, [inst_id for inst_id, _, _ in future_instances], db_series.id)
     try:
         service.events().patch(
             calendarId=calendar_id,
@@ -700,6 +695,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
     local_start = booking_in.start.astimezone(BUSINESS_TZ)
     local_end = booking_in.end.astimezone(BUSINESS_TZ)
     db_series.tutor_id = booking_in.tutor_id
+    db_series.start_date = local_start.date()
     db_series.start_day_of_week = local_start.weekday()
     db_series.end_day_of_week = local_end.weekday()
     db_series.start_time = local_start.time()

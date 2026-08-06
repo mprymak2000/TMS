@@ -69,7 +69,7 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
         unix timestamp = seconds since epoch (UTC). In JS: Math.floor(Date.now() / 1000)
 
     Tries a direct public_id lookup first — this alone covers standalone bookings and any
-    occurrence that's already a real row. Only falls back to composite parsing (and
+    occurrence that's already a materialized row. Only falls back to composite parsing (and
     materializing via _ensure_occurrence) when nothing matches, i.e. a genuinely virtual
     occurrence. Flushes but doesn't commit on materialization — caller owns the transaction.
     """
@@ -102,39 +102,55 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
-def _virtual_occurrences(series: BookingSeries, after: datetime, count: int, settings) -> list[BookingResponse]:
-    """Generates up to `count` virtual occurrences for a series starting from `after`, skipping
-    any date that already has a real Booking row. Stops early if recur_until is reached first.
-    Never touches the DB.
+def _virtual_occurrences(
+        series: BookingSeries,
+        time_min: datetime | None,
+        time_max: datetime | None,
+        count: int, 
+        settings
+    ) -> list[BookingResponse]:
+    """Generates up to `count` virtual occurrences for a series within [time_min, time_max],
+     skipping any date that already has a materialized Booking row (in db). Stops early if recur_until or
+     time_max is reached first. Never touches the DB.
 
-    Advances one week at a time — this app's recurrence is always weekly today. If a variable
-    interval (daily, every-N-weeks, monthly, etc.) is ever added to BookingSeries, this is the
-    one place that needs to change.
-    """
+     time_min/time_max mirror Google Calendar's timeMin/timeMax — both optional. Omitting time_min
+     means "since the series actually started" (series.start_date); omitting time_max means
+     unbounded — count (page * page_size from the caller) is what guarantees termination in that
+     case, same role pageToken/maxResults plays for Google.
+
+     Advances one week at a time — this app's recurrence is always weekly today. If a variable
+     interval is ever added to BookingSeries, this is the one place that needs to change.
+     """
     tz = ZoneInfo(settings.business_timezone)
-    existing_starts = {b.start for b in series.bookings}
+    existing_starts = {b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC) for b in series.bookings} # existing materialized occurrences part of series, to skip when generating virtual occurrences
 
-    # Never generate virtual occurrences before the series' actual earliest real row — same
-    # reasoning as _ensure_occurrence's lower-bound check. Without this, a series that starts
-    # in the future would show phantom virtual occurrences dated before it actually begins.
-    after_tz = after if after.tzinfo else after.replace(tzinfo=UTC)
-    if existing_starts:
-        earliest = min(s if s.tzinfo else s.replace(tzinfo=UTC) for s in existing_starts)
-        after_tz = max(after_tz, earliest)
+    # Need a FLOOR so no virtual occurrences are generated before the series actually started. 
+    floor_date = series.start_date
+    if time_min is not None:
+        time_min_tz = time_min if time_min.tzinfo else time_min.replace(tzinfo=UTC)
+        floor_date = max(floor_date, time_min_tz.astimezone(tz).date()) # first occ is in local timezone, convert from utc to local
 
-    # get datetime series occurrences in local time for DST safety, then advance weekly (should be same time every week)
-    cursor_date = after_tz.astimezone(tz).date()
-    days_until_next_occurrence = (series.start_day_of_week - cursor_date.weekday()) % 7
+    time_max_date = None
+    if time_max is not None:
+        time_max_tz = time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)
+        time_max_date = time_max_tz.astimezone(tz).date()
+
+    # point at the first occurrence in local time, then jump forward by one week (DST safe) and generate occurrence objects
+    cursor_date = floor_date
+    days_until_next_occurrence = (series.start_day_of_week - cursor_date.weekday()) % 7 # no-op if floor is the series first occurrence
     cursor_date += timedelta(days=days_until_next_occurrence) # next occurrence of the series
 
     occurrences = []
     while len(occurrences) < count:
-        # if series is finite, stop generating occurrences after recur_until
+        # if series is finite, stop generating occurrences after recur_until - can't have more occurrences
         if series.recur_until is not None and cursor_date > series.recur_until:
+            break
+        # if upper bound date is set, stop generating occurrences after time_max
+        if time_max_date is not None and cursor_date > time_max_date:
             break
         start_utc = datetime.combine(cursor_date, series.start_time, tzinfo=tz).astimezone(UTC) # next ocurrence local -> utc
 
-        # some occurrences may already exist if acted on by user or background job, don't touch those
+        # skip occurrences that were already materialized and acted on by user or background job
         if start_utc not in existing_starts:
             end_utc = _occurrence_end(series, cursor_date, tz)
             minutes_until = (start_utc - datetime.now(UTC)).total_seconds() / 60
@@ -169,27 +185,39 @@ def _virtual_occurrences(series: BookingSeries, after: datetime, count: int, set
     return occurrences
 
 
-def resolve_series_occurrences(
+def merge_occurrences(
     relevant_series: list[BookingSeries],
-    real_q,
-    now: datetime,
+    materialized_query,
+    time_min: datetime | None,
+    time_max: datetime | None,
     page: int,
     page_size: int,
     settings,
 ) -> list[BookingResponse]:
-    """Merge real + virtual upcoming occurrences across the given series, paginate to one page.
-    Shared by GET /bookings/my-bookings (many series, scoped by email/tutor_id) and
-    GET /bookings/booking-series/{id}/occurrences (exactly one series)."""
-    needed_total = page * page_size
-    real_bookings = real_q.filter(Booking.start >= now, Booking.status == "confirmed").all()
+    """Merge materialized (in db) + virtual occurrences across the given series within [time_min, time_max],
+     paginate to one page. Shared by GET /bookings/ and
+     GET /bookings/booking-series/{id}/occurrences.
 
+     time_min/time_max optional — omitting either
+     means unbounded on that side. page/page_size remains a 'local' termination mechanism for an
+     indefinite series when time_max is omitted and can be recalled indefinitely;
+     time_max, when given, is an 'absolute' stop.
+     """
+    materialized_bookings_query = materialized_query.filter(Booking.status == "confirmed")
+    if time_min is not None:
+        materialized_bookings_query = materialized_bookings_query.filter(Booking.start >= time_min)
+    if time_max is not None:
+        materialized_bookings_query = materialized_bookings_query.filter(Booking.start <= time_max)
+    materialized_bookings = materialized_bookings_query.all()
+    
+    needed_total = page * page_size
     virtual = []
     for series in relevant_series:
-        virtual.extend(_virtual_occurrences(series, now, needed_total, settings))
+        virtual.extend(_virtual_occurrences(series, time_min, time_max, needed_total, settings))
 
     def _sort_key(b):
         return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
 
-    merged = sorted([*real_bookings, *virtual], key=_sort_key)
+    merged = sorted([*materialized_bookings, *virtual], key=_sort_key)
     start = (page - 1) * page_size
     return [BookingResponse.model_validate(b) for b in merged[start:start + page_size]]

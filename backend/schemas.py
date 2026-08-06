@@ -490,11 +490,6 @@ class BookingSeriesResponse(BaseModel):
     bookings: list[BookingResponse]
 
 
-class MyBookingsResponse(BaseModel):
-    items: list[BookingResponse]
-    request: BookingRequestResponse | None = None
-
-
 def _convert_to_utc(dt: datetime, tz_str: str) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=ZoneInfo(tz_str)).astimezone(timezone.utc)
