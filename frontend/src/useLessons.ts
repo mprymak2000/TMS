@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { Lesson, Student, Tutor, LessonEdit } from './types'
-import dayjs from 'dayjs'
+import { startOfWeek, toLocalDateStr, parseLocalDateStr } from './utils'
 
 export interface LessonEditErrors {
   date?: string
@@ -99,11 +99,7 @@ export function useLessons() {
   }, {} as Record<string, Lesson[]>)
   const months = Object.keys(byMonth).sort().reverse()
 
-  const getWeekStart = (dateStr: string): string => {
-    const date = dayjs(dateStr)
-    const dayDiff = date.day() === 0 ? 6 : date.day()-1 // convert Sunday=0 to 6, Mon=1 to 0, Tue=2 to 1, etc.
-    return date.subtract(dayDiff, 'day').format('YYYY-MM-DD')
-  }
+  const getWeekStart = (dateStr: string): string => toLocalDateStr(startOfWeek(parseLocalDateStr(dateStr)))
 
   const byWeek = ungrouped.reduce((acc, lesson) => {
     const key = getWeekStart(lesson.date)

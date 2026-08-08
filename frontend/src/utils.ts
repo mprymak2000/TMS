@@ -33,3 +33,22 @@ export const tutorBubbleClass = (t: { id: number }) =>
 
 export const tutorInitials = (t: { first_name: string; last_name: string }) =>
     `${t.first_name[0]}${t.last_name[0]}`.toUpperCase()
+
+// Date-math primitives shared by BookingPage.tsx (slot-picker calendar), useLessons.ts
+// (week/month grouping), and Bookings.tsx (Day/Week/Month timeline nav).
+export const addDays = (d: Date, n: number) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n)
+export const startOfWeek = (d: Date) => { const day = d.getDay() || 7; return addDays(d, 1 - day) } // Monday-start
+export const startOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1)
+export const endOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth() + 1, 0)
+export const toLocalDateStr = (d: Date) => d.toLocaleDateString('en-CA') // YYYY-MM-DD
+
+// Inverse of toLocalDateStr. Deliberately not `new Date(s)` — a date-only ISO string parses as
+// UTC midnight per spec, which shifts to the previous local day west of UTC.
+export const parseLocalDateStr = (s: string): Date => {
+    const [y, m, d] = s.split('-').map(Number)
+    return new Date(y, m - 1, d)
+}
+
+// start_day_of_week convention used by BookingSeries: 0 = Monday .. 6 = Sunday.
+export const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+export const DAY_LABELS = DAY_NAMES.map(d => d.slice(0, 3))

@@ -1,12 +1,11 @@
 import { useState, useRef } from 'react'
 import { Button, Loader, Menu } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconRepeat } from '@tabler/icons-react'
+import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingSeries, Tutor, EventType } from './types'
 import { extractError, formatDate, formatUTCTime } from './utils'
 import BookingRow from './BookingRow'
 
-const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 const PAGE_SIZE = 10
 
 interface SeriesRowProps {
@@ -62,32 +61,26 @@ const SeriesRow = ({ series, tutor, eventType, onRefresh, onError, onCancelSerie
         if (next && !loaded) loadOccurrences(1, false)
     }
 
-    const dayName = DAY_NAMES[series.start_day_of_week]
-    const timeStr = formatUTCTime(series.start_time)
+    const timeStr = `${formatUTCTime(series.start_time)} – ${formatUTCTime(series.end_time)}`
 
     return (
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 border-l-4 border-l-indigo-400 overflow-hidden mt-4 first:mt-0">
+        <div>
             <div
-                className="flex items-center px-5 py-4 gap-4 cursor-pointer hover:bg-gray-50 transition-colors"
+                className="group flex items-center px-5 py-1.5 cursor-pointer hover:bg-gray-50 transition-colors"
                 onClick={toggleExpand}
             >
-                <div className="w-8 h-8 rounded-lg bg-indigo-50 flex items-center justify-center shrink-0">
-                    <IconRepeat size={16} className="text-indigo-500" />
-                </div>
-                <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-0.5">
-                        <span className="font-medium text-gray-800 truncate">
-                            {tutor.first_name} {tutor.last_name} · {series.student_first} {series.student_last}
-                        </span>
-                        <span className="shrink-0 text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-medium">
-                            {eventType.name}
-                        </span>
-                    </div>
-                    <p className="text-xs text-gray-400">
-                        {dayName}s · {timeStr}{series.recur_until ? ` · until ${formatDate(series.recur_until)}` : ''}
-                    </p>
-                </div>
-                <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
+                <div className="w-2 h-2 rounded-full shrink-0 bg-indigo-400" />
+                <span className="w-40 shrink-0 ml-3 text-sm text-indigo-600 tabular-nums">
+                    {timeStr}
+                </span>
+                <span className="w-56 shrink-0 truncate ml-5 text-sm text-gray-800">
+                    {tutor.first_name} {tutor.last_name} · {series.student_first} {series.student_last}
+                </span>
+                <span className="w-40 shrink-0 truncate ml-5 text-xs text-gray-400">
+                    {eventType.name}{series.recur_until ? ` · until ${formatDate(series.recur_until)}` : ''}
+                </span>
+                <div className="flex-1" />
+                <div className={`flex items-center gap-0.5 shrink-0 ml-3 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} onClick={e => e.stopPropagation()}>
                     {isCustomer ? (
                         <button
                             onClick={() => navigate(`/manage-series/${series.id}`)}
@@ -156,6 +149,7 @@ const SeriesRow = ({ series, tutor, eventType, onRefresh, onError, onCancelSerie
                                     onError={onError}
                                     isCustomer={isCustomer}
                                     compact={true}
+                                    showDate={true}
                                 />
                             ))}
                             {occurrences.length === 0 && (

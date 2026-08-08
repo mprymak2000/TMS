@@ -3,7 +3,7 @@ import outlookIcon from './assets/outlook-icon.svg'
 import { TextInput, Select, Button } from '@mantine/core'
 import type { Tutor, EventType, EventTypeAvailability, AvailableSlot } from './types'
 import { useLocation, useParams } from 'react-router'
-import { extractError, formatUTCTime } from './utils'
+import { extractError, formatUTCTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
 
 /*
   BookingPage — Custom duration
@@ -79,11 +79,6 @@ const buildIcsBlobUrl = (start: string, end: string, title: string, description:
 const WEEK_DAYS = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
 const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
 
-const addDays = (d: Date, n: number) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n)
-const startOfWeek = (d: Date) => { const day = d.getDay() || 7; return addDays(d, 1 - day) }
-const startOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1)
-const endOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth() + 1, 0)
-const toLocalDateStr = (d: Date) => d.toLocaleDateString('en-CA')
 const localDateOf = (utcIso: string, tz: string) =>
     new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date(utcIso))
 const localTimeOf = (utcIso: string, tz: string) =>
@@ -498,7 +493,7 @@ const BookingPage = () => {
                                     </p>
                                     {rescheduleSeriesId && originalDayOfWeek !== null && originalStartTime ? (
                                         <p className="text-sm text-gray-500 line-through">
-                                            {['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][originalDayOfWeek]}s at {formatUTCTime(originalStartTime)}
+                                            {DAY_NAMES[originalDayOfWeek]}s at {formatUTCTime(originalStartTime)}
                                         </p>
                                     ) : originalStart && (
                                         <>
@@ -602,7 +597,7 @@ const BookingPage = () => {
                                     <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-2">From</p>
                                     {rescheduleSeriesId && originalDayOfWeek !== null && originalStartTime ? (
                                         <p className="text-sm text-gray-400 line-through">
-                                            {['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][originalDayOfWeek]}s at {formatUTCTime(originalStartTime)}
+                                            {DAY_NAMES[originalDayOfWeek]}s at {formatUTCTime(originalStartTime)}
                                         </p>
                                     ) : originalStart && (
                                         <>

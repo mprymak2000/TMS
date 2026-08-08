@@ -4,10 +4,8 @@ import { IconPlus, IconPencil, IconTrash } from '@tabler/icons-react'
 import type { Tutor, Schedule } from './types'
 import ScheduleForm from './ScheduleForm'
 import { useToast } from './useToast'
-import { extractError } from './utils'
+import { extractError, DAY_LABELS } from './utils'
 import Toast from './Toast'
-
-const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 const Availability = () => {
   const [tutors, setTutors] = useState<Tutor[]>([])

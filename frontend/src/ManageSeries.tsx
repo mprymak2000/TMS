@@ -1,9 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import type { BookingSeries, EventType } from './types'
-import { formatDate, formatUTCTime, extractError } from './utils'
-
-const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+import { formatDate, formatUTCTime, extractError, DAY_NAMES } from './utils'
 
 interface LoadErrors {
     series?: string

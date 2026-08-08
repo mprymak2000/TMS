@@ -106,7 +106,7 @@ def _virtual_occurrences(
         series: BookingSeries,
         time_min: datetime | None,
         time_max: datetime | None,
-        count: int, 
+        count: int | None,
         settings
     ) -> list[BookingResponse]:
     """Generates up to `count` virtual occurrences for a series within [time_min, time_max],
@@ -116,7 +116,9 @@ def _virtual_occurrences(
      time_min/time_max mirror Google Calendar's timeMin/timeMax — both optional. Omitting time_min
      means "since the series actually started" (series.start_date); omitting time_max means
      unbounded — count (page * page_size from the caller) is what guarantees termination in that
-     case, same role pageToken/maxResults plays for Google.
+     case, same role pageToken/maxResults plays for Google. count=None means no cap at all — only
+     safe when time_max is set (a real range guarantees termination on its own); the caller
+     (merge_occurrences) only does this when both time_min and time_max are present.
 
      Advances one week at a time — this app's recurrence is always weekly today. If a variable
      interval is ever added to BookingSeries, this is the one place that needs to change.
@@ -141,7 +143,7 @@ def _virtual_occurrences(
     cursor_date += timedelta(days=days_until_next_occurrence) # next occurrence of the series
 
     occurrences = []
-    while len(occurrences) < count:
+    while count is None or len(occurrences) < count:
         # if series is finite, stop generating occurrences after recur_until - can't have more occurrences
         if series.recur_until is not None and cursor_date > series.recur_until:
             break
@@ -193,24 +195,53 @@ def merge_occurrences(
     page: int,
     page_size: int,
     settings,
-) -> list[BookingResponse]:
+    include_cancelled: bool = False,
+    order: str = "asc",
+) -> tuple[list[BookingResponse], int | None]:
     """Merge materialized (in db) + virtual occurrences across the given series within [time_min, time_max],
      paginate to one page. Shared by GET /bookings/ and
-     GET /bookings/booking-series/{id}/occurrences.
+     GET /bookings/booking-series/{id}/occurrences. Returns (page_items, total) — total is only
+     meaningful (non-None) for a bounded range; the caller surfaces it as an X-Total-Count header.
 
      time_min/time_max optional — omitting either
      means unbounded on that side. page/page_size remains a 'local' termination mechanism for an
      indefinite series when time_max is omitted and can be recalled indefinitely;
      time_max, when given, is an 'absolute' stop.
+
+     include_cancelled is an independent filter, not tied to time direction — mirrors Google
+     Calendar's showDeleted (default False, excludes cancelled/rescheduled-away rows; True shows
+     everything). Virtual occurrences are always "confirmed" by construction, so this only
+     affects the materialized-row query.
+
+     order='desc' fetches the most-recent-first page instead of the oldest-first page — without
+     this, an unbounded-below query (e.g. time_max=now, no time_min) would always paginate
+     starting from the very earliest matching row, not the most recent one; reversing the already
+     -fetched page client-side can't fix that, since it doesn't change which rows got fetched.
+     _virtual_occurrences stays forward-only regardless (unaffected by order) — descending queries
+     are only ever used for genuinely-past ranges, which are always already materialized by the
+     time they're in the past, so there's nothing virtual to walk backward through.
+
+     Whenever time_max is given, the range is bounded — cheap to walk to completion (time_max
+     alone guarantees _virtual_occurrences terminates, no count cap needed: the walk's floor is
+     always a real anchor either way, series.start_date if time_min is omitted, so omitting
+     time_min doesn't threaten termination or cost, only widens the floor), so the true total is
+     computed before slicing. page/page_size still apply normally — this isn't "return
+     everything," it's "we can tell you how many pages there are." Only a missing time_max is
+     genuinely unbounded (an indefinite series has no natural "last occurrence ever"), which is
+     the one case that still needs the page-cap/Load-More fallback instead of a real total.
      """
-    materialized_bookings_query = materialized_query.filter(Booking.status == "confirmed")
+    bounded = time_max is not None
+
+    materialized_bookings_query = materialized_query
+    if not include_cancelled:
+        materialized_bookings_query = materialized_bookings_query.filter(Booking.status == "confirmed")
     if time_min is not None:
         materialized_bookings_query = materialized_bookings_query.filter(Booking.start >= time_min)
     if time_max is not None:
         materialized_bookings_query = materialized_bookings_query.filter(Booking.start <= time_max)
     materialized_bookings = materialized_bookings_query.all()
-    
-    needed_total = page * page_size
+
+    needed_total = None if bounded else page * page_size
     virtual = []
     for series in relevant_series:
         virtual.extend(_virtual_occurrences(series, time_min, time_max, needed_total, settings))
@@ -218,6 +249,8 @@ def merge_occurrences(
     def _sort_key(b):
         return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
 
-    merged = sorted([*materialized_bookings, *virtual], key=_sort_key)
+    merged = sorted([*materialized_bookings, *virtual], key=_sort_key, reverse=(order == "desc"))
+    total = len(merged) if bounded else None
     start = (page - 1) * page_size
-    return [BookingResponse.model_validate(b) for b in merged[start:start + page_size]]
+    items = [BookingResponse.model_validate(b) for b in merged[start:start + page_size]]
+    return items, total

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Select, Button, TextInput, Switch } from '@mantine/core'
 import { IconTrash, IconX } from '@tabler/icons-react'
 import type { Tutor, Schedule } from './types'
-import { extractError } from './utils'
+import { extractError, DAY_LABELS } from './utils'
 
 const TIME_OPTIONS = [
   ...Array.from({ length: 96 }, (_, i) => {
@@ -12,8 +12,6 @@ const TIME_OPTIONS = [
   }),
   '23:59',
 ]
-
-const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
 
 const DEFAULT_DAYS = DAY_LABELS.map((label, i) => ({
   label,

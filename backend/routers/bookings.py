@@ -62,39 +62,63 @@ def get_booking_series(
 @router.get("/booking-series/{id}/occurrences", response_model=list[BookingResponse])
 def get_booking_series_occurrences(
     id: str,
+    response: Response,
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
+    include_cancelled: bool = Query(default=False),
+    order: str = Query(default="asc"),
     page: int = Query(default=1, ge=1),
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
     """Returns a paginated list of all occurrences (materialized + virtual) for a given series."""
-    
+    if order not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
+
     series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not series:
         raise HTTPException(status_code=404, detail="Booking series not found")
 
     materialized_query = db.query(Booking).filter(Booking.series_id == series.id) # materialized occurrences only part of a series
-    return merge_occurrences([series], materialized_query, time_min, time_max, page, PAGE_SIZE, settings)
+    items, total = merge_occurrences([series], materialized_query, time_min, time_max, page, PAGE_SIZE, settings, include_cancelled, order)
+    if total is not None:
+        response.headers["X-Total-Count"] = str(total)
+    return items
 
 @router.get("/", response_model=list[BookingResponse])
 def list_bookings(
+    response: Response,
     email: str | None = Query(default=None),
-    tutor_id: int | None = Query(default=None),
+    tutor_ids: list[int] = Query(default=[]),
+    event_type_ids: list[int] = Query(default=[]),
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
+    include_cancelled: bool = Query(default=False),
+    order: str = Query(default="asc"),
     pending_only: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=PAGE_SIZE, ge=1, le=500),
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
     """Returns a paginated, flat list of all bookings (materialized + virtual occurrences).
-    Optionally filtered to a student/parent email or a tutor_id. Optionally filtered to only pending requests.
+    Optionally filtered to a student/parent email, one or more tutor_ids, and/or one or more
+    event_type_ids. Optionally filtered to only pending requests.
     Virtual ocurrences (from series rules) are generated in memory and merged with real rows, then the combined list is paginated.
-    Min and max optional filters are used to scope the time window for ocurrences. The default floor is to start from the first occurrence, 
+    Min and max optional filters are used to scope the time window for ocurrences. The default floor is to start from the first occurrence,
     while max is dynamically calculated based on the number of pages requested (pagination).
-    
+
+    page_size defaults to PAGE_SIZE (10, real pagination — used by Range) but callers with a
+    naturally-bounded window (Day/Week/Month) can request a larger one — same idea as Google
+    Calendar's events.list maxResults (default/typical 250): a single practitioner's day/week/
+    month is never going to have hundreds of bookings, so there's no real "page 2" to speak of;
+    a generous cap is just a safety net, not a genuine pagination boundary. Capped at 500 to
+    bound worst-case cost on an unbounded (no time_max) query, where page_size directly controls
+    how deep _virtual_occurrences walks.
+
     Returned list represents a real timeline of all bookings."""
+    if order not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
     if pending_only:
         # a virtual occurrence can never have a pending BookingRequest (nothing to request
@@ -102,26 +126,35 @@ def list_bookings(
         query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
         if email:
             query = query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        if tutor_id:
-            query = query.filter(Booking.tutor_id == tutor_id)
-        return query.order_by(Booking.start.desc()).offset((page - 1) * PAGE_SIZE).limit(PAGE_SIZE).all()
+        if tutor_ids:
+            query = query.filter(Booking.tutor_id.in_(tutor_ids))
+        if event_type_ids:
+            query = query.filter(Booking.event_type_id.in_(event_type_ids))
+        return query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
     # Get booking rows that already exist in db (materialized occurrences). Filter if needed.
     materialized_query = db.query(Booking)
     if email:
         materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-    if tutor_id:
-        materialized_query = materialized_query.filter(Booking.tutor_id == tutor_id)
+    if tutor_ids:
+        materialized_query = materialized_query.filter(Booking.tutor_id.in_(tutor_ids))
+    if event_type_ids:
+        materialized_query = materialized_query.filter(Booking.event_type_id.in_(event_type_ids))
 
     # Get series rows in db (BookingSeries - rules). Filter if needed.
     series_query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
     if email:
         series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
-    if tutor_id:
-        series_query = series_query.filter(BookingSeries.tutor_id == tutor_id)
+    if tutor_ids:
+        series_query = series_query.filter(BookingSeries.tutor_id.in_(tutor_ids))
+    if event_type_ids:
+        series_query = series_query.filter(BookingSeries.event_type_id.in_(event_type_ids))
 
     # Merge materialized + resolved virtual occurrences across all series, then paginate the combined list.
-    return merge_occurrences(series_query.all(), materialized_query, time_min, time_max, page, PAGE_SIZE, settings)
+    items, total = merge_occurrences(series_query.all(), materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
+    if total is not None:
+        response.headers["X-Total-Count"] = str(total)
+    return items
 
 
 @router.get("/{ref}", response_model=BookingResponse)
@@ -426,21 +459,19 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
 @router.post("/{ref}/reschedule", response_model=BookingResponse)
 def reschedule_booking(ref: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
     db_booking = resolve_ref(ref, db, settings)
-    # Policy checks — admin path enforces strictly (no pending_request fallback)
-    # TODO: skip these checks when is_admin=True once auth is in place
+    # Admin path: only the booking's own state is enforced (must still be confirmed) — event-type
+    # policy (reschedule_mode) and the past-time notice-window floor are booker-facing rules and
+    # deliberately don't apply to admin, who needs to override both (e.g. waiving a no-show fee).
     if db_booking.status != "confirmed":
         raise HTTPException(status_code=400, detail="Only confirmed bookings can be rescheduled")
-    if db_booking.event_type.reschedule_mode == 'not_allowed':
-        raise HTTPException(status_code=400, detail="Rescheduling is not allowed for this event type")
     service = get_calendar_service(SCOPES)
     return _reschedule_booking(db_booking, booking_in, db, service)
 
 
 @router.put("/booking-series/{id}", response_model=BookingSeriesResponse)
 def update_booking_series(id: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    # TODO: no notice-window check here — if the next upcoming occurrence is within
-    # min_notice_reschedule_minutes, this still goes through. Consider whether to warn
-    # or block when the series change affects an imminent session (requires auth to skip for admin).
+    # Admin path: only the series' own state is enforced (must still be active) — no
+    # notice-window/policy check, same reasoning as the occurrence-level admin routes above.
     db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
@@ -748,9 +779,13 @@ def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, 
 """All series deletes are "hard" deletes that permanently remove all future bookings. Series is soft-deleted."""
 @router.delete("/booking-series/{id}", response_model=BookingSeriesResponse)
 def delete_booking_series(id: str, db: Session = Depends(get_db)):
+    # Admin path: only the series' own state is enforced (must still be active) — same
+    # reasoning as update_booking_series above. This check was previously missing entirely.
     db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
+    if not db_series.is_active:
+        raise HTTPException(status_code=400, detail="Booking series is not active")
     service = get_calendar_service(SCOPES)
     return _cancel_series(db_series, db, service)
 
@@ -822,12 +857,11 @@ def _cancel_booking(db_booking: Booking, db: Session, service) -> Booking:
 @router.delete("/{ref}", response_model=BookingResponse)
 def delete_booking(ref: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
     db_booking = resolve_ref(ref, db, settings)
-    # Policy checks — admin path enforces strictly (no pending_request fallback)
-    # TODO: skip these checks when is_admin=True once auth is in place
+    # Admin path: only the booking's own state is enforced (must still be confirmed) — event-type
+    # policy (cancel_mode) and the past-time notice-window floor are booker-facing rules and
+    # deliberately don't apply to admin, who needs to override both (e.g. waiving a no-show fee).
     if db_booking.status != "confirmed":
         raise HTTPException(status_code=400, detail="Only confirmed bookings can be cancelled")
-    if db_booking.event_type.cancel_mode == 'not_allowed':
-        raise HTTPException(status_code=400, detail="Cancellation is not allowed for this event type")
     service = get_calendar_service(SCOPES)
     return _cancel_booking(db_booking, db, service)
 

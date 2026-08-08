@@ -334,6 +334,22 @@ def test_pending_only_ignores_time_range_params(client):
     assert items[0]["request"]["type"] == "cancel_occurrence"
 
 
+def test_my_bookings_include_cancelled(client):
+    """include_cancelled is an independent filter, not tied to time direction — default excludes
+    cancelled rows (mirrors Google Calendar's showDeleted), opt-in shows everything."""
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.delete(f"/bookings/{created['id']}")
+
+    default_items = client.get(f"/bookings/?email={created['student_email']}").json()
+    assert created["id"] not in [i["id"] for i in default_items]
+
+    all_items = client.get(f"/bookings/?email={created['student_email']}&include_cancelled=true").json()
+    assert created["id"] in [i["id"] for i in all_items]
+
+
 # ── CANCEL (soft-delete) ──────────────────────────────────────────────────────
 
 def test_cancel_booking(client):
@@ -347,13 +363,16 @@ def test_cancel_booking(client):
     assert client.get(f"/bookings/{created['id']}").json()["status"] == "cancelled"
 
 
-def test_cancel_booking_blocked_not_allowed_policy(client):
+def test_admin_cancel_ignores_not_allowed_policy(client):
+    """Admin's DELETE /{ref} deliberately ignores event-type cancel_mode policy — only the
+    booking's own confirmed status is enforced. Policy (and the past-time floor) are booker-
+    facing rules that don't apply to admin, who needs to be able to override both."""
     tutor, availability = make_tutor_with_schedule(client)
     event_type = client.post("/event_types/", json={"name": "No Cancel ET", "duration_minutes": 60, "recurring": False, "cancel_mode": "not_allowed", "availability": availability}).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
-        assert client.delete(f"/bookings/{created['id']}").status_code == 400
+        assert client.delete(f"/bookings/{created['id']}").status_code == 200
 
 
 def test_cancel_booking_not_found(client):
@@ -458,13 +477,15 @@ def test_reschedule_not_confirmed(client):
         assert client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 400
 
 
-def test_reschedule_not_allowed_policy(client):
+def test_admin_reschedule_ignores_not_allowed_policy(client):
+    """Admin's POST /{ref}/reschedule deliberately ignores event-type reschedule_mode policy —
+    same reasoning as test_admin_cancel_ignores_not_allowed_policy above."""
     tutor, availability = make_tutor_with_schedule(client)
     event_type = client.post("/event_types/", json={"name": "No Reschedule ET", "duration_minutes": 60, "recurring": False, "reschedule_mode": "not_allowed", "availability": availability}).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         original = client.post("/bookings/", json=payload).json()
-        assert client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 400
+        assert client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 200
 
 
 # ── SERIES CANCEL ─────────────────────────────────────────────────────────────
@@ -504,6 +525,18 @@ def test_cancel_series_batches_instance_deletes(client):
 
 def test_cancel_series_not_found(client):
     assert client.delete("/bookings/booking-series/9999").status_code == 404
+
+
+def test_cancel_already_cancelled_series(client):
+    """Previously missing entirely — DELETE /booking-series/{id} didn't check is_active at all,
+    so cancelling an already-cancelled series would silently re-run the whole cancel saga."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first = client.post("/bookings/", json=payload).json()
+        series_id = first["series_id"]
+        assert client.delete(f"/bookings/booking-series/{series_id}").status_code == 200
+        assert client.delete(f"/bookings/booking-series/{series_id}").status_code == 400
 
 
 # ── MANAGE OCCURRENCE ─────────────────────────────────────────────────────────
@@ -640,7 +673,7 @@ def test_my_bookings_no_email_shows_everyone(client):
     assert any(":" in i["id"] for i in items)  # includes virtual occurrences, not just real rows
 
 
-def test_my_bookings_tutor_id_filters_scope(client):
+def test_my_bookings_tutor_ids_filters_scope(client):
     tutor_a, availability_a = make_tutor_with_schedule(client)
     tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
     schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
@@ -650,9 +683,31 @@ def test_my_bookings_tutor_id_filters_scope(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
-    items = client.get(f"/bookings/?tutor_id={tutor_a['id']}&time_min=2099-01-01T00:00:00").json()
+    items = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&time_min=2099-01-01T00:00:00").json()
     assert len(items) == 1
     assert items[0]["tutor_id"] == tutor_a["id"]
+
+    # multi-value: both tutors requested at once returns both bookings
+    items = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&tutor_ids={tutor_b['id']}&time_min=2099-01-01T00:00:00").json()
+    assert {i["tutor_id"] for i in items} == {tutor_a["id"], tutor_b["id"]}
+
+
+def test_my_bookings_event_type_ids_filters_scope(client):
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_standalone, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+    items = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&time_min=2099-01-01T00:00:00").json()
+    assert len(items) == 1
+    assert items[0]["event_type_id"] == event_type_a["id"]
+
+    items = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&event_type_ids={event_type_b['id']}&time_min=2099-01-01T00:00:00").json()
+    assert {i["event_type_id"] for i in items} == {event_type_a["id"], event_type_b["id"]}
 
 
 def test_my_bookings_past(client):
@@ -719,6 +774,79 @@ def test_my_bookings_time_max_stops_virtual_generation(client):
     assert items[-1]["start"].startswith("2099-06-24")
 
 
+def test_my_bookings_bounded_range_paginates_with_total_count(client):
+    """A bounded range (both time_min and time_max) still paginates normally via page/page_size —
+    it's not "return everything." What's different is the range is cheap to walk to completion
+    (time_max alone guarantees termination), so the true total is known and surfaced via
+    X-Total-Count, letting the frontend render real page navigation instead of incremental
+    Load More."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE (10)
+    base = f"/bookings/?email={created['student_email']}&time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59"
+    page1 = client.get(f"{base}&page=1")
+    assert page1.headers["x-total-count"] == "12"
+    items1 = page1.json()
+    assert len(items1) == 10
+    assert items1[0]["start"].startswith("2099-06-10")
+
+    page2 = client.get(f"{base}&page=2")
+    assert page2.headers["x-total-count"] == "12"
+    items2 = page2.json()
+    assert len(items2) == 2
+    assert items2[-1]["start"].startswith("2099-08-26")
+
+
+def test_my_bookings_time_max_only_still_gets_total_count(client):
+    """time_max alone is enough to guarantee termination (the walk's floor is always a real
+    anchor — series.start_date when time_min is omitted), so a time_max-only query is just as
+    safely bounded as a fully-specified range and should get the same real total, not fall back
+    to the unbounded/Load-More path. Same 12-occurrence series as the fully-bounded test above,
+    with time_min dropped entirely (the series itself starts 2099-06-10, same effective floor)."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1")
+    assert response.headers["x-total-count"] == "12"
+    assert len(response.json()) == 10
+
+
+def test_my_bookings_custom_page_size_returns_all_in_one_page(client):
+    """A caller with a naturally-bounded window (Day/Week/Month) can ask for a bigger page_size
+    (mirrors Google Calendar's events.list maxResults) instead of real pagination — same
+    12-occurrence series, page_size=250 should return all 12 in a single page."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size=250")
+    assert response.headers["x-total-count"] == "12"
+    assert len(response.json()) == 12
+
+
+def test_my_bookings_page_size_rejects_out_of_range(client):
+    assert client.get("/bookings/?page_size=0").status_code == 422
+    assert client.get("/bookings/?page_size=501").status_code == 422
+
+
+def test_my_bookings_unbounded_has_no_total_count_header(client):
+    """Unbounded queries (plain Upcoming/Past) never compute a total — X-Total-Count is only
+    meaningful, and only present, for a genuinely bounded range."""
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+
+    response = client.get("/bookings/?time_min=2099-01-01T00:00:00")
+    assert "x-total-count" not in response.headers
+
+
 def test_my_bookings_time_min_narrows_real_rows(client):
     """time_min narrows real rows too, not just virtual generation — a genuinely new capability,
     since the floor used to be hardcoded to 'now'."""
@@ -733,6 +861,45 @@ def test_my_bookings_time_min_narrows_real_rows(client):
     ids = [i["id"] for i in items]
     assert early["id"] not in ids
     assert late["id"] in ids
+
+
+def test_my_bookings_order_desc_paginates_from_most_recent(client):
+    """order=desc must fetch the most-recent-first page, not just display-reverse whatever the
+    oldest-first page happened to be. Regression test for a real bug: an unbounded-below query
+    (time_max=now, no time_min) always paginated starting from the earliest matching row —
+    reversing an already-fetched page can't fix that, since it doesn't change which rows got
+    fetched in the first place. 15 past bookings, page_size=10, so the bug (fetching the 10
+    oldest instead of the 10 most recent) would actually be visible here."""
+    tutor, event_type = setup_standalone(client)
+    created_ids = []
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        for i in range(15):
+            payload = {
+                **booking_payload,
+                "tutor_id": tutor["id"],
+                "event_type_id": event_type["id"],
+                "start": f"2099-06-{10 + i:02d}T16:00:00",
+                "end": f"2099-06-{10 + i:02d}T17:00:00",
+            }
+            created_ids.append(client.post("/bookings/", json=payload).json()["id"])
+
+    db = TestingSessionLocal()
+    for i, booking_id in enumerate(created_ids):
+        booking = db.query(Booking).filter(Booking.public_id == booking_id).first()
+        booking.start = datetime(2020, 1, 1 + i, 16, 0, tzinfo=UTC)  # 2020-01-01 .. 2020-01-15
+        booking.end = datetime(2020, 1, 1 + i, 17, 0, tzinfo=UTC)
+    db.commit()
+    db.close()
+
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    items = client.get(f"/bookings/?time_max={now_iso}&order=desc&page=1").json()
+    assert len(items) == 10
+    assert items[0]["start"].startswith("2020-01-15")  # most recent of the 15, comes first
+    assert items[-1]["start"].startswith("2020-01-06")  # 10th most recent — not the oldest (01-01)
+
+
+def test_my_bookings_order_rejects_invalid_value(client):
+    assert client.get("/bookings/?order=sideways").status_code == 400
 
 
 def test_virtual_occurrences_anchored_to_start_date_not_earliest_booking(client):
@@ -1228,6 +1395,18 @@ def test_booking_series_occurrences_time_max_stops_virtual_generation(client):
     items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max=2099-06-24T23:59:59").json()
     assert len(items) == 3
     assert items[-1]["start"].startswith("2099-06-24")
+
+
+def test_booking_series_occurrences_bounded_range_sets_total_count_header(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE (10)
+    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59")
+    assert response.headers["x-total-count"] == "12"
+    assert len(response.json()) == 10
 
 
 def test_booking_series_occurrences_time_min_narrows(client):

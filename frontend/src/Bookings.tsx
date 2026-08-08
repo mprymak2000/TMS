@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
-import { TextInput, Loader, Input, Button, Modal, Popover, Menu, Switch } from '@mantine/core'
-import { IconSearch, IconCalendar, IconFilter, IconX, IconCheck, IconChevronDown } from '@tabler/icons-react'
+import type { ReactNode } from 'react'
+import { TextInput, Loader, Input, Button, Modal, Popover } from '@mantine/core'
+import { IconSearch, IconCalendar, IconX, IconChevronDown, IconChevronLeft, IconChevronRight, IconSortAscending, IconSortDescending, IconRepeat } from '@tabler/icons-react'
 import type { Tutor, EventType, Booking, BookingSeries } from './types'
-import { extractError, formatDate, formatTime, tutorBubbleClass } from './utils'
+import { extractError, formatDate, formatTime, tutorBubbleClass, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
 import { useToast } from './useToast'
 import BookingRow from './BookingRow'
 import SeriesRow from './SeriesRow'
@@ -14,7 +15,6 @@ interface BookingFilters {
     dateFrom: string | null
     dateTo: string | null
     searchQuery: string
-    pendingOnly: boolean
 }
 
 interface LoadErrors {
@@ -28,22 +28,53 @@ interface LoadErrors {
 // since it changes the whole interaction paradigm; TIME SCOPE is just a filter within a view,
 // so it's an inner toggle instead — Requests has no time scope at all (nothing to filter).
 type BookingsTab = 'timeline' | 'recurring' | 'requests'
-type TimeScope = 'upcoming' | 'past'
-type FetchResult = { ok: true; items: Booking[]; hasMore: boolean } | { ok: false; error: any }
+type TimeScope = 'day' | 'week' | 'month' | 'range'
+type FetchResult = { ok: true; items: Booking[]; hasMore: boolean; total: number | null } | { ok: false; error: any }
 
 const TABS = [
-    { key: 'timeline', label: 'Timeline' },
+    { key: 'timeline', label: 'Schedule' },
     { key: 'recurring', label: 'Recurring' },
     { key: 'requests', label: 'Requests' },
 ] as const
 
 const PAGE_SIZE = 10
+// Day/Week/Month are naturally bounded (a single practitioner's day/week/month is never going
+// to have hundreds of bookings), so there's no real "page 2" to paginate — same idea as Google
+// Calendar's events.list maxResults (default/typical 250): request a generous cap in one go and
+// just render the whole thing, no page-number UI. Range keeps real PAGE_SIZE-based pagination
+// since it can genuinely span a large, open-ended window.
+const WIDE_PAGE_SIZE = 250
 
-// Exact-day comparison key (ISO date, unambiguous across years) vs. the subtle
-// display label shown above the first booking of each new day — WhatsApp-style
+// Exact-day comparison key (local calendar date, not UTC — must match dateLabelOf's timezone
+// or two events on different local days can share a UTC-sliced date and get bundled together)
+// vs. the subtle display label shown above the first booking of each new day — WhatsApp-style
 // date pill, not a full grouped card.
-const dateKeyOf = (iso: string) => iso.slice(0, 10)
+const dateKeyOf = (iso: string) => {
+    const d = new Date(iso)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
 const dateLabelOf = (iso: string) => new Date(iso).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
+
+// Day/Week/Month bounds for the API call — always both ends, so always bounded (real
+// X-Total-Count + PageNav, never the unbounded Load-More fallback).
+const periodBounds = (scope: 'day' | 'week' | 'month', anchor: Date): { dateFrom: string; dateTo: string } => {
+    if (scope === 'day') { const s = toLocalDateStr(anchor); return { dateFrom: s, dateTo: s } }
+    if (scope === 'week') { const start = startOfWeek(anchor); return { dateFrom: toLocalDateStr(start), dateTo: toLocalDateStr(addDays(start, 6)) } }
+    return { dateFrom: toLocalDateStr(startOfMonth(anchor)), dateTo: toLocalDateStr(endOfMonth(anchor)) }
+}
+
+const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const MONTH_LONG = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+
+const periodLabel = (scope: 'day' | 'week' | 'month', anchor: Date): string => {
+    if (scope === 'day') return anchor.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })
+    if (scope === 'month') return `${MONTH_LONG[anchor.getMonth()]} ${anchor.getFullYear()}`
+    const start = startOfWeek(anchor)
+    const end = addDays(start, 6)
+    const startStr = `${MONTH_SHORT[start.getMonth()]} ${start.getDate()}`
+    const endStr = start.getMonth() === end.getMonth() ? `${end.getDate()}` : `${MONTH_SHORT[end.getMonth()]} ${end.getDate()}`
+    return `${startStr} – ${endStr}, ${end.getFullYear()}`
+}
 
 // Same-day only — a gap indicator is only meaningful within one day's flow;
 // crossing into a new day is already communicated by the date pill above.
@@ -58,19 +89,219 @@ const formatGap = (minutes: number): string => {
     return `${hours}h ${mins}m`
 }
 
-const fetchMyBookings = async (tab: 'timeline' | 'requests', timeScope: TimeScope, pageNum: number, boundary: string, emailFilter?: string): Promise<FetchResult> => {
+const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | undefined, timeMax: string | undefined, order: 'asc' | 'desc', pageNum: number, pageSize: number, tutorIds: string[], eventTypeIds: string[], emailFilter?: string): Promise<FetchResult> => {
     const base = `${import.meta.env.VITE_API_URL}/bookings/`
     const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
-    const query = tab === 'requests'
-        ? `pending_only=true`
-        : timeScope === 'upcoming' ? `time_min=${boundary}` : `time_max=${boundary}`
+    const pendingParam = tab === 'requests' ? `&pending_only=true` : ''
+    const timeMinParam = timeMin ? `&time_min=${timeMin}` : ''
+    const timeMaxParam = timeMax ? `&time_max=${timeMax}` : ''
+    const orderParam = `&order=${order}`
+    const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
+    const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
 
-    const res = await fetch(`${base}?${query}&page=${pageNum}${emailParam}`)
+    const res = await fetch(`${base}?page=${pageNum}&page_size=${pageSize}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${emailParam}`)
     if (!res.ok) { return { ok: false, error: await res.json() } }
     const items = (await res.json()) as Booking[]
-    // If the number of items returned is less than PAGE_SIZE, it means there are no more items to fetch.
-    // TODO: this behavior needs to be revisited and formalized but ok for now.
-    return { ok: true, items, hasMore: items.length === PAGE_SIZE }
+    // X-Total-Count is only present for a genuinely bounded range — real page-number navigation
+    // there instead of incremental Load More, since the true total is known.
+    const totalHeader = res.headers.get('x-total-count')
+    const total = totalHeader !== null ? Number(totalHeader) : null
+    const hasMore = total !== null ? false : items.length === pageSize
+    return { ok: true, items, hasMore, total }
+}
+
+const DateRangeInputs = ({
+    dateFrom,
+    dateTo,
+    onDateFromChange,
+    onDateToChange,
+}: {
+    dateFrom: string | null
+    dateTo: string | null
+    onDateFromChange: (value: string | null) => void
+    onDateToChange: (value: string | null) => void
+}) => (
+    <div className="flex gap-2 items-center">
+        <Input
+            type="date"
+            size="sm"
+            value={dateFrom ?? ''}
+            max={dateTo ?? undefined}
+            onChange={(e) => onDateFromChange(e.target.value || null)}
+            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
+        />
+        <span className="text-gray-400 text-sm shrink-0">to</span>
+        <Input
+            type="date"
+            size="sm"
+            value={dateTo ?? ''}
+            min={dateFrom ?? undefined}
+            onChange={(e) => onDateToChange(e.target.value || null)}
+            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
+        />
+    </div>
+)
+
+// Normal (ascending, dates going down the list) is the quiet default — no border. Inverted
+// (descending) is the deviation from default, so it gets a visible border + accent color to
+// signal "this is toggled on," same visual language as an active filter chip.
+const OrderToggle = ({ order, onToggle }: { order: 'asc' | 'desc'; onToggle: () => void }) => (
+    <button
+        onClick={onToggle}
+        title={order === 'asc' ? 'Oldest first — click for newest first' : 'Newest first — click for oldest first'}
+        className={`flex items-center justify-center w-9 h-9 rounded-lg border transition-colors shrink-0 ${
+            order === 'desc'
+                ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
+                : 'border-transparent bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200'
+        }`}
+    >
+        {order === 'asc' ? <IconSortAscending size={16} /> : <IconSortDescending size={16} />}
+    </button>
+)
+
+// Three-zone layout (classic centered-header trick — two equal-growing flex-1 sides pin their
+// content to the outer edges, leaving the middle genuinely centered regardless of how wide either
+// side's content is): left = the actual navigator (Today + prev/next), center = the current
+// period's label (or the date inputs, in Range mode), right = the granularity switcher itself.
+// Day/Week/Month are one kind of thing (granularity of the same live view) — grouped tightly as a
+// segmented control. Date Range is a different kind of thing (an arbitrary, manually-picked
+// window) — set apart with real spacing and its own bordered/pill styling.
+const ScopeSwitcher = ({
+    timeScope,
+    periodAnchor,
+    dateFrom,
+    dateTo,
+    onScopeChange,
+    onRangeToggle,
+    onPeriodShift,
+    onToday,
+    onDateFromChange,
+    onDateToChange,
+    leftContent,
+}: {
+    timeScope: TimeScope
+    periodAnchor: Date
+    dateFrom: string | null
+    dateTo: string | null
+    onScopeChange: (scope: TimeScope) => void
+    onRangeToggle: () => void
+    onPeriodShift: (direction: 1 | -1) => void
+    onToday: () => void
+    onDateFromChange: (value: string | null) => void
+    onDateToChange: (value: string | null) => void
+    leftContent?: ReactNode
+}) => {
+    // Slide direction is a pure presentational concern (which way the label animates in), not
+    // data — kept local rather than lifted to the parent.
+    const [slideDirection, setSlideDirection] = useState<1 | -1>(1)
+    const shift = (direction: 1 | -1) => { setSlideDirection(direction); onPeriodShift(direction) }
+
+    return (
+        <div className="flex items-center gap-3 flex-wrap">
+            <div className="flex-1 flex items-center gap-2 min-w-0">
+                {leftContent}
+            </div>
+
+            <div className="min-w-[220px] flex items-center justify-center gap-2">
+                {timeScope !== 'range' && (
+                    <>
+                        <button onClick={onToday} className="px-3 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors text-xs font-semibold shrink-0">
+                            Today
+                        </button>
+                        <button onClick={() => shift(-1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
+                            <IconChevronLeft size={15} />
+                        </button>
+                        <span
+                            key={`${timeScope}-${dateFrom}-${dateTo}`}
+                            className={`block text-sm font-semibold text-gray-800 whitespace-nowrap text-center ${
+                                slideDirection === 1 ? 'animate-[slide-in-right_0.18s_ease-out]' : 'animate-[slide-in-left_0.18s_ease-out]'
+                            }`}
+                        >
+                            {periodLabel(timeScope, periodAnchor)}
+                        </span>
+                        <button onClick={() => shift(1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
+                            <IconChevronRight size={15} />
+                        </button>
+                    </>
+                )}
+            </div>
+
+            <div className="flex-1 flex items-center justify-end gap-3 min-w-0">
+                {/* Day/Week/Month pills and the date inputs occupy the same slot — Date Range
+                    swaps one for the other rather than the two coexisting. */}
+                {timeScope === 'range' ? (
+                    <DateRangeInputs dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={onDateFromChange} onDateToChange={onDateToChange} />
+                ) : (
+                    <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 h-9 w-fit shrink-0">
+                        {(['day', 'week', 'month'] as const).map(scope => (
+                            <button
+                                key={scope}
+                                onClick={() => onScopeChange(scope)}
+                                className={`h-full px-3.5 rounded-md text-sm font-medium transition-colors ${
+                                    timeScope === scope ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                                }`}
+                            >
+                                {scope === 'day' ? 'Day' : scope === 'week' ? 'Week' : 'Month'}
+                            </button>
+                        ))}
+                    </div>
+                )}
+
+                <button
+                    onClick={onRangeToggle}
+                    className={`flex items-center gap-1.5 px-3.5 h-9 rounded-lg text-sm font-medium border transition-colors shrink-0 ${
+                        timeScope === 'range'
+                            ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
+                            : 'border-gray-200 text-gray-500 hover:text-gray-700 hover:border-gray-300'
+                    }`}
+                >
+                    <IconCalendar size={15} />
+                    Date Range
+                </button>
+            </div>
+        </div>
+    )
+}
+
+const PageNav = ({ page, total, pageSize, onJump }: { page: number; total: number; pageSize: number; onJump: (pageNum: number) => void }) => {
+    const totalPages = Math.ceil(total / pageSize)
+    return (
+        <div className="flex items-center justify-center gap-3 pt-2">
+            <Button variant="default" size="xs" disabled={page <= 1} onClick={() => onJump(page - 1)}>
+                Previous
+            </Button>
+            <span className="text-xs text-gray-500">Page {page} of {totalPages} · {total} total</span>
+            <Button variant="default" size="xs" disabled={page >= totalPages} onClick={() => onJump(page + 1)}>
+                Next
+            </Button>
+        </div>
+    )
+}
+
+// Infinite scroll — no button. Scrolling this sentinel into view triggers the next page; a
+// ref (not the `loading` prop itself) guards the observer callback so a burst of intersection
+// events during a fast scroll can't fire multiple concurrent loads before state catches up.
+const LoadMoreSentinel = ({ onVisible, loading }: { onVisible: () => void; loading: boolean }) => {
+    const ref = useRef<HTMLDivElement>(null)
+    const loadingRef = useRef(loading)
+    loadingRef.current = loading
+
+    useEffect(() => {
+        const el = ref.current
+        if (!el) return
+        const observer = new IntersectionObserver(
+            entries => { if (entries[0].isIntersecting && !loadingRef.current) onVisible() },
+            { rootMargin: '200px' } // start loading a bit before it's actually on screen
+        )
+        observer.observe(el)
+        return () => observer.disconnect()
+    }, [onVisible])
+
+    return (
+        <div ref={ref} className="flex justify-center py-4">
+            {loading && <Loader size="sm" />}
+        </div>
+    )
 }
 
 const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }) => (
@@ -82,50 +313,206 @@ const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }
     </span>
 )
 
-interface CheckDropdownOption {
+// Shared by Schedule, Recurring, and Requests' toolbars — self-guards, renders nothing when
+// there's nothing active, so callers don't need their own activeFilterCount check.
+const ActiveFilterChips = ({
+    tutorIds,
+    eventTypeIds,
+    tutors,
+    eventTypes,
+    onTutorRemove,
+    onEventTypeRemove,
+}: {
+    tutorIds: string[]
+    eventTypeIds: string[]
+    tutors: Tutor[]
+    eventTypes: EventType[]
+    onTutorRemove: (id: string) => void
+    onEventTypeRemove: (id: string) => void
+}) => {
+    if (tutorIds.length === 0 && eventTypeIds.length === 0) return null
+    return (
+        <div className="flex flex-wrap gap-2 mt-3">
+            {tutorIds.map(id => (
+                <FilterChip
+                    key={`tutor-${id}`}
+                    label={`Tutor: ${tutors.find(t => String(t.id) === id)?.first_name ?? ''}`}
+                    onRemove={() => onTutorRemove(id)}
+                />
+            ))}
+            {eventTypeIds.map(id => (
+                <FilterChip
+                    key={`event-${id}`}
+                    label={`Event: ${eventTypes.find(e => String(e.id) === id)?.name ?? ''}`}
+                    onRemove={() => onEventTypeRemove(id)}
+                />
+            ))}
+        </div>
+    )
+}
+
+interface FilterOption {
     value: string
     label: string
 }
 
-const CheckDropdown = ({
+// One expandable row inside the Filters menu — clicking it expands/collapses its own option
+// list in place (accordion), rather than opening a second popover.
+const FilterAccordionSection = ({
     label,
     options,
     selected,
-    onToggle,
+    expanded,
+    onToggleExpand,
+    onToggleOption,
 }: {
     label: string
-    options: CheckDropdownOption[]
+    options: FilterOption[]
     selected: string[]
-    onToggle: (value: string) => void
+    expanded: boolean
+    onToggleExpand: () => void
+    onToggleOption: (value: string) => void
 }) => (
-    <Menu closeOnItemClick={false} withinPortal={false} shadow="md" width={220} position="bottom-start">
-        <Menu.Target>
-            <Button
-                variant="default"
-                size="sm"
-                rightSection={<IconChevronDown size={14} />}
-                styles={{ root: { borderRadius: '8px', borderColor: '#e5e7eb' }, label: { fontWeight: 400 } }}
-            >
-                {label}{selected.length > 0 ? ` · ${selected.length}` : ''}
-            </Button>
-        </Menu.Target>
-        <Menu.Dropdown>
-            {options.length === 0 && <Menu.Item disabled>None available</Menu.Item>}
-            {options.map(opt => {
-                const checked = selected.includes(opt.value)
-                return (
-                    <Menu.Item
-                        key={opt.value}
-                        onClick={() => onToggle(opt.value)}
-                        leftSection={checked ? <IconCheck size={14} className="text-indigo-600" /> : <span style={{ display: 'inline-block', width: 14 }} />}
-                    >
-                        {opt.label}
-                    </Menu.Item>
-                )
-            })}
-        </Menu.Dropdown>
-    </Menu>
+    <div>
+        <button
+            onClick={onToggleExpand}
+            className="w-full flex items-center justify-between px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+        >
+            <span>{label}{selected.length > 0 ? ` · ${selected.length}` : ''}</span>
+            <IconChevronDown size={14} className={`text-gray-400 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+        </button>
+        {expanded && (
+            <div className="pb-1">
+                {options.length === 0 && <p className="px-3 py-1.5 text-xs text-gray-400">None available</p>}
+                {options.map(opt => {
+                    const checked = selected.includes(opt.value)
+                    return (
+                        <button
+                            key={opt.value}
+                            onClick={() => onToggleOption(opt.value)}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-gray-600 hover:bg-gray-50 transition-colors text-left"
+                        >
+                            <span className={`w-3 h-3 rounded-full border shrink-0 transition-colors ${checked ? 'bg-indigo-600 border-indigo-600' : 'border-gray-300'}`} />
+                            {opt.label}
+                        </button>
+                    )
+                })}
+            </div>
+        )}
+    </div>
 )
+
+// One context menu (Google-Calendar-"Schedule"-dropdown style): a single trigger, and Tutors /
+// Event types expand as accordion sections inside the same panel — never a second popover.
+const FiltersMenu = ({
+    tutorOptions,
+    tutorSelected,
+    onTutorToggle,
+    eventTypeOptions,
+    eventTypeSelected,
+    onEventTypeToggle,
+}: {
+    tutorOptions: FilterOption[]
+    tutorSelected: string[]
+    onTutorToggle: (value: string) => void
+    eventTypeOptions: FilterOption[]
+    eventTypeSelected: string[]
+    onEventTypeToggle: (value: string) => void
+}) => {
+    const [opened, setOpened] = useState(false)
+    const [expandedSection, setExpandedSection] = useState<'tutors' | 'eventTypes' | null>(null)
+    const activeCount = tutorSelected.length + eventTypeSelected.length
+
+    return (
+        <Popover
+            opened={opened}
+            onChange={(v) => { setOpened(v); if (!v) setExpandedSection(null) }}
+            position="bottom-start"
+            shadow="md"
+            width={240}
+        >
+            <Popover.Target>
+                <Button
+                    variant="default"
+                    size="sm"
+                    rightSection={<IconChevronDown size={14} />}
+                    onClick={() => setOpened(o => !o)}
+                    styles={{ root: { borderRadius: '8px', borderColor: '#e5e7eb' }, label: { fontWeight: 400 } }}
+                >
+                    Filters{activeCount > 0 ? ` · ${activeCount}` : ''}
+                </Button>
+            </Popover.Target>
+            <Popover.Dropdown styles={{ dropdown: { padding: 4 } }}>
+                <FilterAccordionSection
+                    label="Tutors"
+                    options={tutorOptions}
+                    selected={tutorSelected}
+                    expanded={expandedSection === 'tutors'}
+                    onToggleExpand={() => setExpandedSection(s => s === 'tutors' ? null : 'tutors')}
+                    onToggleOption={onTutorToggle}
+                />
+                <div className="border-t border-gray-100" />
+                <FilterAccordionSection
+                    label="Event types"
+                    options={eventTypeOptions}
+                    selected={eventTypeSelected}
+                    expanded={expandedSection === 'eventTypes'}
+                    onToggleExpand={() => setExpandedSection(s => s === 'eventTypes' ? null : 'eventTypes')}
+                    onToggleOption={onEventTypeToggle}
+                />
+            </Popover.Dropdown>
+        </Popover>
+    )
+}
+
+// Shared by admin and customer Recurring tab — Monday..Sunday section headers (only for days
+// with something to show), full-width SeriesRow cards underneath each, one connected card.
+// Mirrors Timeline's proven day-header-bar pattern instead of a cramped 7-column grid.
+const RecurringList = ({
+    seriesByDay,
+    tutors,
+    eventTypes,
+    isCustomer,
+    onRefresh,
+    onError,
+    onCancelSeries,
+    emptyState,
+}: {
+    seriesByDay: { day: number; name: string; series: BookingSeries[] }[]
+    tutors: Tutor[]
+    eventTypes: EventType[]
+    isCustomer: boolean
+    onRefresh: (msg: string) => void
+    onError: (msg: string) => void
+    onCancelSeries: (seriesId: string) => void
+    emptyState: ReactNode
+}) => {
+    if (seriesByDay.length === 0) return <>{emptyState}</>
+    return (
+        <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+            {seriesByDay.map(({ day, name, series }, i) => (
+                <div key={day}>
+                    <div className={`px-5 py-2 bg-gray-50/80 text-[11px] font-semibold text-gray-500 uppercase tracking-wide ${i > 0 ? 'border-t border-gray-100' : ''}`}>
+                        {name}
+                    </div>
+                    {series.map((s, j) => (
+                        <div key={s.id} className={j > 0 ? 'border-t border-gray-100' : ''}>
+                            <SeriesRow
+                                series={s}
+                                tutor={tutors.find(t => t.id === s.tutor_id)!}
+                                eventType={eventTypes.find(e => e.id === s.event_type_id)!}
+                                onRefresh={onRefresh}
+                                onError={onError}
+                                onCancelSeries={onCancelSeries}
+                                isCustomer={isCustomer}
+                            />
+                        </div>
+                    ))}
+                </div>
+            ))}
+        </div>
+    )
+}
 
 
 const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
@@ -133,9 +520,22 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [eventTypes, setEventTypes] = useState<EventType[]>([])
     const [activeTab, setActiveTab] = useState<BookingsTab>('timeline')
-    const [timeScope, setTimeScope] = useState<TimeScope>('upcoming')
-    const [filters, setFilters] = useState<BookingFilters>({ tutorIds: [], eventTypeIds: [], dateFrom: null, dateTo: null, searchQuery: '', pendingOnly: false })
-    const [filtersOpen, setFiltersOpen] = useState(false)
+    const [timeScope, setTimeScope] = useState<TimeScope>('week')
+    // Remembers which granularity was active before switching into Range mode, so clicking
+    // "Date Range" a second time (toggling off) restores exactly where the user was, not a
+    // fixed default.
+    const [lastGranularity, setLastGranularity] = useState<'day' | 'week' | 'month'>('week')
+    // Anchor date driving Day/Week/Month bounds — preserved across granularity switches (Day ->
+    // Month lands on the month containing the day you were on, not "today's" month), only reset
+    // to now by handleToday or on tab entry.
+    const [periodAnchor, setPeriodAnchor] = useState<Date>(() => new Date())
+    // Display order — a within-session browsing preference only, not persisted across reloads
+    // (a fresh page load always starts chronological/ascending, regardless of what was last set).
+    const [order, setOrder] = useState<'asc' | 'desc'>('asc')
+    const [filters, setFilters] = useState<BookingFilters>(() => ({
+        tutorIds: [], eventTypeIds: [], searchQuery: '',
+        ...periodBounds('week', new Date()),
+    }))
     const [expandedId, setExpandedId] = useState<string | null>(null)
     const [cancellingSeriesId, setCancellingSeriesId] = useState<string | null>(null)
     const [isCancelling, setIsCancelling] = useState(false)
@@ -151,9 +551,15 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [isLoadingMore, setIsLoadingMore] = useState(false)
     const [page, setPage] = useState(1)
     const [hasMore, setHasMore] = useState(false)
-    // frozen once per fresh (non-append) load, reused across "Load more" clicks so the
-    // time_min/time_max window doesn't drift between pages of the same browsing session
-    const boundaryRef = useRef<string>(new Date().toISOString())
+    // Non-null whenever Timeline is loaded (always bounded now) — drives real page-number
+    // navigation there; null only for the Requests tab, which uses incremental Load More instead.
+    const [total, setTotal] = useState<number | null>(null)
+    // Whichever page_size was actually used for the current fetch (PAGE_SIZE or WIDE_PAGE_SIZE)
+    // — PageNav only needs to show when total exceeds this, not just because total is non-null.
+    // Day/Week/Month effectively never hit this in practice, but if a month ever did have more
+    // than WIDE_PAGE_SIZE occurrences, this is what keeps the overflow from being silently
+    // truncated instead of gracefully falling back to real pagination.
+    const [pageSizeUsed, setPageSizeUsed] = useState(PAGE_SIZE)
 
     // recurring tab — separate state, separate shape (BookingSeries, not Booking), unpaginated
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
@@ -172,14 +578,53 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         ].filter(Boolean).join(' ').toLowerCase()
     }
 
-    const loadData = async (options: { emailFilter?: string; tab?: 'timeline' | 'requests'; timeScope?: TimeScope; pageNum?: number; append?: boolean } = {}) => {
-        const { emailFilter, tab = (activeTab === 'requests' ? 'requests' : 'timeline'), timeScope: scope = timeScope, pageNum = 1, append = false } = options
-        if (!append) boundaryRef.current = new Date().toISOString()
+    const getSeriesSearchString = (s: BookingSeries) => {
+        const tutor = tutors.find(t => t.id === s.tutor_id)
+        const eventType = eventTypes.find(e => e.id === s.event_type_id)
+        return [
+            s.student_first, s.student_last,
+            tutor?.first_name, tutor?.last_name,
+            eventType?.name,
+        ].filter(Boolean).join(' ').toLowerCase()
+    }
+
+    const loadData = async ({
+        emailFilter,
+        tab = activeTab === 'requests' ? 'requests' : 'timeline',
+        scope = timeScope,
+        dateFrom = filters.dateFrom,
+        dateTo = filters.dateTo,
+        tutorIds = filters.tutorIds,
+        eventTypeIds = filters.eventTypeIds,
+        pageNum = 1,
+        append = false,
+    }: {
+        emailFilter?: string
+        tab?: 'timeline' | 'requests'
+        scope?: TimeScope
+        dateFrom?: string | null
+        dateTo?: string | null
+        tutorIds?: string[]
+        eventTypeIds?: string[]
+        pageNum?: number
+        append?: boolean
+    } = {}) => {
+        // Every Timeline scope (Day/Week/Month/Range) is bounded now — dateFrom/dateTo fully
+        // determine the window, no scope branching needed here anymore.
+        const timeMin = dateFrom ? `${dateFrom}T00:00:00` : undefined
+        const timeMax = dateTo ? `${dateTo}T23:59:59` : undefined
+        // Canonical fetch order for a bounded page — `order` (state) only controls the client-side
+        // display sort of the already-fetched page (see displayed's .sort()), same as it always did.
+        const fetchOrder = 'asc'
+        // Day/Week/Month: one big page, no real pagination (see WIDE_PAGE_SIZE). Range and
+        // Requests keep real PAGE_SIZE-based pagination — Range can genuinely be large, and
+        // Requests is unbounded (no time_max), so page_size there controls actual walk depth.
+        const pageSize = tab === 'requests' || scope === 'range' ? PAGE_SIZE : WIDE_PAGE_SIZE
         if (append) setIsLoadingMore(true)
         else setIsLoading(true)
         try {
             const [bookingsRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetchMyBookings(tab, scope, pageNum, boundaryRef.current, emailFilter),
+                fetchMyBookings(tab, timeMin, timeMax, fetchOrder, pageNum, pageSize, tutorIds, eventTypeIds, emailFilter),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/event_types`),
             ])
@@ -202,6 +647,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             setEventTypes(await eventTypesRes.json())
             setPage(pageNum)
             setHasMore(bookingsRes.hasMore)
+            setTotal(bookingsRes.total)
+            setPageSizeUsed(pageSize)
             setLoadErrors({})
         } catch (error) {
             console.error(error)
@@ -212,10 +659,15 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         }
     }
 
-    const loadSeries = async (emailFilter?: string) => {
+    const loadSeries = async (emailFilter?: string, tutorIds: string[] = filters.tutorIds, eventTypeIds: string[] = filters.eventTypeIds) => {
         setIsLoadingSeries(true)
         try {
-            const query = emailFilter ? `?email=${encodeURIComponent(emailFilter)}` : ''
+            const params = [
+                emailFilter ? `email=${encodeURIComponent(emailFilter)}` : null,
+                ...tutorIds.map(id => `tutor_ids=${id}`),
+                ...eventTypeIds.map(id => `event_type_ids=${id}`),
+            ].filter(Boolean)
+            const query = params.length ? `?${params.join('&')}` : ''
             const [seriesRes, tutorsRes, eventTypesRes] = await Promise.all([
                 fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series${query}`),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
@@ -265,12 +717,105 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         else loadData({ emailFilter: isCustomer ? email : undefined, tab })
     }
 
-    const handleTimeScopeChange = (scope: TimeScope) => {
+    const handleScopeChange = (scope: TimeScope) => {
         setTimeScope(scope)
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', timeScope: scope })
+        if (scope === 'range') {
+            // entering range mode — nothing to fetch until at least one date is picked
+            setFilters(f => ({ ...f, dateFrom: null, dateTo: null }))
+            setBookings([])
+            setHasMore(false)
+            setTotal(null)
+            return
+        }
+        setLastGranularity(scope)
+        // Reuses the current anchor (not "now") — switching Day -> Month while looking at a
+        // specific day lands on that day's month, not the current month.
+        const bounds = periodBounds(scope, periodAnchor)
+        setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
+        // scope passed explicitly — setTimeScope above hasn't taken effect in this closure yet
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', scope, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
-    const handleLoadMore = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', timeScope, pageNum: page + 1, append: true })
+    // Toggle: Date Range button switches into range mode; clicking it again while already in
+    // range mode restores whichever granularity (day/week/month) was active before.
+    const handleRangeToggle = () => handleScopeChange(timeScope === 'range' ? lastGranularity : 'range')
+
+    const handlePeriodShift = (direction: 1 | -1) => {
+        const scope = timeScope as 'day' | 'week' | 'month' // only invoked when timeScope !== 'range'
+        const nextAnchor = scope === 'day' ? addDays(periodAnchor, direction)
+            : scope === 'week' ? addDays(periodAnchor, direction * 7)
+            : new Date(periodAnchor.getFullYear(), periodAnchor.getMonth() + direction, 1)
+        setPeriodAnchor(nextAnchor)
+        const bounds = periodBounds(scope, nextAnchor)
+        setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+    }
+
+    const handleToday = () => {
+        const anchor = new Date()
+        const scope = timeScope as 'day' | 'week' | 'month'
+        setPeriodAnchor(anchor)
+        const bounds = periodBounds(scope, anchor)
+        setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+    }
+
+    const handleDateFromChange = (value: string | null) => {
+        // A dateFrom later than the current dateTo would make the range inverted/nonsensical —
+        // clear dateTo rather than silently allow it (the input's max attribute already blocks
+        // most such picks in the UI itself; this covers anything that slips through).
+        const dateTo = value && filters.dateTo && value > filters.dateTo ? null : filters.dateTo
+        setFilters(f => ({ ...f, dateFrom: value, dateTo }))
+        if (!value && !dateTo) {
+            // Both dates cleared — loadData would otherwise treat this as "no bound on either
+            // side" and fetch everything. Nothing should show until a date is picked again.
+            setBookings([])
+            setHasMore(false)
+            setTotal(null)
+            return
+        }
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: value, dateTo })
+    }
+
+    const handleDateToChange = (value: string | null) => {
+        // Ignore a dateTo earlier than the current dateFrom — same reasoning as above, just the
+        // other direction; the input's min attribute is the primary guard, this is the backstop.
+        if (value && filters.dateFrom && value < filters.dateFrom) return
+        setFilters(f => ({ ...f, dateTo: value }))
+        if (!filters.dateFrom && !value) {
+            // Both dates cleared — same reasoning as handleDateFromChange above.
+            setBookings([])
+            setHasMore(false)
+            setTotal(null)
+            return
+        }
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateTo: value })
+    }
+
+    // Pure display flip — displayed() re-sorts fully every render, so no refetch needed.
+    const handleOrderToggle = () => setOrder(o => o === 'asc' ? 'desc' : 'asc')
+
+    const handleLoadMore = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum: page + 1, append: true })
+
+    // Bounded range only (total is non-null) — jumps replace the page rather than appending,
+    // since each page is a distinct slice of an already-fully-known set, not an incremental extension.
+    const handlePageJump = (pageNum: number) => loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum, append: false })
+
+    // Server-side filters now (not client-side) — same reasoning as time range: filtering an
+    // already-paginated set client-side can silently hide real matches sitting on unfetched pages.
+    const handleTutorFilterToggle = (id: string) => {
+        const next = filters.tutorIds.includes(id) ? filters.tutorIds.filter(x => x !== id) : [...filters.tutorIds, id]
+        setFilters(f => ({ ...f, tutorIds: next }))
+        if (activeTab === 'recurring') { loadSeries(isCustomer ? email : undefined, next, filters.eventTypeIds); return }
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', tutorIds: next })
+    }
+
+    const handleEventTypeFilterToggle = (id: string) => {
+        const next = filters.eventTypeIds.includes(id) ? filters.eventTypeIds.filter(x => x !== id) : [...filters.eventTypeIds, id]
+        setFilters(f => ({ ...f, eventTypeIds: next }))
+        if (activeTab === 'recurring') { loadSeries(isCustomer ? email : undefined, filters.tutorIds, next); return }
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', eventTypeIds: next })
+    }
 
     const handleEmailSubmit = () => {
         if (!email.trim()) return
@@ -332,25 +877,31 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         }
     }
 
-    const activeFilterCount = [
-        filters.tutorIds.length > 0,
-        filters.eventTypeIds.length > 0,
-        filters.dateFrom !== null,
-        filters.dateTo !== null,
-        filters.pendingOnly,
-    ].filter(Boolean).length
-
+    // Tutor/event-type are already narrowed server-side (both Timeline and Requests send
+    // tutor_ids/event_type_ids) — search is the only genuinely client-side filter.
     const displayed = bookings
-        .filter(b => filters.tutorIds.length === 0 || filters.tutorIds.includes(String(b.tutor_id)))
-        .filter(b => filters.eventTypeIds.length === 0 || filters.eventTypeIds.includes(String(b.event_type_id)))
-        .filter(b => !filters.dateFrom || b.start.slice(0, 10) >= filters.dateFrom)
-        .filter(b => !filters.dateTo || b.start.slice(0, 10) <= filters.dateTo)
         .filter(b => getSearchString(b).includes(filters.searchQuery.trim().toLowerCase()))
-        .filter(b => !filters.pendingOnly || b.request?.status === 'pending')
-        // Past is reverse-chronological (most recent first) — matches the backend's own
-        // ORDER BY start DESC for that scope. Without this, appending an older "Load more"
-        // page and re-sorting ascending would put older items above newer ones, backwards.
-        .sort((a, b) => timeScope === 'past' ? b.start.localeCompare(a.start) : a.start.localeCompare(b.start))
+        // Requests' backend branch hardcodes order=desc regardless of what's sent, so this sort
+        // is load-bearing there (not just cosmetic re-display like it is for Timeline).
+        .sort((a, b) => order === 'desc' ? b.start.localeCompare(a.start) : a.start.localeCompare(b.start))
+
+    // Tutor/event-type narrowing happens server-side via loadSeries (see get_booking_series) —
+    // search is the only genuinely client-side filter, same convention as `displayed` above.
+    const displayedSeries = seriesList
+        .filter(s => getSeriesSearchString(s).includes(filters.searchQuery.trim().toLowerCase()))
+
+    // Grouped Monday(0)..Sunday(6), skipping days with nothing to show, sorted by start_time
+    // within each day — "HH:MM:SS" strings compare correctly lexicographically.
+    const seriesByDay = DAY_NAMES
+        .map((name, day) => ({
+            day,
+            name,
+            series: displayedSeries
+                .filter(s => s.start_day_of_week === day)
+                .sort((a, b) => order === 'desc' ? b.start_time.localeCompare(a.start_time) : a.start_time.localeCompare(b.start_time)),
+        }))
+        .filter(({ series }) => series.length > 0)
+    const orderedSeriesByDay = order === 'desc' ? [...seriesByDay].reverse() : seriesByDay
 
     if (isCustomer && !submitted) {
         return (
@@ -430,13 +981,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             <button
                                 key={tab.key}
                                 onClick={() => handleTabChange(tab.key)}
-                                className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                                className={`group flex items-center gap-1 px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
                                     activeTab === tab.key
                                         ? 'bg-white text-gray-800 shadow-sm'
                                         : 'text-gray-500 hover:text-gray-700'
                                 }`}
                             >
                                 {tab.label}
+                                {tab.key === 'recurring' && <IconRepeat size={13} className="transition-transform duration-500 group-hover:rotate-180" />}
                             </button>
                         ))}
                     </div>
@@ -445,100 +997,112 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         <>
                             {isLoadingSeries && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
                             {!isLoadingSeries && (
-                                <div className="flex flex-col">
-                                    {seriesList.map(series => (
-                                        <SeriesRow
-                                            key={series.id}
-                                            series={series}
-                                            tutor={tutors.find(t => t.id === series.tutor_id)!}
-                                            eventType={eventTypes.find(e => e.id === series.event_type_id)!}
-                                            onRefresh={msg => { refresh(); showToast(msg) }}
-                                            onError={msg => showToast(msg, 'error')}
-                                            onCancelSeries={() => {}}
-                                            isCustomer={true}
-                                        />
-                                    ))}
-                                    {seriesList.length === 0 && (
+                                <RecurringList
+                                    seriesByDay={orderedSeriesByDay}
+                                    tutors={tutors}
+                                    eventTypes={eventTypes}
+                                    isCustomer={true}
+                                    onRefresh={msg => { refresh(); showToast(msg) }}
+                                    onError={msg => showToast(msg, 'error')}
+                                    onCancelSeries={() => {}}
+                                    emptyState={
                                         <div className="text-center py-16">
                                             <div className="w-12 h-12 rounded-xl bg-gray-100 flex items-center justify-center mx-auto mb-4">
                                                 <IconCalendar size={22} className="text-gray-400" />
                                             </div>
                                             <p className="text-sm font-medium text-gray-500">No recurring series</p>
                                         </div>
-                                    )}
-                                </div>
+                                    }
+                                />
                             )}
                         </>
                     ) : (
                         <>
-                            {/* time-scope toggle — inner axis, only relevant to the timeline view */}
-                            <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit mb-4">
-                                {(['upcoming', 'past'] as const).map(scope => (
-                                    <button
-                                        key={scope}
-                                        onClick={() => handleTimeScopeChange(scope)}
-                                        className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
-                                            timeScope === scope
-                                                ? 'bg-white text-gray-800 shadow-sm'
-                                                : 'text-gray-500 hover:text-gray-700'
-                                        }`}
-                                    >
-                                        {scope === 'upcoming' ? 'Upcoming' : 'Past'}
-                                    </button>
-                                ))}
+                            {/* time-scope toggle — inner axis, only relevant to the timeline view.
+                                Order toggle lives in its left zone (no search/filters for customers). */}
+                            <div className="mb-4">
+                                <ScopeSwitcher
+                                    timeScope={timeScope}
+                                    periodAnchor={periodAnchor}
+                                    dateFrom={filters.dateFrom}
+                                    dateTo={filters.dateTo}
+                                    onScopeChange={handleScopeChange}
+                                    onRangeToggle={handleRangeToggle}
+                                    onPeriodShift={handlePeriodShift}
+                                    onToday={handleToday}
+                                    onDateFromChange={handleDateFromChange}
+                                    onDateToChange={handleDateToChange}
+                                    leftContent={<OrderToggle order={order} onToggle={handleOrderToggle} />}
+                                />
                             </div>
 
                             {isLoading && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
 
                             {!isLoading && (
-                                <div className="flex flex-col">
-                                    {displayed.map((b, i) => {
-                                        const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
-                                        const gapMinutes = !isNewDate ? (timeScope === 'past' ? gapMinutesBetween(b.end, displayed[i - 1].start) : gapMinutesBetween(displayed[i - 1].end, b.start)) : 0
-                                        const showGap = !isNewDate && gapMinutes > 30
-                                        return (
-                                            <div key={b.id} className={isNewDate ? 'mt-5 first:mt-0' : 'mt-1.5'}>
-                                                {isNewDate && (
-                                                    <div className="flex justify-center mb-2">
-                                                        <span className="text-[11px] text-gray-400 font-medium tracking-wide">{dateLabelOf(b.start)}</span>
+                                <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                                    {displayed.length > 0 ? (
+                                        <div>
+                                            {displayed.map((b, i) => {
+                                                const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
+                                                const gapMinutes = !isNewDate ? (order === 'desc' ? gapMinutesBetween(b.end, displayed[i - 1].start) : gapMinutesBetween(displayed[i - 1].end, b.start)) : 0
+                                                const showGap = !isNewDate && gapMinutes > 30
+                                                return (
+                                                    <div key={b.id}>
+                                                        {isNewDate ? (
+                                                            <div className={`px-5 py-2 bg-gray-50/80 text-[11px] font-semibold text-gray-500 uppercase tracking-wide ${i > 0 ? 'border-t border-gray-100' : ''}`}>
+                                                                {dateLabelOf(b.start)}
+                                                            </div>
+                                                        ) : showGap ? (
+                                                            // Zero layout height — the label is absolutely positioned over the
+                                                            // 1px line, so it steals space from the padding of the rows above/
+                                                            // below instead of adding any of its own. Same row spacing always.
+                                                            <div className="relative px-5">
+                                                                <div className="border-t border-gray-100" />
+                                                                <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-white px-2 text-[10px] text-gray-400 font-medium whitespace-nowrap">
+                                                                    {formatGap(gapMinutes)} break
+                                                                </span>
+                                                            </div>
+                                                        ) : (
+                                                            <div className="border-t border-gray-100" />
+                                                        )}
+                                                        <BookingRow
+                                                            booking={b}
+                                                            tutor={tutors.find(t => t.id === b.tutor_id)!}
+                                                            eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                                                            expanded={expandedId === b.id}
+                                                            onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
+                                                            onRefresh={msg => { refresh(); showToast(msg) }}
+                                                            onError={msg => showToast(msg, 'error')}
+                                                            isCustomer={true}
+                                                            compact={true}
+                                                        />
                                                     </div>
-                                                )}
-                                                {showGap && (
-                                                    <div className="flex justify-center my-1">
-                                                        <span className="text-[10px] text-gray-400 font-medium tracking-wide">···· {formatGap(gapMinutes)} gap ····</span>
-                                                    </div>
-                                                )}
-                                                <BookingRow
-                                                    booking={b}
-                                                    tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                                    eventType={eventTypes.find(e => e.id === b.event_type_id)!}
-                                                    expanded={expandedId === b.id}
-                                                    onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
-                                                    onRefresh={msg => { refresh(); showToast(msg) }}
-                                                    onError={msg => showToast(msg, 'error')}
-                                                    isCustomer={true}
-                                                />
-                                            </div>
-                                        )
-                                    })}
-
-                                    {displayed.length === 0 && (
+                                                )
+                                            })}
+                                        </div>
+                                    ) : (
                                         <div className="text-center py-16">
                                             <div className="w-12 h-12 rounded-xl bg-gray-100 flex items-center justify-center mx-auto mb-4">
                                                 <IconCalendar size={22} className="text-gray-400" />
                                             </div>
-                                            <p className="text-sm font-medium text-gray-500">No bookings found</p>
+                                            <p className="text-sm font-medium text-gray-500">
+                                                {timeScope === 'range' && !filters.dateFrom && !filters.dateTo ? 'Pick a date range' : 'No bookings found'}
+                                            </p>
                                             <p className="text-xs text-gray-400 mt-1">
-                                                {timeScope === 'upcoming' ? 'No upcoming sessions.' : 'No past sessions.'}
+                                                {timeScope === 'range'
+                                                    ? (!filters.dateFrom && !filters.dateTo ? 'Choose a start and end date above.' : 'No sessions in this range.')
+                                                    : `No sessions this ${timeScope}.`}
                                             </p>
                                         </div>
                                     )}
 
-                                    {hasMore && (
-                                        <div className="flex justify-center pt-2">
-                                            <Button variant="default" size="sm" loading={isLoadingMore} onClick={handleLoadMore}>
-                                                Load more
-                                            </Button>
+                                    {total !== null && total > pageSizeUsed ? (
+                                        <div className="border-t border-gray-100 px-5 py-3">
+                                            <PageNav page={page} total={total} pageSize={pageSizeUsed} onJump={handlePageJump} />
+                                        </div>
+                                    ) : total === null && hasMore && (
+                                        <div className="border-t border-gray-100">
+                                            <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
                                         </div>
                                     )}
                                 </div>
@@ -558,58 +1122,83 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             {loadErrors.tutors && <p className="text-sm text-red-500 mb-2">{loadErrors.tutors}</p>}
             {loadErrors.eventTypes && <p className="text-sm text-red-500 mb-4">{loadErrors.eventTypes}</p>}
 
-            {/* header */}
-            <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center gap-3">
-                    <h1 className="text-xl font-semibold text-gray-800">Bookings</h1>
-                    {!isLoading && !isLoadingSeries && (
-                        <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full font-medium">
-                            {activeTab === 'recurring' ? seriesList.length : displayed.length}
-                        </span>
-                    )}
-                </div>
-            </div>
-
             {/* tabs */}
             <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit mb-5">
                 {TABS.filter(t => !isCustomer || t.key !== 'requests').map(tab => (
                     <button
                         key={tab.key}
                         onClick={() => handleTabChange(tab.key)}
-                        className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                        className={`group flex items-center gap-1 px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
                             activeTab === tab.key
                                 ? 'bg-white text-gray-800 shadow-sm'
                                 : 'text-gray-500 hover:text-gray-700'
                         }`}
                     >
                         {tab.label}
+                        {tab.key === 'recurring' && <IconRepeat size={13} className="transition-transform duration-500 group-hover:rotate-180" />}
                     </button>
                 ))}
             </div>
 
-            {/* time-scope toggle — inner axis, only relevant to the timeline view */}
+            {/* time-scope toggle — inner axis, only relevant to the timeline view. Filters/search
+                live in its left zone, on the same line as the day/week/month/range navigator. */}
             {activeTab === 'timeline' && (
-                <div className="flex gap-1 bg-gray-100 rounded-lg p-1 w-fit mb-4">
-                    {(['upcoming', 'past'] as const).map(scope => (
-                        <button
-                            key={scope}
-                            onClick={() => handleTimeScopeChange(scope)}
-                            className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
-                                timeScope === scope
-                                    ? 'bg-white text-gray-800 shadow-sm'
-                                    : 'text-gray-500 hover:text-gray-700'
-                            }`}
-                        >
-                            {scope === 'upcoming' ? 'Upcoming' : 'Past'}
-                        </button>
-                    ))}
+                <div className="mb-5">
+                    <ScopeSwitcher
+                        timeScope={timeScope}
+                        periodAnchor={periodAnchor}
+                        dateFrom={filters.dateFrom}
+                        dateTo={filters.dateTo}
+                        onScopeChange={handleScopeChange}
+                        onRangeToggle={handleRangeToggle}
+                        onPeriodShift={handlePeriodShift}
+                        onToday={handleToday}
+                        onDateFromChange={handleDateFromChange}
+                        onDateToChange={handleDateToChange}
+                        leftContent={
+                            <>
+                                <TextInput
+                                    placeholder="Search..."
+                                    leftSection={<IconSearch size={14} />}
+                                    value={filters.searchQuery}
+                                    onChange={(e) => {
+                                        const value = e.target.value
+                                        setFilters(f => ({ ...f, searchQuery: value }))
+                                    }}
+                                    styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
+                                    size="sm"
+                                />
+                                <FiltersMenu
+                                    tutorOptions={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                                    tutorSelected={filters.tutorIds}
+                                    onTutorToggle={handleTutorFilterToggle}
+                                    eventTypeOptions={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
+                                    eventTypeSelected={filters.eventTypeIds}
+                                    onEventTypeToggle={handleEventTypeFilterToggle}
+                                />
+                                <div className="w-px h-6 bg-gray-200 mx-1" />
+                                <OrderToggle order={order} onToggle={handleOrderToggle} />
+                            </>
+                        }
+                    />
+
+                    <ActiveFilterChips
+                        tutorIds={filters.tutorIds}
+                        eventTypeIds={filters.eventTypeIds}
+                        tutors={tutors}
+                        eventTypes={eventTypes}
+                        onTutorRemove={handleTutorFilterToggle}
+                        onEventTypeRemove={handleEventTypeFilterToggle}
+                    />
                 </div>
             )}
 
-            {/* filters */}
-            {activeTab !== 'requests' && activeTab !== 'recurring' && !isCustomer && (
+            {/* Recurring/Requests toolbar — same Search + Filters + order toggle as Schedule,
+                just without ScopeSwitcher's day/week/month/range navigator (neither tab has a
+                time-period concept to navigate). */}
+            {(activeTab === 'recurring' || activeTab === 'requests') && !isCustomer && (
                 <div className="mb-5">
-                    <div className="flex flex-wrap gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                         <TextInput
                             placeholder="Search..."
                             leftSection={<IconSearch size={14} />}
@@ -621,102 +1210,26 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
                             size="sm"
                         />
-                        <Popover opened={filtersOpen} onChange={setFiltersOpen} position="bottom-start" shadow="md" width={300}>
-                            <Popover.Target>
-                                <Button
-                                    variant="default"
-                                    size="sm"
-                                    leftSection={<IconFilter size={14} />}
-                                    onClick={() => setFiltersOpen(o => !o)}
-                                    styles={{ root: { borderRadius: '8px', borderColor: '#e5e7eb' } }}
-                                >
-                                    Filters{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ''}
-                                </Button>
-                            </Popover.Target>
-                            <Popover.Dropdown>
-                                <div className="flex flex-col gap-3">
-                                    <CheckDropdown
-                                        label="Tutors"
-                                        options={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
-                                        selected={filters.tutorIds}
-                                        onToggle={id => setFilters(f => ({
-                                            ...f,
-                                            tutorIds: f.tutorIds.includes(id) ? f.tutorIds.filter(x => x !== id) : [...f.tutorIds, id],
-                                        }))}
-                                    />
-                                    <CheckDropdown
-                                        label="Event types"
-                                        options={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
-                                        selected={filters.eventTypeIds}
-                                        onToggle={id => setFilters(f => ({
-                                            ...f,
-                                            eventTypeIds: f.eventTypeIds.includes(id) ? f.eventTypeIds.filter(x => x !== id) : [...f.eventTypeIds, id],
-                                        }))}
-                                    />
-                                    <div className="flex gap-2 items-center">
-                                        <Input
-                                            type="date"
-                                            size="sm"
-                                            value={filters.dateFrom ?? ''}
-                                            onChange={(e) => {
-                                                const value = e.target.value || null
-                                                setFilters(f => ({ ...f, dateFrom: value }))
-                                            }}
-                                            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                                        />
-                                        <span className="text-gray-400 text-sm shrink-0">to</span>
-                                        <Input
-                                            type="date"
-                                            size="sm"
-                                            value={filters.dateTo ?? ''}
-                                            onChange={(e) => {
-                                                const value = e.target.value || null
-                                                setFilters(f => ({ ...f, dateTo: value }))
-                                            }}
-                                            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-                                        />
-                                    </div>
-                                    <Switch
-                                        label="Pending requests only"
-                                        checked={filters.pendingOnly}
-                                        onChange={(e) => {
-                                            const checked = e.currentTarget.checked
-                                            setFilters(f => ({ ...f, pendingOnly: checked }))
-                                        }}
-                                        size="sm"
-                                    />
-                                </div>
-                            </Popover.Dropdown>
-                        </Popover>
+                        <FiltersMenu
+                            tutorOptions={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                            tutorSelected={filters.tutorIds}
+                            onTutorToggle={handleTutorFilterToggle}
+                            eventTypeOptions={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
+                            eventTypeSelected={filters.eventTypeIds}
+                            onEventTypeToggle={handleEventTypeFilterToggle}
+                        />
+                        <div className="w-px h-6 bg-gray-200 mx-1" />
+                        <OrderToggle order={order} onToggle={handleOrderToggle} />
                     </div>
 
-                    {activeFilterCount > 0 && (
-                        <div className="flex flex-wrap gap-2 mt-3">
-                            {filters.tutorIds.map(id => (
-                                <FilterChip
-                                    key={`tutor-${id}`}
-                                    label={`Tutor: ${tutors.find(t => String(t.id) === id)?.first_name ?? ''}`}
-                                    onRemove={() => setFilters(f => ({ ...f, tutorIds: f.tutorIds.filter(x => x !== id) }))}
-                                />
-                            ))}
-                            {filters.eventTypeIds.map(id => (
-                                <FilterChip
-                                    key={`event-${id}`}
-                                    label={`Event: ${eventTypes.find(e => String(e.id) === id)?.name ?? ''}`}
-                                    onRemove={() => setFilters(f => ({ ...f, eventTypeIds: f.eventTypeIds.filter(x => x !== id) }))}
-                                />
-                            ))}
-                            {filters.dateFrom && (
-                                <FilterChip label={`From: ${filters.dateFrom}`} onRemove={() => setFilters(f => ({ ...f, dateFrom: null }))} />
-                            )}
-                            {filters.dateTo && (
-                                <FilterChip label={`To: ${filters.dateTo}`} onRemove={() => setFilters(f => ({ ...f, dateTo: null }))} />
-                            )}
-                            {filters.pendingOnly && (
-                                <FilterChip label="Pending only" onRemove={() => setFilters(f => ({ ...f, pendingOnly: false }))} />
-                            )}
-                        </div>
-                    )}
+                    <ActiveFilterChips
+                        tutorIds={filters.tutorIds}
+                        eventTypeIds={filters.eventTypeIds}
+                        tutors={tutors}
+                        eventTypes={eventTypes}
+                        onTutorRemove={handleTutorFilterToggle}
+                        onEventTypeRemove={handleEventTypeFilterToggle}
+                    />
                 </div>
             )}
 
@@ -726,7 +1239,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             {/* requests tab */}
             {!isLoading && activeTab === 'requests' && (
                 <div className="flex flex-col gap-3">
-                    {bookings.map(b => {
+                    {displayed.map(b => {
                         const req = b.request!
                         const tutor = tutors.find(t => t.id === b.tutor_id)
                         const eventType = eventTypes.find(e => e.id === b.event_type_id)
@@ -771,7 +1284,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             </div>
                         )
                     })}
-                    {bookings.length === 0 && (
+                    {displayed.length === 0 && (
                         <p className="text-sm text-gray-400 text-center py-12">No pending requests.</p>
                     )}
                 </div>
@@ -779,71 +1292,80 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
             {/* recurring tab */}
             {!isLoadingSeries && activeTab === 'recurring' && (
-                <div className="flex flex-col">
-                    {seriesList.map(series => (
-                        <SeriesRow
-                            key={series.id}
-                            series={series}
-                            tutor={tutors.find(t => t.id === series.tutor_id)!}
-                            eventType={eventTypes.find(e => e.id === series.event_type_id)!}
-                            onRefresh={msg => { refresh(); showToast(msg) }}
-                            onError={msg => showToast(msg, 'error')}
-                            onCancelSeries={setCancellingSeriesId}
-                            isCustomer={isCustomer}
-                        />
-                    ))}
-                    {seriesList.length === 0 && (
-                        <p className="text-sm text-gray-400 text-center py-12">No recurring series.</p>
-                    )}
-                </div>
+                <RecurringList
+                    seriesByDay={orderedSeriesByDay}
+                    tutors={tutors}
+                    eventTypes={eventTypes}
+                    isCustomer={isCustomer}
+                    onRefresh={msg => { refresh(); showToast(msg) }}
+                    onError={msg => showToast(msg, 'error')}
+                    onCancelSeries={setCancellingSeriesId}
+                    emptyState={<p className="text-sm text-gray-400 text-center py-12">No recurring series.</p>}
+                />
             )}
 
             {/* booking list */}
             {!isLoading && activeTab !== 'requests' && activeTab !== 'recurring' && (
-                <div className="flex flex-col">
-                    {displayed.map((b, i) => {
-                        const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
-                        const gapMinutes = !isNewDate ? (timeScope === 'past' ? gapMinutesBetween(b.end, displayed[i - 1].start) : gapMinutesBetween(displayed[i - 1].end, b.start)) : 0
-                        const showGap = !isNewDate && gapMinutes > 30
-                        return (
-                            <div key={b.id} className={isNewDate ? 'mt-5 first:mt-0' : 'mt-1.5'}>
-                                {isNewDate && (
-                                    <div className="flex justify-center mb-2">
-                                        <span className="text-[11px] text-gray-400 font-medium tracking-wide">{dateLabelOf(b.start)}</span>
+                <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                    {displayed.length > 0 ? (
+                        <div>
+                            {displayed.map((b, i) => {
+                                const isNewDate = i === 0 || dateKeyOf(displayed[i - 1].start) !== dateKeyOf(b.start)
+                                const gapMinutes = !isNewDate ? (order === 'desc' ? gapMinutesBetween(b.end, displayed[i - 1].start) : gapMinutesBetween(displayed[i - 1].end, b.start)) : 0
+                                const showGap = !isNewDate && gapMinutes > 30
+                                return (
+                                    <div key={b.id}>
+                                        {isNewDate ? (
+                                            <div className={`px-5 py-2 bg-gray-50/80 text-[11px] font-semibold text-gray-500 uppercase tracking-wide ${i > 0 ? 'border-t border-gray-100' : ''}`}>
+                                                {dateLabelOf(b.start)}
+                                            </div>
+                                        ) : showGap ? (
+                                            // Zero layout height — the label is absolutely positioned over the
+                                            // 1px line, so it steals space from the padding of the rows above/
+                                            // below instead of adding any of its own. Same row spacing always.
+                                            <div className="relative px-5">
+                                                <div className="border-t border-gray-100" />
+                                                <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-white px-2 text-[10px] text-gray-400 font-medium whitespace-nowrap">
+                                                    {formatGap(gapMinutes)} break
+                                                </span>
+                                            </div>
+                                        ) : (
+                                            <div className="border-t border-gray-100" />
+                                        )}
+                                        <BookingRow
+                                            booking={b}
+                                            tutor={tutors.find(t => t.id === b.tutor_id)!}
+                                            eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                                            expanded={expandedId === b.id}
+                                            onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
+                                            onRefresh={msg => { refresh(); showToast(msg) }}
+                                            onError={msg => showToast(msg, 'error')}
+                                            onReviewRequest={setProcessingRequest}
+                                            isCustomer={isCustomer}
+                                            compact={true}
+                                        />
                                     </div>
-                                )}
-                                {showGap && (
-                                    <div className="flex justify-center my-1">
-                                        <span className="text-[10px] text-gray-400 font-medium tracking-wide">···· {formatGap(gapMinutes)} gap ····</span>
-                                    </div>
-                                )}
-                                <BookingRow
-                                    booking={b}
-                                    tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                    eventType={eventTypes.find(e => e.id === b.event_type_id)!}
-                                    expanded={expandedId === b.id}
-                                    onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
-                                    onRefresh={msg => { refresh(); showToast(msg) }}
-                                    onError={msg => showToast(msg, 'error')}
-                                    onReviewRequest={setProcessingRequest}
-                                    isCustomer={isCustomer}
-                                />
-                            </div>
-                        )
-                    })}
-
-                    {displayed.length === 0 && (
+                                )
+                            })}
+                        </div>
+                    ) : (
                         <p className="text-sm text-gray-400 text-center py-12">No bookings found.</p>
+                    )}
+
+                    {total !== null && total > pageSizeUsed ? (
+                        <div className="border-t border-gray-100 px-5 py-3">
+                            <PageNav page={page} total={total} pageSize={pageSizeUsed} onJump={handlePageJump} />
+                        </div>
+                    ) : total === null && hasMore && (
+                        <div className="border-t border-gray-100">
+                            <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
+                        </div>
                     )}
                 </div>
             )}
 
-            {!isLoading && activeTab !== 'recurring' && hasMore && (
-                <div className="flex justify-center pt-4">
-                    <Button variant="default" size="sm" loading={isLoadingMore} onClick={handleLoadMore}>
-                        Load more
-                    </Button>
-                </div>
+            {!isLoading && activeTab === 'requests' && total === null && hasMore && (
+                <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
             )}
 
             {/* approve/deny request modal — admin only */}
