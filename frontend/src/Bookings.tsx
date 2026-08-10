@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
-import { TextInput, Loader, Input, Button, Modal, Popover } from '@mantine/core'
+import { TextInput, Loader, Input, Button, Modal, Popover, Switch } from '@mantine/core'
 import { IconSearch, IconCalendar, IconX, IconChevronDown, IconChevronLeft, IconChevronRight, IconSortAscending, IconSortDescending, IconRepeat } from '@tabler/icons-react'
 import type { Tutor, EventType, Booking, BookingSeries } from './types'
 import { extractError, formatDate, formatTime, tutorBubbleClass, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
@@ -15,6 +15,7 @@ interface BookingFilters {
     dateFrom: string | null
     dateTo: string | null
     searchQuery: string
+    includeCancelled: boolean
 }
 
 interface LoadErrors {
@@ -89,7 +90,7 @@ const formatGap = (minutes: number): string => {
     return `${hours}h ${mins}m`
 }
 
-const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | undefined, timeMax: string | undefined, order: 'asc' | 'desc', pageNum: number, pageSize: number, tutorIds: string[], eventTypeIds: string[], emailFilter?: string): Promise<FetchResult> => {
+const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | undefined, timeMax: string | undefined, order: 'asc' | 'desc', pageNum: number, pageSize: number, tutorIds: string[], eventTypeIds: string[], includeCancelled: boolean, emailFilter?: string): Promise<FetchResult> => {
     const base = `${import.meta.env.VITE_API_URL}/bookings/`
     const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
     const pendingParam = tab === 'requests' ? `&pending_only=true` : ''
@@ -98,8 +99,9 @@ const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | u
     const orderParam = `&order=${order}`
     const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
     const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
+    const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
 
-    const res = await fetch(`${base}?page=${pageNum}&page_size=${pageSize}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${emailParam}`)
+    const res = await fetch(`${base}?page=${pageNum}&page_size=${pageSize}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${includeCancelledParam}${emailParam}`)
     if (!res.ok) { return { ok: false, error: await res.json() } }
     const items = (await res.json()) as Booking[]
     // X-Total-Count is only present for a genuinely bounded range — real page-number navigation
@@ -214,7 +216,7 @@ const ScopeSwitcher = ({
                         <span
                             key={`${timeScope}-${dateFrom}-${dateTo}`}
                             className={`block text-sm font-semibold text-gray-800 whitespace-nowrap text-center ${
-                                slideDirection === 1 ? 'animate-[slide-in-right_0.18s_ease-out]' : 'animate-[slide-in-left_0.18s_ease-out]'
+                                slideDirection === 1 ? 'animate-[slide-in-right_0.35s_ease-out]' : 'animate-[slide-in-left_0.35s_ease-out]'
                             }`}
                         >
                             {periodLabel(timeScope, periodAnchor)}
@@ -320,17 +322,21 @@ const ActiveFilterChips = ({
     eventTypeIds,
     tutors,
     eventTypes,
+    includeCancelled,
     onTutorRemove,
     onEventTypeRemove,
+    onIncludeCancelledRemove,
 }: {
     tutorIds: string[]
     eventTypeIds: string[]
     tutors: Tutor[]
     eventTypes: EventType[]
+    includeCancelled: boolean
     onTutorRemove: (id: string) => void
     onEventTypeRemove: (id: string) => void
+    onIncludeCancelledRemove: () => void
 }) => {
-    if (tutorIds.length === 0 && eventTypeIds.length === 0) return null
+    if (tutorIds.length === 0 && eventTypeIds.length === 0 && includeCancelled) return null
     return (
         <div className="flex flex-wrap gap-2 mt-3">
             {tutorIds.map(id => (
@@ -347,6 +353,9 @@ const ActiveFilterChips = ({
                     onRemove={() => onEventTypeRemove(id)}
                 />
             ))}
+            {!includeCancelled && (
+                <FilterChip label="Hide cancelled" onRemove={onIncludeCancelledRemove} />
+            )}
         </div>
     )
 }
@@ -411,6 +420,8 @@ const FiltersMenu = ({
     eventTypeOptions,
     eventTypeSelected,
     onEventTypeToggle,
+    includeCancelled,
+    onIncludeCancelledToggle,
 }: {
     tutorOptions: FilterOption[]
     tutorSelected: string[]
@@ -418,10 +429,12 @@ const FiltersMenu = ({
     eventTypeOptions: FilterOption[]
     eventTypeSelected: string[]
     onEventTypeToggle: (value: string) => void
+    includeCancelled: boolean
+    onIncludeCancelledToggle: () => void
 }) => {
     const [opened, setOpened] = useState(false)
     const [expandedSection, setExpandedSection] = useState<'tutors' | 'eventTypes' | null>(null)
-    const activeCount = tutorSelected.length + eventTypeSelected.length
+    const activeCount = tutorSelected.length + eventTypeSelected.length + (includeCancelled ? 0 : 1)
 
     return (
         <Popover
@@ -460,6 +473,15 @@ const FiltersMenu = ({
                     onToggleExpand={() => setExpandedSection(s => s === 'eventTypes' ? null : 'eventTypes')}
                     onToggleOption={onEventTypeToggle}
                 />
+                <div className="border-t border-gray-100" />
+                <button
+                    type="button"
+                    onClick={onIncludeCancelledToggle}
+                    className="w-full flex items-center justify-between gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors text-left"
+                >
+                    <span>Hide cancelled</span>
+                    <Switch checked={!includeCancelled} onChange={() => {}} color="indigo" size="sm" style={{ pointerEvents: 'none' }} />
+                </button>
             </Popover.Dropdown>
         </Popover>
     )
@@ -473,6 +495,7 @@ const RecurringList = ({
     tutors,
     eventTypes,
     isCustomer,
+    includeCancelled,
     onRefresh,
     onError,
     onCancelSeries,
@@ -482,11 +505,15 @@ const RecurringList = ({
     tutors: Tutor[]
     eventTypes: EventType[]
     isCustomer: boolean
+    includeCancelled: boolean
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onCancelSeries: (seriesId: string) => void
     emptyState: ReactNode
 }) => {
+    // Only one series open at a time across the whole list — expanding one collapses whichever
+    // other row was open.
+    const [expandedSeriesId, setExpandedSeriesId] = useState<string | null>(null)
     if (seriesByDay.length === 0) return <>{emptyState}</>
     return (
         <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
@@ -500,11 +527,15 @@ const RecurringList = ({
                             <SeriesRow
                                 series={s}
                                 tutor={tutors.find(t => t.id === s.tutor_id)!}
+                                tutors={tutors}
                                 eventType={eventTypes.find(e => e.id === s.event_type_id)!}
                                 onRefresh={onRefresh}
                                 onError={onError}
                                 onCancelSeries={onCancelSeries}
+                                expanded={expandedSeriesId === s.id}
+                                onToggleExpand={() => setExpandedSeriesId(prev => prev === s.id ? null : s.id)}
                                 isCustomer={isCustomer}
+                                includeCancelled={includeCancelled}
                             />
                         </div>
                     ))}
@@ -533,7 +564,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // (a fresh page load always starts chronological/ascending, regardless of what was last set).
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>(() => ({
-        tutorIds: [], eventTypeIds: [], searchQuery: '',
+        tutorIds: [], eventTypeIds: [], searchQuery: '', includeCancelled: true,
         ...periodBounds('week', new Date()),
     }))
     const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -596,6 +627,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         dateTo = filters.dateTo,
         tutorIds = filters.tutorIds,
         eventTypeIds = filters.eventTypeIds,
+        includeCancelled = filters.includeCancelled,
         pageNum = 1,
         append = false,
     }: {
@@ -606,6 +638,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         dateTo?: string | null
         tutorIds?: string[]
         eventTypeIds?: string[]
+        includeCancelled?: boolean
         pageNum?: number
         append?: boolean
     } = {}) => {
@@ -624,7 +657,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         else setIsLoading(true)
         try {
             const [bookingsRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetchMyBookings(tab, timeMin, timeMax, fetchOrder, pageNum, pageSize, tutorIds, eventTypeIds, emailFilter),
+                fetchMyBookings(tab, timeMin, timeMax, fetchOrder, pageNum, pageSize, tutorIds, eventTypeIds, includeCancelled, emailFilter),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/event_types`),
             ])
@@ -711,10 +744,16 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         else loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline' })
     }
 
+    // Search/Tutors/Event-types/Show-cancelled are scoped to whichever tab you're looking at —
+    // switching tabs starts that tab's filtering fresh rather than carrying over a selection that
+    // may not even apply there (e.g. a non-recurring event type picked on Schedule). Date scope
+    // isn't touched — Recurring/Requests don't use it, and Timeline should keep whatever
+    // day/week/month/range you had.
     const handleTabChange = (tab: BookingsTab) => {
         setActiveTab(tab)
-        if (tab === 'recurring') loadSeries(isCustomer ? email : undefined)
-        else loadData({ emailFilter: isCustomer ? email : undefined, tab })
+        setFilters(f => ({ ...f, tutorIds: [], eventTypeIds: [], searchQuery: '', includeCancelled: true }))
+        if (tab === 'recurring') loadSeries(isCustomer ? email : undefined, [], [])
+        else loadData({ emailFilter: isCustomer ? email : undefined, tab, tutorIds: [], eventTypeIds: [], includeCancelled: true })
     }
 
     const handleScopeChange = (scope: TimeScope) => {
@@ -815,6 +854,16 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         setFilters(f => ({ ...f, eventTypeIds: next }))
         if (activeTab === 'recurring') { loadSeries(isCustomer ? email : undefined, filters.tutorIds, next); return }
         loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', eventTypeIds: next })
+    }
+
+    // Recurring tab doesn't refetch here — BookingSeries rows carry no status of their own;
+    // SeriesRow reads includeCancelled directly (via RecurringList) and reloads its own
+    // occurrences whenever the flag changes.
+    const handleIncludeCancelledToggle = () => {
+        const next = !filters.includeCancelled
+        setFilters(f => ({ ...f, includeCancelled: next }))
+        if (activeTab === 'recurring') return
+        loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', includeCancelled: next })
     }
 
     const handleEmailSubmit = () => {
@@ -1002,6 +1051,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     tutors={tutors}
                                     eventTypes={eventTypes}
                                     isCustomer={true}
+                                    includeCancelled={filters.includeCancelled}
                                     onRefresh={msg => { refresh(); showToast(msg) }}
                                     onError={msg => showToast(msg, 'error')}
                                     onCancelSeries={() => {}}
@@ -1175,6 +1225,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     eventTypeOptions={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
                                     eventTypeSelected={filters.eventTypeIds}
                                     onEventTypeToggle={handleEventTypeFilterToggle}
+                                    includeCancelled={filters.includeCancelled}
+                                    onIncludeCancelledToggle={handleIncludeCancelledToggle}
                                 />
                                 <div className="w-px h-6 bg-gray-200 mx-1" />
                                 <OrderToggle order={order} onToggle={handleOrderToggle} />
@@ -1187,8 +1239,10 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         eventTypeIds={filters.eventTypeIds}
                         tutors={tutors}
                         eventTypes={eventTypes}
+                        includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onEventTypeRemove={handleEventTypeFilterToggle}
+                        onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
                 </div>
             )}
@@ -1214,9 +1268,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             tutorOptions={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                             tutorSelected={filters.tutorIds}
                             onTutorToggle={handleTutorFilterToggle}
-                            eventTypeOptions={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
+                            // A BookingSeries only ever exists for a recurring=true event type — a
+                            // non-recurring option here could never match anything on this tab.
+                            eventTypeOptions={(activeTab === 'recurring' ? eventTypes.filter(e => e.recurring) : eventTypes)
+                                .map(e => ({ value: String(e.id), label: e.name }))}
                             eventTypeSelected={filters.eventTypeIds}
                             onEventTypeToggle={handleEventTypeFilterToggle}
+                            includeCancelled={filters.includeCancelled}
+                            onIncludeCancelledToggle={handleIncludeCancelledToggle}
                         />
                         <div className="w-px h-6 bg-gray-200 mx-1" />
                         <OrderToggle order={order} onToggle={handleOrderToggle} />
@@ -1227,8 +1286,10 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         eventTypeIds={filters.eventTypeIds}
                         tutors={tutors}
                         eventTypes={eventTypes}
+                        includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onEventTypeRemove={handleEventTypeFilterToggle}
+                        onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
                 </div>
             )}
@@ -1297,6 +1358,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     tutors={tutors}
                     eventTypes={eventTypes}
                     isCustomer={isCustomer}
+                    includeCancelled={filters.includeCancelled}
                     onRefresh={msg => { refresh(); showToast(msg) }}
                     onError={msg => showToast(msg, 'error')}
                     onCancelSeries={setCancellingSeriesId}

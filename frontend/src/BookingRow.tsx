@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react'
-import { Button, Modal, Menu, TextInput } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle } from '@tabler/icons-react'
+import { Menu } from '@mantine/core'
+import { IconChevronDown, IconChevronUp, IconDotsVertical } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, Tutor, EventType } from './types'
-import { formatDate, formatTime, extractError, tutorBubbleClass } from './utils'
+import { formatTime, tutorBubbleClass } from './utils'
+import { useBookingActions } from './useBookingActions'
 
 interface BookingRowProps {
     booking: Booking
@@ -16,174 +16,26 @@ interface BookingRowProps {
     onReviewRequest?: (booking: Booking) => void
     isCustomer?: boolean
     compact?: boolean
-    // Compact mode's leading column shows a time range by default (Schedule's flat list, where
-    // day is already established by the enclosing date header, so time is the varying fact).
-    // Inside an expanded series, the opposite is true — every occurrence shares the same time,
-    // date is what varies — so this swaps that column to show the date instead.
-    showDate?: boolean
 }
 
-interface ContactForm {
-    studentEmail: string
-    studentPhone: string
-    parentEmail:  string
-    parentPhone:  string
+// isPast only dulls a status once its time has actually gone by — a rescheduled/cancelled row
+// whose original slot is still upcoming reads as "moved/removed" (full color), not "already
+// handled" (dulled), same rule a plain confirmed booking already followed.
+export const statusConfig = (b: Booking, isPast: boolean) => {
+    if (b.is_no_show) return { dot: 'bg-orange-400', text: 'text-orange-600', name: 'text-gray-800', label: 'No-show', chip: 'bg-orange-50 text-orange-500' }
+    if (b.status === 'cancelled' || b.status === 'rescheduled') {
+        const label = b.status === 'cancelled' ? 'Cancelled' : 'Rescheduled'
+        if (isPast) return { dot: 'bg-red-500/40', text: 'text-red-500/70', name: 'text-gray-400', label, chip: 'bg-red-50 text-red-500/70' }
+        return { dot: 'bg-red-400', text: 'text-red-600', name: 'text-gray-800', label, chip: 'bg-red-50 text-red-500' }
+    }
+    if (isPast) return { dot: 'bg-gray-300', text: 'text-gray-400', name: 'text-gray-400', label: null, chip: '' }
+    return { dot: 'bg-emerald-400', text: 'text-emerald-600', name: 'text-gray-800', label: null, chip: '' }
 }
 
-const statusConfig = (b: Booking) => {
-    if (b.is_no_show)             return { dot: 'bg-orange-400', text: 'text-orange-600', label: 'No-show',     chip: 'bg-orange-50 text-orange-500' }
-    if (b.status === 'cancelled') return { dot: 'bg-red-400',    text: 'text-red-600',    label: 'Cancelled',   chip: 'bg-red-50 text-red-500' }
-    if (b.status === 'rescheduled') return { dot: 'bg-amber-400', text: 'text-amber-600', label: 'Rescheduled', chip: 'bg-amber-50 text-amber-600' }
-    return { dot: 'bg-emerald-400', text: 'text-emerald-600', label: null, chip: '' }
-}
-
-const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, onError, onReviewRequest, isCustomer = false, compact = false, showDate = false }: BookingRowProps) => {
+const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, onError, onReviewRequest, isCustomer = false, compact = false }: BookingRowProps) => {
     const navigate = useNavigate()
-    const [confirmingDelete, setConfirmingDelete] = useState(false)
-    const [confirmingPermanentDelete, setConfirmingPermanentDelete] = useState(false)
-    const [confirmingCascadeDelete, setConfirmingCascadeDelete] = useState(false)
-    const [editingContact, setEditingContact] = useState(false)
-    const [contact, setContact] = useState<ContactForm>({
-        studentEmail: booking.student_email ?? '',
-        studentPhone: booking.student_phone ?? '',
-        parentEmail:  booking.parent_email  ?? '',
-        parentPhone:  booking.parent_phone  ?? '',
-    })
-    const [contactError, setContactError]   = useState<string | null>(null)
-    const [contactSaving, setContactSaving] = useState(false)
-    const [isSubmitting, setIsSubmitting] = useState(false)
-
-    const isPast = new Date(booking.start) < new Date()
-    // Cancelled/rescheduled/no-show already have their own distinct color regardless of time —
-    // only a plain confirmed booking needs a separate "this already happened" signal.
-    const isPastConfirmed = isPast && booking.status === 'confirmed' && !booking.is_no_show
-
-    const isDirty =
-        contact.studentEmail !== (booking.student_email ?? '') ||
-        contact.studentPhone !== (booking.student_phone ?? '') ||
-        contact.parentEmail  !== (booking.parent_email  ?? '') ||
-        contact.parentPhone  !== (booking.parent_phone  ?? '')
-
-    useEffect(() => {
-        if (editingContact) {
-            setContact({
-                studentEmail: booking.student_email ?? '',
-                studentPhone: booking.student_phone ?? '',
-                parentEmail:  booking.parent_email  ?? '',
-                parentPhone:  booking.parent_phone  ?? '',
-            })
-            setContactError(null)
-        }
-    }, [editingContact])
-
-    const handleDelete = async () => {
-        setIsSubmitting(true)
-        try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, { method: 'DELETE' })
-            if (!res.ok) {
-                onError(extractError(await res.json(), 'Failed to cancel booking.'))
-                setConfirmingDelete(false)
-                return
-            }
-            setConfirmingDelete(false)
-            onRefresh('Booking cancelled')
-        } catch (error) {
-            console.error(error)
-            onError('Failed to cancel booking.')
-            setConfirmingDelete(false)
-        } finally {
-            setIsSubmitting(false)
-        }
-    }
-
-    // Two-step cascade pattern: first call (cascade=false) returns 409 if a predecessor exists,
-    // which triggers the cascade confirm modal. User confirms → second call (cascade=true) walks
-    // and deletes the full predecessor chain.
-    const handlePermanentDelete = async (cascade = false) => {
-        setIsSubmitting(true)
-        try {
-            const url = `${import.meta.env.VITE_API_URL}/bookings/${booking.id}/permanent${cascade ? '?cascade=true' : ''}`
-            const res = await fetch(url, { method: 'DELETE' })
-            if (res.status === 409) {
-                setConfirmingPermanentDelete(false)
-                setConfirmingCascadeDelete(true)
-                return
-            }
-            if (!res.ok) {
-                onError(extractError(await res.json(), 'Failed to permanently delete booking.'))
-                setConfirmingPermanentDelete(false)
-                return
-            }
-            setConfirmingPermanentDelete(false)
-            setConfirmingCascadeDelete(false)
-            onRefresh('Booking deleted')
-        } catch (error) {
-            console.error(error)
-            onError('Failed to permanently delete booking.')
-            setConfirmingPermanentDelete(false)
-            setConfirmingCascadeDelete(false)
-        } finally {
-            setIsSubmitting(false)
-        }
-    }
-
-    const buildPayload = () => ({
-        student_first: booking.student_first,
-        student_last:  booking.student_last,
-        student_email: contact.studentEmail || null,
-        student_phone: contact.studentPhone || null,
-        parent_email:  contact.parentEmail  || null,
-        parent_phone:  contact.parentPhone  || null,
-        is_no_show:    booking.is_no_show,
-    })
-
-    const handleNoShow = async () => {
-        try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...buildPayload(), is_no_show: true }),
-            })
-            if (!res.ok) {
-                onError(extractError(await res.json(), 'Failed to mark as no-show.'))
-                return
-            }
-            onRefresh('Marked as no-show')
-        } catch (error) {
-            console.error(error)
-            onError('Failed to mark as no-show.')
-        }
-    }
-
-    const handleSaveContact = async () => {
-        const hasEmail = contact.studentEmail || contact.parentEmail
-        const hasPhone = contact.studentPhone || contact.parentPhone
-        if (!hasEmail || !hasPhone) {
-            setContactError('At least one email and one phone number are required.')
-            return
-        }
-        setContactSaving(true)
-        try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(buildPayload()),
-            })
-            if (!res.ok) {
-                setContactError(extractError(await res.json(), 'Failed to update contact info.'))
-                return
-            }
-            setEditingContact(false)
-            onRefresh('Contact updated')
-        } catch (error) {
-            console.error(error)
-            setContactError('Failed to update contact info.')
-        } finally {
-            setContactSaving(false)
-        }
-    }
-
-    const status = statusConfig(booking)
+    const { isPast, menuItems, modals } = useBookingActions(booking, eventType, onRefresh, onError, onReviewRequest)
+    const status = statusConfig(booking, isPast)
     const startDate = new Date(booking.start)
     const dayName = startDate.toLocaleDateString('en-US', { weekday: 'short' })
     const monthStr = startDate.toLocaleDateString('en-US', { month: 'short' })
@@ -196,89 +48,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                     <IconDotsVertical size={16} />
                 </button>
             </Menu.Target>
-            <Menu.Dropdown>
-                {booking.request?.status === 'pending' && (
-                    <>
-                        <Menu.Item
-                            leftSection={<IconAlertCircle size={14} />}
-                            color="amber"
-                            onClick={() => onReviewRequest?.(booking)}
-                        >
-                            Review request
-                        </Menu.Item>
-                        <Menu.Divider />
-                    </>
-                )}
-                {booking.series_id !== null ? (
-                    <Menu.Item
-                        leftSection={<IconCalendarEvent size={14} />}
-                        disabled={booking.status !== 'confirmed'}
-                        onClick={() => {
-                            navigate(`/book/${eventType.id}`, {
-                                state: {
-                                    rescheduleFromId: booking.id,
-                                    originalStart: booking.start,
-                                    originalEnd: booking.end,
-                                    studentFirst: booking.student_first,
-                                    studentLast:  booking.student_last,
-                                    studentEmail: booking.student_email,
-                                    studentPhone: booking.student_phone,
-                                    parentEmail:  booking.parent_email,
-                                    parentPhone:  booking.parent_phone,
-                                }
-                            })
-                        }}
-                    >
-                        Reschedule booking
-                    </Menu.Item>
-                ) : (
-                    <>
-                        <Menu.Item
-                            leftSection={<IconCalendarEvent size={14} />}
-                            disabled={booking.status !== 'confirmed'}
-                            onClick={() => {
-                                navigate(`/book/${eventType.id}`, {
-                                    state: {
-                                        rescheduleFromId: booking.id,
-                                        tutorId: booking.tutor_id,
-                                        originalStart: booking.start,
-                                        originalEnd: booking.end,
-                                        studentFirst: booking.student_first,
-                                        studentLast:  booking.student_last,
-                                        studentEmail: booking.student_email,
-                                        studentPhone: booking.student_phone,
-                                        parentEmail:  booking.parent_email,
-                                        parentPhone:  booking.parent_phone,
-                                    }
-                                })
-                            }}
-                        >
-                            Reschedule
-                        </Menu.Item>
-                        <Menu.Item leftSection={<IconRefresh size={14} />} disabled>
-                            Request reschedule
-                        </Menu.Item>
-                    </>
-                )}
-                <Menu.Item leftSection={<IconPencil size={14} />} disabled={booking.status !== 'confirmed'} onClick={() => setEditingContact(true)}>
-                    Modify contact
-                </Menu.Item>
-                <Menu.Item leftSection={<IconUserOff size={14} />} color="orange" disabled={booking.status !== 'confirmed'} onClick={handleNoShow}>
-                    Mark as no-show
-                </Menu.Item>
-                <Menu.Divider />
-                <Menu.Item
-                    leftSection={<IconBan size={14} />}
-                    color="red"
-                    disabled={booking.status !== 'confirmed'}
-                    onClick={() => setConfirmingDelete(true)}
-                >
-                    {isPast ? 'Mark as cancelled' : 'Cancel booking'}
-                </Menu.Item>
-                <Menu.Item leftSection={<IconTrash size={14} />} color="red" onClick={() => setConfirmingPermanentDelete(true)}>
-                    Delete permanently
-                </Menu.Item>
-            </Menu.Dropdown>
+            <Menu.Dropdown>{menuItems}</Menu.Dropdown>
         </Menu>
     )
 
@@ -311,22 +81,24 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                 // reveal on hover (or while expanded) to keep the resting state quiet; the
                 // day grouping itself lives one level up (SeriesRow's own date header).
                 <div className={`group flex items-center px-5 py-1.5 hover:bg-gray-50/60 transition-colors ${expanded ? 'bg-gray-50/60' : ''}`}>
-                    <div className={`w-2 h-2 rounded-full shrink-0 ${isPastConfirmed ? 'bg-gray-300' : status.dot}`} />
-                    <span className={`w-40 shrink-0 ml-3 text-sm tabular-nums ${isPastConfirmed ? 'text-gray-400' : status.text}`}>
-                        {showDate
-                            ? new Date(booking.start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-                            : `${formatTime(booking.start)} – ${formatTime(booking.end)}`}
+                    <div className={`w-2 h-2 rounded-full shrink-0 ${status.dot}`} />
+                    <span className={`flex-1 min-w-0 truncate ml-6 text-sm tabular-nums ${status.text}`}>
+                        {formatTime(booking.start)} – {formatTime(booking.end)}
                     </span>
-                    <span className={`w-56 shrink-0 truncate ml-5 text-sm ${isPastConfirmed ? 'text-gray-400' : 'text-gray-800'}`}>
+                    <span className={`flex-1 min-w-0 truncate ml-6 text-sm ${status.name}`}>
                         {tutor.first_name} {tutor.last_name} · {booking.student_first} {booking.student_last}
-                        {status.label && <span className="ml-1.5 text-xs text-gray-400">· {status.label}</span>}
-                        {booking.request?.status === 'pending' && <span className="ml-1.5 text-xs text-amber-500 font-medium">· Pending</span>}
                     </span>
-                    <span className="w-40 shrink-0 truncate ml-5 text-xs text-gray-400">
+                    <span className="flex-1 min-w-0 truncate ml-6 text-xs">
+                        {status.label && <span className="text-gray-400">{status.label}</span>}
+                        {status.label && booking.request?.status === 'pending' && <span className="text-gray-300"> · </span>}
+                        {booking.request?.status === 'pending' && (
+                            <span className={`font-medium ${isPast ? 'text-red-300' : 'text-amber-500'}`}>Pending</span>
+                        )}
+                    </span>
+                    <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
                         {eventType.name}
                     </span>
-                    <div className="flex-1" />
-                    <div className={`flex items-center gap-0.5 shrink-0 ml-3 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+                    <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                         {actions}
                     </div>
                 </div>
@@ -353,7 +125,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                                 <span className={`text-xs px-2 py-0.5 rounded-full ${status.chip}`}>{status.label}</span>
                             )}
                             {booking.request?.status === 'pending' && (
-                                <span className="text-xs bg-amber-100 text-amber-700 border border-amber-300 px-2 py-0.5 rounded-full font-medium">Pending</span>
+                                <span className={`text-xs px-2 py-0.5 rounded-full font-medium border ${isPast ? 'bg-red-50 text-red-300 border-red-100' : 'bg-amber-100 text-amber-700 border-amber-300'}`}>Pending</span>
                             )}
                         </div>
                         <div className="text-xs text-gray-400 mt-0.5">
@@ -405,52 +177,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
             )}
 
             {/* modals */}
-            <Modal opened={confirmingDelete} onClose={() => setConfirmingDelete(false)}
-                title={`Cancel ${booking.student_first}'s booking on ${formatDate(booking.start)}?`} centered size="sm">
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingDelete(false)}>Keep it</Button>
-                    <Button color="red" loading={isSubmitting} onClick={handleDelete}>Cancel booking</Button>
-                </div>
-            </Modal>
-
-            <Modal opened={confirmingPermanentDelete} onClose={() => setConfirmingPermanentDelete(false)}
-                title={`Permanently delete ${booking.student_first}'s booking?`} centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">This cannot be undone. The calendar event will also be removed.</p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingPermanentDelete(false)}>Keep it</Button>
-                    <Button color="red" loading={isSubmitting} onClick={() => handlePermanentDelete()}>Delete permanently</Button>
-                </div>
-            </Modal>
-
-            <Modal opened={confirmingCascadeDelete} onClose={() => setConfirmingCascadeDelete(false)}
-                title="Delete entire reschedule chain?" centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">
-                    This booking was created by rescheduling an earlier one. All bookings in the reschedule chain will be permanently deleted.
-                </p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingCascadeDelete(false)}>Cancel</Button>
-                    <Button color="red" loading={isSubmitting} onClick={() => handlePermanentDelete(true)}>Delete all</Button>
-                </div>
-            </Modal>
-
-            <Modal opened={editingContact} onClose={() => setEditingContact(false)}
-                title="Modify contact info" centered size="sm">
-                <div className="flex flex-col gap-3">
-                    <TextInput label="Student email" value={contact.studentEmail}
-                        onChange={e => { setContact(c => ({ ...c, studentEmail: e.target.value })); setContactError(null) }} />
-                    <TextInput label="Student phone" value={contact.studentPhone}
-                        onChange={e => { setContact(c => ({ ...c, studentPhone: e.target.value })); setContactError(null) }} />
-                    <TextInput label="Parent email" value={contact.parentEmail}
-                        onChange={e => { setContact(c => ({ ...c, parentEmail: e.target.value })); setContactError(null) }} />
-                    <TextInput label="Parent phone" value={contact.parentPhone}
-                        onChange={e => { setContact(c => ({ ...c, parentPhone: e.target.value })); setContactError(null) }} />
-                    {contactError && <p className="text-sm text-red-500">{contactError}</p>}
-                    <div className="flex justify-end gap-2 mt-1">
-                        <Button variant="default" onClick={() => setEditingContact(false)}>Cancel</Button>
-                        <Button loading={contactSaving} disabled={!isDirty} onClick={handleSaveContact}>Save</Button>
-                    </div>
-                </div>
-            </Modal>
+            {modals}
         </>
     )
 

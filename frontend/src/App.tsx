@@ -91,16 +91,18 @@ function App() {
             </div>
           </header>
 
-          <main className="flex-1 overflow-y-auto p-8">
-            <Routes>
-              <Route path="/" element={<LessonsTable />} />
-              <Route path="/students" element={<div className="text-gray-400">Students — coming soon</div>} />
-              <Route path="/tutors" element={<Tutors />} />
-              <Route path="/availability" element={<Availability />} />
-              <Route path="/event-types" element={<EventTypes />} />
-              <Route path="/event-types/:id" element={<EventTypePage />} />
-              <Route path="/bookings" element={<Bookings />} />
-            </Routes>
+          <main className="flex-1 overflow-y-auto py-8 px-16">
+            <div className="max-w-7xl mx-auto">
+              <Routes>
+                <Route path="/" element={<LessonsTable />} />
+                <Route path="/students" element={<div className="text-gray-400">Students — coming soon</div>} />
+                <Route path="/tutors" element={<Tutors />} />
+                <Route path="/availability" element={<Availability />} />
+                <Route path="/event-types" element={<EventTypes />} />
+                <Route path="/event-types/:id" element={<EventTypePage />} />
+                <Route path="/bookings" element={<Bookings />} />
+              </Routes>
+            </div>
           </main>
         </div>
 

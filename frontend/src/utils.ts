@@ -4,6 +4,11 @@ export const formatDate = (iso: string) =>
 export const formatTime = (iso: string) =>
     new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
 
+// Same as formatDate but without the weekday — used where the weekday is already established
+// by surrounding context (e.g. a day-of-week section header or series card).
+export const formatShortDate = (iso: string) =>
+    new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+
 // For bare "HH:MM:SS" time strings (no date) stored as UTC
 export const formatUTCTime = (timeStr: string) =>
     new Date(`1970-01-01T${timeStr}Z`).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'UTC' })

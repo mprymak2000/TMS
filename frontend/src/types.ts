@@ -113,6 +113,7 @@ export interface Booking {
   status: string
   is_no_show: boolean
   rescheduled_to: string | null
+  rescheduled_from: string | null
   google_event_id: string
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'

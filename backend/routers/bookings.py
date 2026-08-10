@@ -68,10 +68,13 @@ def get_booking_series_occurrences(
     include_cancelled: bool = Query(default=False),
     order: str = Query(default="asc"),
     page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=PAGE_SIZE, ge=1, le=500),
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
-    """Returns a paginated list of all occurrences (materialized + virtual) for a given series."""
+    """Returns a paginated list of all occurrences (materialized + virtual) for a given series.
+    page_size defaults to PAGE_SIZE (10) but callers can request a smaller/larger page — same
+    page_size override pattern as GET /bookings/ (list_bookings)."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
@@ -80,7 +83,7 @@ def get_booking_series_occurrences(
         raise HTTPException(status_code=404, detail="Booking series not found")
 
     materialized_query = db.query(Booking).filter(Booking.series_id == series.id) # materialized occurrences only part of a series
-    items, total = merge_occurrences([series], materialized_query, time_min, time_max, page, PAGE_SIZE, settings, include_cancelled, order)
+    items, total = merge_occurrences([series], materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
     if total is not None:
         response.headers["X-Total-Count"] = str(total)
     return items
@@ -641,7 +644,8 @@ def _cancel_series(db_series: BookingSeries, db: Session, service) -> BookingSer
     return db_series
 
 
-def _reschedule_series(db_series: BookingSeries, booking_in: BookingReschedule, db: Session, service, settings) -> BookingSeries:
+def _reschedule_series(db_series: BookingSeries, booking_in: 
+    BookingReschedule, db: Session, service, settings) -> BookingSeries:
     """Reschedule series saga — truncates old RRULE, creates new RRULE event on (possibly new) tutor's calendar,
     drops future occurrence rows, regenerates from the new time. Caller owns is_active check.
     Helper fetches and validates the new tutor and event type since they're needed for the calendar op."""

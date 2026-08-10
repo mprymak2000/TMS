@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from database import Base
 from datetime import datetime, UTC
 from uuid import uuid4
@@ -286,7 +286,15 @@ class Booking(Base):
     student_record = relationship("Student")
     lesson = relationship("Lesson", back_populates="booking", uselist=False)
     request = relationship("BookingRequest", back_populates="booking", uselist=False)
-    rescheduled_to_booking = relationship("Booking", remote_side=[id], foreign_keys=[rescheduled_to])
+    # backref: rescheduled_from_booking (uselist=False) — the predecessor booking that got
+    # rescheduled into this one, if any. Not a stored column; SQLAlchemy resolves it as
+    # `SELECT * FROM bookings WHERE rescheduled_to = <this booking's id>` on access.
+    rescheduled_to_booking = relationship(
+        "Booking",
+        remote_side=[id],
+        foreign_keys=[rescheduled_to],
+        backref=backref("rescheduled_from_booking", uselist=False),
+    )
 
     # allow pydantic to inherit parent's (booking's series) public_id field from the
     # model's relationship by @property and getattr(model_obj, field_name).
@@ -297,6 +305,10 @@ class Booking(Base):
     @property
     def rescheduled_to_public_id(self) -> str | None:
         return self.rescheduled_to_booking.public_id if self.rescheduled_to_booking else None
+
+    @property
+    def rescheduled_from_public_id(self) -> str | None:
+        return self.rescheduled_from_booking.public_id if self.rescheduled_from_booking else None
 
     @property
     def cancel_action(self) -> str:

@@ -448,6 +448,7 @@ class BookingResponse(BaseModel):
     status: str
     is_no_show: bool
     rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
+    rescheduled_from: str | None = Field(default=None, validation_alias="rescheduled_from_public_id")
     google_event_id: str
     cancel_action: str
     reschedule_action: str
