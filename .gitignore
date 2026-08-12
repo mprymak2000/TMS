@@ -26,6 +26,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Claude Code — personal overrides, not shared project config
+.claude/settings.local.json
+
 # Personal notes — not project docs, stays local
 notes/
 

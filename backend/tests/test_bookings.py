@@ -3,6 +3,7 @@ from unittest.mock import patch, MagicMock
 from conftest import TestingSessionLocal
 from models import Booking, BookingSeries
 from schemas import BookingResponse
+from routers.bookings import PAGE_SIZE, DEFAULT_PAGE_SIZE
 
 
 def _all_bookings():
@@ -332,6 +333,30 @@ def test_pending_only_ignores_time_range_params(client):
     items = client.get("/bookings/?pending_only=true&time_min=2099-01-01T00:00:00&time_max=2000-01-01T00:00:00").json()
     assert len(items) == 1
     assert items[0]["request"]["type"] == "cancel_occurrence"
+
+
+def test_pending_only_has_more_and_page_size_headers(client):
+    tutor, event_type = setup_strict_notice(client)
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        for i in range(3):
+            payload = {
+                **booking_payload,
+                "tutor_id": tutor["id"],
+                "event_type_id": event_type["id"],
+                "start": f"2099-06-{10 + i:02d}T16:00:00",
+                "end": f"2099-06-{10 + i:02d}T17:00:00",
+            }
+            created = client.post("/bookings/", json=payload).json()
+            client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
+
+    page1 = client.get("/bookings/?pending_only=true&page=1&page_size=2")
+    assert page1.headers["x-has-more"] == "true"
+    assert page1.headers["x-page-size"] == "2"
+    assert len(page1.json()) == 2
+
+    page2 = client.get("/bookings/?pending_only=true&page=2&page_size=2")
+    assert page2.headers["x-has-more"] == "false"
+    assert len(page2.json()) == 1
 
 
 def test_my_bookings_include_cancelled(client):
@@ -785,18 +810,18 @@ def test_my_bookings_bounded_range_paginates_with_total_count(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE (10)
-    base = f"/bookings/?email={created['student_email']}&time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59"
+    # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE
+    base = f"/bookings/?email={created['student_email']}&time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59&page_size={PAGE_SIZE}"
     page1 = client.get(f"{base}&page=1")
     assert page1.headers["x-total-count"] == "12"
     items1 = page1.json()
-    assert len(items1) == 10
+    assert len(items1) == PAGE_SIZE
     assert items1[0]["start"].startswith("2099-06-10")
 
     page2 = client.get(f"{base}&page=2")
     assert page2.headers["x-total-count"] == "12"
     items2 = page2.json()
-    assert len(items2) == 2
+    assert len(items2) == 12 - PAGE_SIZE
     assert items2[-1]["start"].startswith("2099-08-26")
 
 
@@ -811,22 +836,22 @@ def test_my_bookings_time_max_only_still_gets_total_count(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1")
+    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size={PAGE_SIZE}")
     assert response.headers["x-total-count"] == "12"
-    assert len(response.json()) == 10
+    assert len(response.json()) == PAGE_SIZE
 
 
-def test_my_bookings_custom_page_size_returns_all_in_one_page(client):
-    """A caller with a naturally-bounded window (Day/Week/Month) can ask for a bigger page_size
-    (mirrors Google Calendar's events.list maxResults) instead of real pagination — same
-    12-occurrence series, page_size=250 should return all 12 in a single page."""
+def test_my_bookings_default_page_size_returns_all_in_one_page(client):
+    """page_size defaults to 250 (DEFAULT_PAGE_SIZE) when omitted — a naturally-bounded window
+    (Day/Week/Month) gets everything in one page without needing to ask for it explicitly."""
     tutor, event_type = setup_recurring(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size=250")
+    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1")
     assert response.headers["x-total-count"] == "12"
+    assert response.headers["x-page-size"] == str(DEFAULT_PAGE_SIZE)
     assert len(response.json()) == 12
 
 
@@ -868,8 +893,8 @@ def test_my_bookings_order_desc_paginates_from_most_recent(client):
     oldest-first page happened to be. Regression test for a real bug: an unbounded-below query
     (time_max=now, no time_min) always paginated starting from the earliest matching row —
     reversing an already-fetched page can't fix that, since it doesn't change which rows got
-    fetched in the first place. 15 past bookings, page_size=10, so the bug (fetching the 10
-    oldest instead of the 10 most recent) would actually be visible here."""
+    fetched in the first place. 15 past bookings, more than PAGE_SIZE, so the bug (fetching the
+    oldest page instead of the most recent) would actually be visible here."""
     tutor, event_type = setup_standalone(client)
     created_ids = []
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
@@ -892,10 +917,10 @@ def test_my_bookings_order_desc_paginates_from_most_recent(client):
     db.close()
 
     now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    items = client.get(f"/bookings/?time_max={now_iso}&order=desc&page=1").json()
-    assert len(items) == 10
+    items = client.get(f"/bookings/?time_max={now_iso}&order=desc&page=1&page_size={PAGE_SIZE}").json()
+    assert len(items) == PAGE_SIZE
     assert items[0]["start"].startswith("2020-01-15")  # most recent of the 15, comes first
-    assert items[-1]["start"].startswith("2020-01-06")  # 10th most recent — not the oldest (01-01)
+    assert items[-1]["start"].startswith(f"2020-01-{16 - PAGE_SIZE:02d}")  # PAGE_SIZE-th most recent
 
 
 def test_my_bookings_order_rejects_invalid_value(client):
@@ -1296,6 +1321,45 @@ def test_get_booking_series_email_filter(client):
     items = client.get("/bookings/booking-series?email=someone-else@example.com").json()
     assert len(items) == 1
     assert items[0]["student_email"] == "someone-else@example.com"
+
+
+def test_get_booking_series_tutor_ids_filters_scope(client):
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_recurring, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_recurring, "name": "Tutoring Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
+        created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}).json()
+
+    items = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}").json()
+    assert len(items) == 1
+    assert items[0]["id"] == created_a["series_id"]
+
+    # multi-value: both tutors requested at once returns both series
+    items = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}&tutor_ids={tutor_b['id']}").json()
+    assert {i["id"] for i in items} == {created_a["series_id"], created_b["series_id"]}
+
+
+def test_get_booking_series_event_type_ids_filters_scope(client):
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_recurring, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_recurring, "name": "Tutoring Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
+        created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}).json()
+
+    items = client.get(f"/bookings/booking-series?event_type_ids={event_type_a['id']}").json()
+    assert len(items) == 1
+    assert items[0]["id"] == created_a["series_id"]
+
+    items = client.get(f"/bookings/booking-series?event_type_ids={event_type_a['id']}&event_type_ids={event_type_b['id']}").json()
+    assert {i["id"] for i in items} == {created_a["series_id"], created_b["series_id"]}
 
 
 def test_booking_series_occurrences_upcoming_merges_real_and_virtual(client):

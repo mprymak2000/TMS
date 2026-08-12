@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 PAGE_SIZE = 10
+DEFAULT_PAGE_SIZE = 250  # GET /bookings/'s default page_size, overridable by callers
 
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
@@ -39,23 +40,26 @@ router = APIRouter(prefix="/bookings", tags=["bookings"])
 @router.get("/booking-series", response_model=list[BookingSeriesResponse])
 def get_booking_series(
     email: str | None = Query(default=None),
-    tutor_id: int | None = Query(default=None),
+    tutor_ids: list[int] = Query(default=[]),
+    event_type_ids: list[int] = Query(default=[]),
     db: Session = Depends(get_db),
 ):
     """Bare series list — no embedded occurrences. Expanding a series row on the frontend
     calls GET /booking-series/{id}/occurrences separately, the same way GET / does it
     internally — one shared resolution path (merge_occurrences) for all occurrence reads,
     regardless of whether the caller wants everyone's occurrences or just one series'."""
-    q = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+    query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
     if email:
-        q = q.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
-    if tutor_id:
-        q = q.filter(BookingSeries.tutor_id == tutor_id)
+        query = query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
+    if tutor_ids:
+        query = query.filter(BookingSeries.tutor_id.in_(tutor_ids))
+    if event_type_ids:
+        query = query.filter(BookingSeries.event_type_id.in_(event_type_ids))
     results = []
-    for series in q.all():
-        resp = BookingSeriesResponse.model_validate(series)
-        resp.bookings = []  # unused here — occurrences are always fetched separately, paginated
-        results.append(resp)
+    for series in query.all():
+        response = BookingSeriesResponse.model_validate(series)
+        response.bookings = []  # unused here — occurrences are always fetched separately, paginated
+        results.append(response)
     return results
 
 
@@ -100,26 +104,12 @@ def list_bookings(
     order: str = Query(default="asc"),
     pending_only: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=PAGE_SIZE, ge=1, le=500),
+    page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=500),
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
-    """Returns a paginated, flat list of all bookings (materialized + virtual occurrences).
-    Optionally filtered to a student/parent email, one or more tutor_ids, and/or one or more
-    event_type_ids. Optionally filtered to only pending requests.
-    Virtual ocurrences (from series rules) are generated in memory and merged with real rows, then the combined list is paginated.
-    Min and max optional filters are used to scope the time window for ocurrences. The default floor is to start from the first occurrence,
-    while max is dynamically calculated based on the number of pages requested (pagination).
-
-    page_size defaults to PAGE_SIZE (10, real pagination — used by Range) but callers with a
-    naturally-bounded window (Day/Week/Month) can request a larger one — same idea as Google
-    Calendar's events.list maxResults (default/typical 250): a single practitioner's day/week/
-    month is never going to have hundreds of bookings, so there's no real "page 2" to speak of;
-    a generous cap is just a safety net, not a genuine pagination boundary. Capped at 500 to
-    bound worst-case cost on an unbounded (no time_max) query, where page_size directly controls
-    how deep _virtual_occurrences walks.
-
-    Returned list represents a real timeline of all bookings."""
+    """Paginated, flat list of all bookings (materialized + virtual occurrences), optionally
+    filtered by email/tutor_ids/event_type_ids/pending_only, bounded by time_min/time_max."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
@@ -133,7 +123,10 @@ def list_bookings(
             query = query.filter(Booking.tutor_id.in_(tutor_ids))
         if event_type_ids:
             query = query.filter(Booking.event_type_id.in_(event_type_ids))
-        return query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size).all()
+        rows = query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
+        response.headers["X-Has-More"] = str(len(rows) > page_size).lower()
+        response.headers["X-Page-Size"] = str(page_size)
+        return rows[:page_size]
 
     # Get booking rows that already exist in db (materialized occurrences). Filter if needed.
     materialized_query = db.query(Booking)
@@ -155,8 +148,10 @@ def list_bookings(
 
     # Merge materialized + resolved virtual occurrences across all series, then paginate the combined list.
     items, total = merge_occurrences(series_query.all(), materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
+    # pass the total count of occurrences as header in the response, so frontend can handle pagination
     if total is not None:
         response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Page-Size"] = str(page_size)
     return items
 
 

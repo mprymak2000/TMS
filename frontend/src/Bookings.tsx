@@ -30,7 +30,7 @@ interface LoadErrors {
 // so it's an inner toggle instead — Requests has no time scope at all (nothing to filter).
 type BookingsTab = 'timeline' | 'recurring' | 'requests'
 type TimeScope = 'day' | 'week' | 'month' | 'range'
-type FetchResult = { ok: true; items: Booking[]; hasMore: boolean; total: number | null } | { ok: false; error: any }
+type FetchResult = { ok: true; items: Booking[]; hasMore: boolean; total: number | null; pageSize: number } | { ok: false; error: any }
 
 const TABS = [
     { key: 'timeline', label: 'Schedule' },
@@ -38,13 +38,7 @@ const TABS = [
     { key: 'requests', label: 'Requests' },
 ] as const
 
-const PAGE_SIZE = 10
-// Day/Week/Month are naturally bounded (a single practitioner's day/week/month is never going
-// to have hundreds of bookings), so there's no real "page 2" to paginate — same idea as Google
-// Calendar's events.list maxResults (default/typical 250): request a generous cap in one go and
-// just render the whole thing, no page-number UI. Range keeps real PAGE_SIZE-based pagination
-// since it can genuinely span a large, open-ended window.
-const WIDE_PAGE_SIZE = 250
+const PAGE_SIZE = 10  // explicit override for Range/Requests; Day/Week/Month omit page_size, backend default applies
 
 // Exact-day comparison key (local calendar date, not UTC — must match dateLabelOf's timezone
 // or two events on different local days can share a UTC-sliced date and get bundled together)
@@ -90,7 +84,7 @@ const formatGap = (minutes: number): string => {
     return `${hours}h ${mins}m`
 }
 
-const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | undefined, timeMax: string | undefined, order: 'asc' | 'desc', pageNum: number, pageSize: number, tutorIds: string[], eventTypeIds: string[], includeCancelled: boolean, emailFilter?: string): Promise<FetchResult> => {
+const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | undefined, timeMax: string | undefined, order: 'asc' | 'desc', pageNum: number, pageSize: number | undefined, tutorIds: string[], eventTypeIds: string[], includeCancelled: boolean, emailFilter?: string): Promise<FetchResult> => {
     const base = `${import.meta.env.VITE_API_URL}/bookings/`
     const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
     const pendingParam = tab === 'requests' ? `&pending_only=true` : ''
@@ -100,16 +94,16 @@ const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | u
     const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
     const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
     const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
+    const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
 
-    const res = await fetch(`${base}?page=${pageNum}&page_size=${pageSize}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${includeCancelledParam}${emailParam}`)
+    const res = await fetch(`${base}?page=${pageNum}${pageSizeParam}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${includeCancelledParam}${emailParam}`)
     if (!res.ok) { return { ok: false, error: await res.json() } }
     const items = (await res.json()) as Booking[]
-    // X-Total-Count is only present for a genuinely bounded range — real page-number navigation
-    // there instead of incremental Load More, since the true total is known.
     const totalHeader = res.headers.get('x-total-count')
     const total = totalHeader !== null ? Number(totalHeader) : null
-    const hasMore = total !== null ? false : items.length === pageSize
-    return { ok: true, items, hasMore, total }
+    const hasMore = res.headers.get('x-has-more') === 'true'
+    const usedPageSize = Number(res.headers.get('x-page-size'))
+    return { ok: true, items, hasMore, total, pageSize: usedPageSize }
 }
 
 const DateRangeInputs = ({
@@ -585,11 +579,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // Non-null whenever Timeline is loaded (always bounded now) — drives real page-number
     // navigation there; null only for the Requests tab, which uses incremental Load More instead.
     const [total, setTotal] = useState<number | null>(null)
-    // Whichever page_size was actually used for the current fetch (PAGE_SIZE or WIDE_PAGE_SIZE)
-    // — PageNav only needs to show when total exceeds this, not just because total is non-null.
-    // Day/Week/Month effectively never hit this in practice, but if a month ever did have more
-    // than WIDE_PAGE_SIZE occurrences, this is what keeps the overflow from being silently
-    // truncated instead of gracefully falling back to real pagination.
+    // Actual page_size the backend used (from X-Page-Size) — PageNav shows only if total exceeds it.
     const [pageSizeUsed, setPageSizeUsed] = useState(PAGE_SIZE)
 
     // recurring tab — separate state, separate shape (BookingSeries, not Booking), unpaginated
@@ -649,10 +639,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         // Canonical fetch order for a bounded page — `order` (state) only controls the client-side
         // display sort of the already-fetched page (see displayed's .sort()), same as it always did.
         const fetchOrder = 'asc'
-        // Day/Week/Month: one big page, no real pagination (see WIDE_PAGE_SIZE). Range and
-        // Requests keep real PAGE_SIZE-based pagination — Range can genuinely be large, and
-        // Requests is unbounded (no time_max), so page_size there controls actual walk depth.
-        const pageSize = tab === 'requests' || scope === 'range' ? PAGE_SIZE : WIDE_PAGE_SIZE
+        // Day/Week/Month omit page_size — backend default applies. Range/Requests override it.
+        const pageSize = tab === 'requests' || scope === 'range' ? PAGE_SIZE : undefined
         if (append) setIsLoadingMore(true)
         else setIsLoading(true)
         try {
@@ -681,7 +669,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             setPage(pageNum)
             setHasMore(bookingsRes.hasMore)
             setTotal(bookingsRes.total)
-            setPageSizeUsed(pageSize)
+            setPageSizeUsed(bookingsRes.pageSize)
             setLoadErrors({})
         } catch (error) {
             console.error(error)
