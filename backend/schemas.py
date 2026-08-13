@@ -569,3 +569,38 @@ class AvailableSlotResponse(BaseModel):
     tutor_id: int
     start: datetime
     end: datetime
+
+
+class TutorFacetOption(BaseModel):
+    id: int
+    first_name: str
+    last_name: str
+
+
+class EventTypeFacetOption(BaseModel):
+    id: int
+    name: str
+
+
+class StudentFacetOption(BaseModel):
+    first_name: str
+    last_name: str
+
+
+class BookingFacets(BaseModel):
+    tutors: list[TutorFacetOption]
+    event_types: list[EventTypeFacetOption]
+    students: list[StudentFacetOption]
+
+
+class BookingListResponse(BaseModel):
+    items: list[BookingResponse]
+    total: int | None
+    has_more: bool
+    page_size: int
+    facets: BookingFacets
+
+
+class BookingSeriesListResponse(BaseModel):
+    items: list[BookingSeriesResponse]
+    facets: BookingFacets

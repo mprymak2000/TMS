@@ -1,9 +1,9 @@
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
-from sqlalchemy import func
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
-from models import Booking, BookingSeries
-from schemas import BookingResponse
+from models import Booking, BookingSeries, EventType, Tutor
+from schemas import BookingFacets, BookingResponse, EventTypeFacetOption, StudentFacetOption, TutorFacetOption
 from policy import get_cancel_action, get_reschedule_action
 from fastapi import HTTPException
      
@@ -197,11 +197,11 @@ def merge_occurrences(
     settings,
     include_cancelled: bool = False,
     order: str = "asc",
-) -> tuple[list[BookingResponse], int | None]:
+) -> tuple[list[BookingResponse], int | None, bool]:
     """Merge materialized (in db) + virtual occurrences across the given series within [time_min, time_max],
      paginate to one page. Shared by GET /bookings/ and
-     GET /bookings/booking-series/{id}/occurrences. Returns (page_items, total) — total is only
-     meaningful (non-None) for a bounded range; the caller surfaces it as an X-Total-Count header.
+     GET /bookings/booking-series/{id}/occurrences. Returns (page_items, total, has_more) — total
+     is only meaningful (non-None) for a bounded range; has_more is only meaningful when unbounded.
 
      time_min/time_max optional — omitting either
      means unbounded on that side. page/page_size remains a 'local' termination mechanism for an
@@ -241,7 +241,7 @@ def merge_occurrences(
         materialized_bookings_query = materialized_bookings_query.filter(Booking.start <= time_max)
     materialized_bookings = materialized_bookings_query.all()
 
-    needed_total = None if bounded else page * page_size
+    needed_total = None if bounded else page * page_size + 1 # extra +1 booking to check if there is more bookings to load after the requested count is satisfied
     virtual = []
     for series in relevant_series:
         virtual.extend(_virtual_occurrences(series, time_min, time_max, needed_total, settings))
@@ -250,7 +250,84 @@ def merge_occurrences(
         return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
 
     merged = sorted([*materialized_bookings, *virtual], key=_sort_key, reverse=(order == "desc"))
+    has_more = False if bounded else len(merged) > page * page_size
     total = len(merged) if bounded else None
     start = (page - 1) * page_size
     items = [BookingResponse.model_validate(b) for b in merged[start:start + page_size]]
-    return items, total
+    return items, total, has_more
+
+
+def apply_scope_filters(query, model, tutor_ids, event_type_ids, student_pairs, email=None, exclude=None):
+    """Take in a query and attach filters to it based on the provided scope parameters. Return the modified query."""
+    if email:
+        query = query.filter((model.student_email == email) | (model.parent_email == email))
+    if tutor_ids and exclude != "tutor":
+        query = query.filter(model.tutor_id.in_(tutor_ids))
+    if event_type_ids and exclude != "event_type":
+        query = query.filter(model.event_type_id.in_(event_type_ids))
+    if student_pairs and exclude != "student":
+        query = query.filter(tuple_(model.student_first, model.student_last).in_(student_pairs))
+    return query
+
+
+def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
+    """Given a set of scope parameters, return the corresponding facet options for the respective fi."""    
+    tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all() if tutor_ids else []
+    event_types = db.query(EventType).filter(EventType.id.in_(event_type_ids)).all() if event_type_ids else []
+
+    tutor_options = [TutorFacetOption(id=t.id, first_name=t.first_name, last_name=t.last_name) for t in tutors]
+    tutor_options.sort(key=lambda t: (t.first_name.lower(), t.last_name.lower()))
+
+    event_type_options = [EventTypeFacetOption(id=e.id, name=e.name) for e in event_types]
+    event_type_options.sort(key=lambda e: e.name.lower())
+
+
+    student_options = [StudentFacetOption(first_name=first, last_name=last) for first, last in student_pairs]
+    student_options.sort(key=lambda s: (s.first_name.lower(), s.last_name.lower()))
+
+    return BookingFacets(tutors=tutor_options, event_types=event_type_options, students=student_options)
+
+
+def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db):
+    """ Given scope parameters, attach them to the base query and fire it as many times as there are facets, while keeping one facet type unfiltered at a time. Do this for regualar Bookings and BookingSeries. Return the unique set of facet options for each facet type. """
+
+    # Deplicate query and apply scope filters, while excluding one filter at a time 
+    tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
+    tutor_id_set = {row[0] for row in tutor_query.with_entities(Booking.tutor_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
+    event_type_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="event_type")
+    event_type_id_set = {row[0] for row in event_type_query.with_entities(Booking.event_type_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
+    student_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="student")
+    student_pair_set = set(student_query.with_entities(Booking.student_first, Booking.student_last).distinct().all()) # [('John', 'Doe'), ('Jane', 'Smith'), ...] -> {('John', 'Doe'), ('Jane', 'Smith'), ...}
+
+    if series_base_query is not None:
+        # the 3 outter queries are series which aren't dated. By calling _virtual_occurrences we can check for actual, scheduled ocurrences within the requested time range (if it's in the future, past is handled by standard Booking model above). If any exist, we add the corresponding facet to the set. This is done for each facet type.
+        series_no_tutor = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="tutor").all()
+        for series in series_no_tutor:
+            # if actual 
+            if _virtual_occurrences(series, time_min, time_max, 1, settings):
+                tutor_id_set.add(series.tutor_id)
+        series_no_event_type = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="event_type").all()
+        for series in series_no_event_type:
+            if _virtual_occurrences(series, time_min, time_max, 1, settings):
+                event_type_id_set.add(series.event_type_id)
+        series_no_student = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="student").all()
+        for series in series_no_student:
+            if _virtual_occurrences(series, time_min, time_max, 1, settings):
+                student_pair_set.add((series.student_first, series.student_last))
+
+    return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
+
+
+def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, db):
+    """ Given scope parameters, attach them to the base query for SERIES (not individual ocurrences) and fire it as many times as there are facets, while keeping one facet type unfiltered at a time. Return the unique set of facet options for each facet type. """
+
+    tutor_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
+    tutor_id_set = {row[0] for row in tutor_query.with_entities(BookingSeries.tutor_id).distinct().all()}
+
+    event_type_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="event_type")
+    event_type_id_set = {row[0] for row in event_type_query.with_entities(BookingSeries.event_type_id).distinct().all()}
+
+    student_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="student")
+    student_pair_set = set(student_query.with_entities(BookingSeries.student_first, BookingSeries.student_last).distinct().all())
+
+    return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
