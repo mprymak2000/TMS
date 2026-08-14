@@ -187,74 +187,48 @@ def _virtual_occurrences(
     return occurrences
 
 
-def merge_occurrences(
-    relevant_series: list[BookingSeries],
-    materialized_query,
+def scoped_virtual_occurrences(
+    series_list: list[BookingSeries],
     time_min: datetime | None,
     time_max: datetime | None,
-    page: int,
-    page_size: int,
+    needed_total: int | None,
     settings,
-    include_cancelled: bool = False,
-    order: str = "asc",
-) -> tuple[list[BookingResponse], int | None, bool]:
-    """Merge materialized (in db) + virtual occurrences across the given series within [time_min, time_max],
-     paginate to one page. Shared by GET /bookings/ and
-     GET /bookings/booking-series/{id}/occurrences. Returns (page_items, total, has_more) — total
-     is only meaningful (non-None) for a bounded range; has_more is only meaningful when unbounded.
-
-     time_min/time_max optional — omitting either
-     means unbounded on that side. page/page_size remains a 'local' termination mechanism for an
-     indefinite series when time_max is omitted and can be recalled indefinitely;
-     time_max, when given, is an 'absolute' stop.
-
-     include_cancelled is an independent filter, not tied to time direction — mirrors Google
-     Calendar's showDeleted (default False, excludes cancelled/rescheduled-away rows; True shows
-     everything). Virtual occurrences are always "confirmed" by construction, so this only
-     affects the materialized-row query.
-
-     order='desc' fetches the most-recent-first page instead of the oldest-first page — without
-     this, an unbounded-below query (e.g. time_max=now, no time_min) would always paginate
-     starting from the very earliest matching row, not the most recent one; reversing the already
-     -fetched page client-side can't fix that, since it doesn't change which rows got fetched.
-     _virtual_occurrences stays forward-only regardless (unaffected by order) — descending queries
-     are only ever used for genuinely-past ranges, which are always already materialized by the
-     time they're in the past, so there's nothing virtual to walk backward through.
-
-     Whenever time_max is given, the range is bounded — cheap to walk to completion (time_max
-     alone guarantees _virtual_occurrences terminates, no count cap needed: the walk's floor is
-     always a real anchor either way, series.start_date if time_min is omitted, so omitting
-     time_min doesn't threaten termination or cost, only widens the floor), so the true total is
-     computed before slicing. page/page_size still apply normally — this isn't "return
-     everything," it's "we can tell you how many pages there are." Only a missing time_max is
-     genuinely unbounded (an indefinite series has no natural "last occurrence ever"), which is
-     the one case that still needs the page-cap/Load-More fallback instead of a real total.
-     """
-    bounded = time_max is not None
-
-    materialized_bookings_query = materialized_query
-    if not include_cancelled:
-        materialized_bookings_query = materialized_bookings_query.filter(Booking.status == "confirmed")
-    if time_min is not None:
-        materialized_bookings_query = materialized_bookings_query.filter(Booking.start >= time_min)
-    if time_max is not None:
-        materialized_bookings_query = materialized_bookings_query.filter(Booking.start <= time_max)
-    materialized_bookings = materialized_bookings_query.all()
-
-    needed_total = None if bounded else page * page_size + 1 # extra +1 booking to check if there is more bookings to load after the requested count is satisfied
+) -> list[BookingResponse]:
+    """Generate virtual occurrences for every series in series_list within [time_min, time_max],
+    capped at needed_total each (None = uncapped, only safe when time_max bounds the walk)."""
     virtual = []
-    for series in relevant_series:
+    for series in series_list:
         virtual.extend(_virtual_occurrences(series, time_min, time_max, needed_total, settings))
+    return virtual
 
+
+def apply_booking_time_status_scope(query, time_min: datetime | None, time_max: datetime | None, include_cancelled: bool):
+    """Time/status scope for a Booking query — mirrors Google Calendar's showDeleted (default
+    False, excludes cancelled/rescheduled-away rows). Only ever applies to Booking; BookingSeries
+    has no status/start columns to scope this way."""
+    if not include_cancelled:
+        query = query.filter(Booking.status == "confirmed")
+    if time_min is not None:
+        query = query.filter(Booking.start >= time_min)
+    if time_max is not None:
+        query = query.filter(Booking.start <= time_max)
+    return query
+
+
+def merge_occurrences(
+    virtual_occurrences: list[BookingResponse],
+    materialized_bookings: list[Booking],
+    order: str = "asc",
+) -> list[BookingResponse]:
+    """Merge already-generated virtual occurrences with materialized bookings into one sorted list.
+    order='desc' sorts most-recent-first — used for unbounded-below queries (e.g. time_max=now, no
+    time_min), where paginating from the earliest match instead of the most recent would be wrong,
+    and reversing an already-fetched page can't fix that since it doesn't change which rows got
+    fetched in the first place."""
     def _sort_key(b):
         return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
-
-    merged = sorted([*materialized_bookings, *virtual], key=_sort_key, reverse=(order == "desc"))
-    has_more = False if bounded else len(merged) > page * page_size
-    total = len(merged) if bounded else None
-    start = (page - 1) * page_size
-    items = [BookingResponse.model_validate(b) for b in merged[start:start + page_size]]
-    return items, total, has_more
+    merged = sorted([*materialized_bookings, *virtual_occurrences], key=_sort_key, reverse=(order == "desc"))
+    return [BookingResponse.model_validate(b) for b in merged]
 
 
 def apply_scope_filters(query, model, tutor_ids, event_type_ids, student_pairs, email=None, exclude=None):
@@ -288,9 +262,9 @@ def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
 
 
 def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db):
-    """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. Return the unique set of facet options for each facet type. """
+    """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. materialized_base_query must already be time/status-scoped by the caller. Return the unique set of facet options for each facet type. """
 
-    # Deplicate query and apply scope filters, while excluding one filter at a time 
+    # Deplicate query and apply scope filters, while excluding one filter at a time
     tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(Booking.tutor_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
     event_type_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="event_type")

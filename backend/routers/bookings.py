@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import apply_scope_filters, compute_series_facets, compute_timeline_facets, resolve_ref, merge_occurrences
+from booking_utils import apply_booking_time_status_scope, apply_scope_filters, compute_series_facets, compute_timeline_facets, resolve_ref, merge_occurrences, scoped_virtual_occurrences
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -85,9 +85,19 @@ def get_booking_series_occurrences(
     if not series:
         raise HTTPException(status_code=404, detail="Booking series not found")
 
-    materialized_query = db.query(Booking).filter(Booking.series_id == series.id) # materialized occurrences only part of a series
-    items, total, has_more = merge_occurrences([series], materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
-    return BookingSeriesOccurrencesResponse(items=items, total=total, has_more=has_more)
+    materialized_query = apply_booking_time_status_scope(
+        db.query(Booking).filter(Booking.series_id == series.id), time_min, time_max, include_cancelled
+    )
+
+    bounded = time_max is not None
+    needed_total = None if bounded else page * page_size + 1
+    virtual = scoped_virtual_occurrences([series], time_min, time_max, needed_total, settings)
+    merged = merge_occurrences(virtual, materialized_query.all(), order)
+
+    total = len(merged) if bounded else None
+    has_more = False if bounded else len(merged) > page * page_size
+    start = (page - 1) * page_size
+    return BookingSeriesOccurrencesResponse(items=merged[start:start + page_size], total=total, has_more=has_more)
 
 @router.get("/", response_model=BookingListResponse)
 def list_bookings(
@@ -133,24 +143,40 @@ def list_bookings(
     # Get booking rows that already exist in db (materialized occurrences) and get series rows that represent weekly ocurrences.
     materialized_query = db.query(Booking)
     series_query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+
+    # apply filters shared by both data types.
     if email:
         materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
         series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
-    # apply scope filters to both queries, pass to merge_ocurrences to derive real occurrences from the series rules and merge with the materialized occurrences.
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs)
-    items, total, has_more = merge_occurrences(scoped_series_query.all(), scoped_materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
+    ## time/status-scope (materialized bookings only)
+    materialized_query = apply_booking_time_status_scope(materialized_query, time_min, time_max, include_cancelled)
 
-    # Compute facet options (filter the list of filter options based on the remaining bookings)
-    facets_base = materialized_query
-    if not include_cancelled:
-        facets_base = facets_base.filter(Booking.status == "confirmed")
-    if time_min is not None:
-        facets_base = facets_base.filter(Booking.start >= time_min)
-    if time_max is not None:
-        facets_base = facets_base.filter(Booking.start <= time_max)
-    facets = compute_timeline_facets(facets_base, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
+    # get facets: self-excluding (narrows down filter types and which tutors/event types/students are available for further filtering)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
+
+    # get actual bookings (items): full scope (no exclusion) on top of the same main-scoped queries, then generate+merge virtual with materialized
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
+    scoped_materialized_bookings = scoped_materialized_query.all()
+
+
+    ## time/status-scope (series only) - different mechanism than bookings materialized in db
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs) # first scope series
+    scoped_series = scoped_series_query.all() # execute query to get series rows.
+
+    # generate occurrence from scoped series rows
+    bounded = time_max is not None
+    needed_total = None if bounded else page * page_size + 1
+    scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, needed_total, settings)
+
+    ### Combine the above two
+    merged = merge_occurrences(scoped_virtual_bookings, scoped_materialized_query.all(), order)
+
+    #### Pagination
+    total = len(merged) if bounded else None
+    has_more = False if bounded else len(merged) > page * page_size
+    start = (page - 1) * page_size
+    items = merged[start:start + page_size]
 
     return BookingListResponse(items=items, total=total, has_more=has_more, page_size=page_size, facets=facets)
     
