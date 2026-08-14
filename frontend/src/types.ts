@@ -147,8 +147,48 @@ export interface BookingSeries {
   student_phone: string | null
   parent_email: string | null
   parent_phone: string | null
-  bookings: Booking[]
   request: BookingRequest | null
+}
+
+export interface TutorFacetOption {
+  id: number
+  first_name: string
+  last_name: string
+}
+
+export interface EventTypeFacetOption {
+  id: number
+  name: string
+}
+
+export interface StudentFacetOption {
+  first_name: string
+  last_name: string
+}
+
+export interface BookingFacets {
+  tutors: TutorFacetOption[]
+  event_types: EventTypeFacetOption[]
+  students: StudentFacetOption[]
+}
+
+export interface BookingListResponse {
+  items: Booking[]
+  total: number | null
+  has_more: boolean
+  page_size: number
+  facets: BookingFacets
+}
+
+export interface BookingSeriesListResponse {
+  items: BookingSeries[]
+  facets: BookingFacets
+}
+
+export interface BookingSeriesOccurrencesResponse {
+  items: Booking[]
+  total: number | null
+  has_more: boolean
 }
 
 export interface BookingRequest {

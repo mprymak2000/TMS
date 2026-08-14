@@ -314,7 +314,7 @@ def test_get_bookings_pending_only(client):
         created = client.post("/bookings/", json=payload).json()
         client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
     assert len(_all_bookings()) == 1  # booking still exists (not executed)
-    pending = client.get("/bookings/?pending_only=true").json()
+    pending = client.get("/bookings/?pending_only=true").json()["items"]
     assert len(pending) == 1
     assert pending[0]["request"]["type"] == "cancel_occurrence"
     assert pending[0]["request"]["status"] == "pending"
@@ -330,12 +330,12 @@ def test_pending_only_ignores_time_range_params(client):
         created = client.post("/bookings/", json=payload).json()
         client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
 
-    items = client.get("/bookings/?pending_only=true&time_min=2099-01-01T00:00:00&time_max=2000-01-01T00:00:00").json()
+    items = client.get("/bookings/?pending_only=true&time_min=2099-01-01T00:00:00&time_max=2000-01-01T00:00:00").json()["items"]
     assert len(items) == 1
     assert items[0]["request"]["type"] == "cancel_occurrence"
 
 
-def test_pending_only_has_more_and_page_size_headers(client):
+def test_pending_only_has_more_and_page_size(client):
     tutor, event_type = setup_strict_notice(client)
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         for i in range(3):
@@ -349,14 +349,14 @@ def test_pending_only_has_more_and_page_size_headers(client):
             created = client.post("/bookings/", json=payload).json()
             client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
 
-    page1 = client.get("/bookings/?pending_only=true&page=1&page_size=2")
-    assert page1.headers["x-has-more"] == "true"
-    assert page1.headers["x-page-size"] == "2"
-    assert len(page1.json()) == 2
+    page1 = client.get("/bookings/?pending_only=true&page=1&page_size=2").json()
+    assert page1["has_more"] is True
+    assert page1["page_size"] == 2
+    assert len(page1["items"]) == 2
 
-    page2 = client.get("/bookings/?pending_only=true&page=2&page_size=2")
-    assert page2.headers["x-has-more"] == "false"
-    assert len(page2.json()) == 1
+    page2 = client.get("/bookings/?pending_only=true&page=2&page_size=2").json()
+    assert page2["has_more"] is False
+    assert len(page2["items"]) == 1
 
 
 def test_my_bookings_include_cancelled(client):
@@ -368,10 +368,10 @@ def test_my_bookings_include_cancelled(client):
         created = client.post("/bookings/", json=payload).json()
         client.delete(f"/bookings/{created['id']}")
 
-    default_items = client.get(f"/bookings/?email={created['student_email']}").json()
+    default_items = client.get(f"/bookings/?email={created['student_email']}").json()["items"]
     assert created["id"] not in [i["id"] for i in default_items]
 
-    all_items = client.get(f"/bookings/?email={created['student_email']}&include_cancelled=true").json()
+    all_items = client.get(f"/bookings/?email={created['student_email']}&include_cancelled=true").json()["items"]
     assert created["id"] in [i["id"] for i in all_items]
 
 
@@ -662,7 +662,7 @@ def test_my_bookings_upcoming_merges_real_and_virtual(client):
 
     response = client.get(f"/bookings/?email={created['student_email']}&time_min=2099-01-01T00:00:00&page=1")
     assert response.status_code == 200
-    items = response.json()
+    items = response.json()["items"]
     assert len(items) >= 2  # occurrence 1 (real) + at least one virtual occurrence
     assert items[0]["id"] == created["id"]  # sorted chronologically, real occurrence 1 comes first
     starts = [i["start"] for i in items]
@@ -677,7 +677,7 @@ def test_my_bookings_upcoming_excludes_other_customers(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
         client.post("/bookings/", json=other_payload)
-    items = client.get("/bookings/?email=someone-else@example.com&time_min=2099-01-01T00:00:00").json()
+    items = client.get("/bookings/?email=someone-else@example.com&time_min=2099-01-01T00:00:00").json()["items"]
     assert len(items) == 1
     assert items[0]["student_email"] == "someone-else@example.com"
 
@@ -691,7 +691,7 @@ def test_my_bookings_no_email_shows_everyone(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
         client.post("/bookings/", json=other_payload)
-    items = client.get("/bookings/?time_min=2099-01-01T00:00:00").json()
+    items = client.get("/bookings/?time_min=2099-01-01T00:00:00").json()["items"]
     emails = {i["student_email"] for i in items}
     assert "alex@example.com" in emails
     assert "someone-else@example.com" in emails
@@ -708,12 +708,12 @@ def test_my_bookings_tutor_ids_filters_scope(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
-    items = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&time_min=2099-01-01T00:00:00").json()
+    items = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&time_min=2099-01-01T00:00:00").json()["items"]
     assert len(items) == 1
     assert items[0]["tutor_id"] == tutor_a["id"]
 
     # multi-value: both tutors requested at once returns both bookings
-    items = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&tutor_ids={tutor_b['id']}&time_min=2099-01-01T00:00:00").json()
+    items = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&tutor_ids={tutor_b['id']}&time_min=2099-01-01T00:00:00").json()["items"]
     assert {i["tutor_id"] for i in items} == {tutor_a["id"], tutor_b["id"]}
 
 
@@ -727,11 +727,11 @@ def test_my_bookings_event_type_ids_filters_scope(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
         client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
-    items = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&time_min=2099-01-01T00:00:00").json()
+    items = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&time_min=2099-01-01T00:00:00").json()["items"]
     assert len(items) == 1
     assert items[0]["event_type_id"] == event_type_a["id"]
 
-    items = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&event_type_ids={event_type_b['id']}&time_min=2099-01-01T00:00:00").json()
+    items = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&event_type_ids={event_type_b['id']}&time_min=2099-01-01T00:00:00").json()["items"]
     assert {i["event_type_id"] for i in items} == {event_type_a["id"], event_type_b["id"]}
 
 
@@ -751,8 +751,8 @@ def test_my_bookings_past(client):
     db.close()
 
     now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    upcoming = client.get(f"/bookings/?email={created['student_email']}&time_min={now_iso}").json()
-    past = client.get(f"/bookings/?email={created['student_email']}&time_max={now_iso}").json()
+    upcoming = client.get(f"/bookings/?email={created['student_email']}&time_min={now_iso}").json()["items"]
+    past = client.get(f"/bookings/?email={created['student_email']}&time_max={now_iso}").json()["items"]
     assert created["id"] not in [i["id"] for i in upcoming]
     assert created["id"] in [i["id"] for i in past]
 
@@ -782,7 +782,7 @@ def test_my_bookings_no_bounds_returns_since_inception(client):
     db.commit()
     db.close()
 
-    items = client.get(f"/bookings/?email={created['student_email']}").json()
+    items = client.get(f"/bookings/?email={created['student_email']}").json()["items"]
     assert items[0]["start"] < "2021-01-01"  # earliest item comes from 2020, not "now" (~2026)
 
 
@@ -794,7 +794,7 @@ def test_my_bookings_time_max_stops_virtual_generation(client):
         created = client.post("/bookings/", json=payload).json()
 
     # weekly occurrences land on 06-10 (real), 06-17, 06-24, 07-01, ... — time_max cuts off after 06-24
-    items = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-06-24T23:59:59").json()
+    items = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-06-24T23:59:59").json()["items"]
     assert len(items) == 3
     assert items[-1]["start"].startswith("2099-06-24")
 
@@ -812,15 +812,15 @@ def test_my_bookings_bounded_range_paginates_with_total_count(client):
 
     # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE
     base = f"/bookings/?email={created['student_email']}&time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59&page_size={PAGE_SIZE}"
-    page1 = client.get(f"{base}&page=1")
-    assert page1.headers["x-total-count"] == "12"
-    items1 = page1.json()
+    page1 = client.get(f"{base}&page=1").json()
+    assert page1["total"] == 12
+    items1 = page1["items"]
     assert len(items1) == PAGE_SIZE
     assert items1[0]["start"].startswith("2099-06-10")
 
-    page2 = client.get(f"{base}&page=2")
-    assert page2.headers["x-total-count"] == "12"
-    items2 = page2.json()
+    page2 = client.get(f"{base}&page=2").json()
+    assert page2["total"] == 12
+    items2 = page2["items"]
     assert len(items2) == 12 - PAGE_SIZE
     assert items2[-1]["start"].startswith("2099-08-26")
 
@@ -836,9 +836,9 @@ def test_my_bookings_time_max_only_still_gets_total_count(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size={PAGE_SIZE}")
-    assert response.headers["x-total-count"] == "12"
-    assert len(response.json()) == PAGE_SIZE
+    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size={PAGE_SIZE}").json()
+    assert response["total"] == 12
+    assert len(response["items"]) == PAGE_SIZE
 
 
 def test_my_bookings_default_page_size_returns_all_in_one_page(client):
@@ -849,10 +849,10 @@ def test_my_bookings_default_page_size_returns_all_in_one_page(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1")
-    assert response.headers["x-total-count"] == "12"
-    assert response.headers["x-page-size"] == str(DEFAULT_PAGE_SIZE)
-    assert len(response.json()) == 12
+    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1").json()
+    assert response["total"] == 12
+    assert response["page_size"] == DEFAULT_PAGE_SIZE
+    assert len(response["items"]) == 12
 
 
 def test_my_bookings_page_size_rejects_out_of_range(client):
@@ -860,16 +860,16 @@ def test_my_bookings_page_size_rejects_out_of_range(client):
     assert client.get("/bookings/?page_size=501").status_code == 422
 
 
-def test_my_bookings_unbounded_has_no_total_count_header(client):
-    """Unbounded queries (plain Upcoming/Past) never compute a total — X-Total-Count is only
-    meaningful, and only present, for a genuinely bounded range."""
+def test_my_bookings_unbounded_has_no_total(client):
+    """Unbounded queries (plain Upcoming/Past) never compute a total — only meaningful for a
+    genuinely bounded range."""
     tutor, event_type = setup_standalone(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
 
-    response = client.get("/bookings/?time_min=2099-01-01T00:00:00")
-    assert "x-total-count" not in response.headers
+    response = client.get("/bookings/?time_min=2099-01-01T00:00:00").json()
+    assert response["total"] is None
 
 
 def test_my_bookings_time_min_narrows_real_rows(client):
@@ -882,7 +882,7 @@ def test_my_bookings_time_min_narrows_real_rows(client):
         early = client.post("/bookings/", json=early_payload).json()
         late = client.post("/bookings/", json=late_payload).json()
 
-    items = client.get(f"/bookings/?email={early['student_email']}&time_min=2099-07-01T00:00:00").json()
+    items = client.get(f"/bookings/?email={early['student_email']}&time_min=2099-07-01T00:00:00").json()["items"]
     ids = [i["id"] for i in items]
     assert early["id"] not in ids
     assert late["id"] in ids
@@ -917,7 +917,7 @@ def test_my_bookings_order_desc_paginates_from_most_recent(client):
     db.close()
 
     now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    items = client.get(f"/bookings/?time_max={now_iso}&order=desc&page=1&page_size={PAGE_SIZE}").json()
+    items = client.get(f"/bookings/?time_max={now_iso}&order=desc&page=1&page_size={PAGE_SIZE}").json()["items"]
     assert len(items) == PAGE_SIZE
     assert items[0]["start"].startswith("2020-01-15")  # most recent of the 15, comes first
     assert items[-1]["start"].startswith(f"2020-01-{16 - PAGE_SIZE:02d}")  # PAGE_SIZE-th most recent
@@ -941,7 +941,7 @@ def test_virtual_occurrences_anchored_to_start_date_not_earliest_booking(client)
     db.close()
     assert _all_bookings() == []  # no real rows left for this series at all
 
-    items = client.get(f"/bookings/?email={created['student_email']}").json()
+    items = client.get(f"/bookings/?email={created['student_email']}").json()["items"]
     assert len(items) > 0
     assert items[0]["start"].startswith("2099-06-10")  # still anchored correctly, purely virtual now
 
@@ -960,7 +960,7 @@ def test_rescheduled_occurrence_not_double_counted(client):
         reschedule_body = {**reschedule_payload, "tutor_id": tutor["id"], "start": "2099-06-18T16:00:00", "end": "2099-06-18T17:30:00"}
         rescheduled = client.post(f"/bookings/{ref}/reschedule", json=reschedule_body).json()
 
-        items = client.get(f"/bookings/?email={created['student_email']}&time_min=2099-01-01T00:00:00").json()
+        items = client.get(f"/bookings/?email={created['student_email']}&time_min=2099-01-01T00:00:00").json()["items"]
 
     starts = [i["start"] for i in items]
     ids = [i["id"] for i in items]
@@ -1285,7 +1285,7 @@ def test_get_booking_series_lists_active_series(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    series_list = client.get("/bookings/booking-series").json()
+    series_list = client.get("/bookings/booking-series").json()["items"]
     assert len(series_list) == 1
     assert series_list[0]["id"] == created["series_id"]
 
@@ -1296,7 +1296,7 @@ def test_get_booking_series_excludes_standalone(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
 
-    assert client.get("/bookings/booking-series").json() == []
+    assert client.get("/bookings/booking-series").json()["items"] == []
 
 
 def test_get_booking_series_excludes_cancelled_series(client):
@@ -1306,7 +1306,7 @@ def test_get_booking_series_excludes_cancelled_series(client):
         created = client.post("/bookings/", json=payload).json()
         client.delete(f"/bookings/booking-series/{created['series_id']}")
 
-    assert client.get("/bookings/booking-series").json() == []
+    assert client.get("/bookings/booking-series").json()["items"] == []
 
 
 def test_get_booking_series_email_filter(client):
@@ -1318,7 +1318,7 @@ def test_get_booking_series_email_filter(client):
         client.post("/bookings/", json=payload)
         client.post("/bookings/", json=other_payload)
 
-    items = client.get("/bookings/booking-series?email=someone-else@example.com").json()
+    items = client.get("/bookings/booking-series?email=someone-else@example.com").json()["items"]
     assert len(items) == 1
     assert items[0]["student_email"] == "someone-else@example.com"
 
@@ -1334,12 +1334,12 @@ def test_get_booking_series_tutor_ids_filters_scope(client):
         created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
         created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}).json()
 
-    items = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}").json()
+    items = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}").json()["items"]
     assert len(items) == 1
     assert items[0]["id"] == created_a["series_id"]
 
     # multi-value: both tutors requested at once returns both series
-    items = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}&tutor_ids={tutor_b['id']}").json()
+    items = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}&tutor_ids={tutor_b['id']}").json()["items"]
     assert {i["id"] for i in items} == {created_a["series_id"], created_b["series_id"]}
 
 
@@ -1354,11 +1354,11 @@ def test_get_booking_series_event_type_ids_filters_scope(client):
         created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
         created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}).json()
 
-    items = client.get(f"/bookings/booking-series?event_type_ids={event_type_a['id']}").json()
+    items = client.get(f"/bookings/booking-series?event_type_ids={event_type_a['id']}").json()["items"]
     assert len(items) == 1
     assert items[0]["id"] == created_a["series_id"]
 
-    items = client.get(f"/bookings/booking-series?event_type_ids={event_type_a['id']}&event_type_ids={event_type_b['id']}").json()
+    items = client.get(f"/bookings/booking-series?event_type_ids={event_type_a['id']}&event_type_ids={event_type_b['id']}").json()["items"]
     assert {i["id"] for i in items} == {created_a["series_id"], created_b["series_id"]}
 
 
@@ -1370,7 +1370,7 @@ def test_booking_series_occurrences_upcoming_merges_real_and_virtual(client):
 
     response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-01-01T00:00:00&page=1")
     assert response.status_code == 200
-    items = response.json()
+    items = response.json()["items"]
     assert len(items) >= 2  # occurrence 1 (real) + at least one virtual occurrence
     assert items[0]["id"] == created["id"]
     starts = [i["start"] for i in items]
@@ -1407,8 +1407,8 @@ def test_booking_series_occurrences_past(client):
     db.close()
 
     now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    upcoming = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min={now_iso}").json()
-    past = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max={now_iso}").json()
+    upcoming = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min={now_iso}").json()["items"]
+    past = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max={now_iso}").json()["items"]
     assert created["id"] not in [i["id"] for i in upcoming]
     assert created["id"] in [i["id"] for i in past]
 
@@ -1427,7 +1427,7 @@ def test_booking_series_occurrences_excludes_other_series(client):
         created = client.post("/bookings/", json=payload).json()
         other_created = client.post("/bookings/", json=other_payload).json()
 
-    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-01-01T00:00:00").json()
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-01-01T00:00:00").json()["items"]
     ids = [i["id"] for i in items]
     assert created["id"] in ids
     assert other_created["id"] not in ids
@@ -1446,7 +1446,7 @@ def test_booking_series_occurrences_no_bounds_returns_since_inception(client):
     db.commit()
     db.close()
 
-    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences").json()
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences").json()["items"]
     assert items[0]["start"] < "2021-01-01"
 
 
@@ -1456,21 +1456,21 @@ def test_booking_series_occurrences_time_max_stops_virtual_generation(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max=2099-06-24T23:59:59").json()
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_max=2099-06-24T23:59:59").json()["items"]
     assert len(items) == 3
     assert items[-1]["start"].startswith("2099-06-24")
 
 
-def test_booking_series_occurrences_bounded_range_sets_total_count_header(client):
+def test_booking_series_occurrences_bounded_range_returns_total(client):
     tutor, event_type = setup_recurring(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
     # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE (10)
-    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59")
-    assert response.headers["x-total-count"] == "12"
-    assert len(response.json()) == 10
+    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59").json()
+    assert response["total"] == 12
+    assert len(response["items"]) == 10
 
 
 def test_booking_series_occurrences_time_min_narrows(client):
@@ -1480,8 +1480,122 @@ def test_booking_series_occurrences_time_min_narrows(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-15T00:00:00").json()
+    items = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-15T00:00:00").json()["items"]
     ids = [i["id"] for i in items]
     starts = [i["start"] for i in items]
     assert created["id"] not in ids  # occurrence 1 (06-10) excluded, before time_min
     assert any(s.startswith("2099-06-17") for s in starts)  # occurrence 2 included
+
+
+# ── FACETS ────────────────────────────────────────────────────────────────────
+
+def test_list_bookings_facets_self_exclusion(client):
+    """Selecting Tutor A must not remove Tutor B from facets.tutors (self-exclusion) — but
+    should narrow facets.event_types/facets.students down to only what A actually has."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_standalone, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"], "student_first": "Alice", "student_last": "Smith"})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "student_first": "Bob", "student_last": "Jones", "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+
+    body = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&time_min=2099-01-01T00:00:00").json()
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_ids_in_facets == {tutor_a["id"], tutor_b["id"]}  # self-exclusion: both still shown
+
+    event_type_ids_in_facets = {e["id"] for e in body["facets"]["event_types"]}
+    assert event_type_ids_in_facets == {event_type_a["id"]}  # narrowed by tutor_ids
+
+    students_in_facets = {(s["first_name"], s["last_name"]) for s in body["facets"]["students"]}
+    assert students_in_facets == {("Alice", "Smith")}
+
+
+def test_list_bookings_student_filter_exact_pair_match(client):
+    """tuple_ matching must not cross-match — filtering for John Smith must not also return
+    a different John (Doe), even though they share a first name."""
+    tutor, event_type = setup_standalone(client)
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"], "student_first": "John", "student_last": "Smith"})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"], "student_first": "John", "student_last": "Doe", "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+
+    items = client.get("/bookings/?student=John%7CSmith&time_min=2099-01-01T00:00:00").json()["items"]
+    assert len(items) == 1
+    assert items[0]["student_first"] == "John"
+    assert items[0]["student_last"] == "Smith"
+
+
+def test_list_bookings_facets_exclude_options_with_no_matches_in_window(client):
+    """A tutor whose only booking falls outside the queried time window must not appear in
+    facets.tutors — facets reflect the current query scope, not the whole business."""
+    tutor_in, availability_in = make_tutor_with_schedule(client)
+    tutor_out = client.post("/tutors/", json={**tutor_payload, "last_name": "Outside"}).json()
+    schedule_out = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_out["id"]}).json()
+    availability_out = [{"tutor_id": tutor_out["id"], "schedule_id": schedule_out["id"]}]
+    event_type_in = client.post("/event_types/", json={**event_type_standalone, "availability": availability_in}).json()
+    event_type_out = client.post("/event_types/", json={**event_type_standalone, "name": "Outside ET", "availability": availability_out}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_in["id"], "event_type_id": event_type_in["id"]})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_out["id"], "event_type_id": event_type_out["id"], "start": "2099-12-25T16:00:00", "end": "2099-12-25T17:00:00"})
+
+    body = client.get("/bookings/?time_min=2099-01-01T00:00:00&time_max=2099-08-01T00:00:00").json()
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_ids_in_facets == {tutor_in["id"]}
+
+
+def test_pending_only_facets_self_exclusion(client):
+    """Requests-tab facets follow the same self-exclusion rule as the main list."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_strict_notice, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_strict_notice, "name": "Strict B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
+        client.post(f"/bookings/manage-occurrence/{created_a['id']}/cancel")
+        created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"}).json()
+        client.post(f"/bookings/manage-occurrence/{created_b['id']}/cancel")
+
+    body = client.get(f"/bookings/?pending_only=true&tutor_ids={tutor_a['id']}").json()
+    assert len(body["items"]) == 1
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_ids_in_facets == {tutor_a["id"], tutor_b["id"]}  # self-exclusion
+
+
+def test_get_booking_series_facets_self_exclusion(client):
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_recurring, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_recurring, "name": "Tutoring B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"})
+
+    body = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}").json()
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_ids_in_facets == {tutor_a["id"], tutor_b["id"]}  # self-exclusion
+    event_type_ids_in_facets = {e["id"] for e in body["facets"]["event_types"]}
+    assert event_type_ids_in_facets == {event_type_a["id"]}
+
+
+def test_get_booking_series_facets_exclude_cancelled_series(client):
+    """A cancelled series must not contribute to facets, same as it's already excluded from items."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_recurring, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_recurring, "name": "Tutoring B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
+        created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"}).json()
+        client.delete(f"/bookings/booking-series/{created_b['series_id']}")
+
+    body = client.get("/bookings/booking-series").json()
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_ids_in_facets == {tutor_a["id"]}

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import resolve_ref, merge_occurrences
+from booking_utils import apply_scope_filters, compute_series_facets, compute_timeline_facets, resolve_ref, merge_occurrences
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -22,9 +22,12 @@ from policy import (
 )
 from schemas import (
     BookingCreate,
+    BookingListResponse,
     BookingRequestResponse,
     BookingReschedule,
     BookingResponse,
+    BookingSeriesListResponse,
+    BookingSeriesOccurrencesResponse,
     BookingSeriesResponse,
     BookingUpdate,
 )
@@ -37,36 +40,34 @@ DEFAULT_PAGE_SIZE = 250  # GET /bookings/'s default page_size, overridable by ca
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
 
-@router.get("/booking-series", response_model=list[BookingSeriesResponse])
+@router.get("/booking-series", response_model=BookingSeriesListResponse)
 def get_booking_series(
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
     event_type_ids: list[int] = Query(default=[]),
+    student: list[str] = Query(default=[]),
+    settings=Depends(get_settings),
     db: Session = Depends(get_db),
 ):
-    """Bare series list — no embedded occurrences. Expanding a series row on the frontend
-    calls GET /booking-series/{id}/occurrences separately, the same way GET / does it
-    internally — one shared resolution path (merge_occurrences) for all occurrence reads,
-    regardless of whether the caller wants everyone's occurrences or just one series'."""
-    query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+    """Filtered series list with facets, no embedded occurrences. Occurrences are fetched
+    separately via GET /booking-series/{id}/occurrences."""
+    student_pairs = [tuple(s.split("|", 1)) for s in student] # split string "john|doe" into tuple (john, doe)
+
+    base_query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
     if email:
-        query = query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
-    if tutor_ids:
-        query = query.filter(BookingSeries.tutor_id.in_(tutor_ids))
-    if event_type_ids:
-        query = query.filter(BookingSeries.event_type_id.in_(event_type_ids))
-    results = []
-    for series in query.all():
-        response = BookingSeriesResponse.model_validate(series)
-        response.bookings = []  # unused here — occurrences are always fetched separately, paginated
-        results.append(response)
-    return results
+        base_query = base_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
+    results = [
+        BookingSeriesResponse.model_validate(series)
+        for series in apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs).all()
+    ]
 
-@router.get("/booking-series/{id}/occurrences", response_model=list[BookingResponse])
+    facets = compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, db)
+    return BookingSeriesListResponse(items=results, facets=facets)
+
+@router.get("/booking-series/{id}/occurrences", response_model=BookingSeriesOccurrencesResponse)
 def get_booking_series_occurrences(
     id: str,
-    response: Response,
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
     include_cancelled: bool = Query(default=False),
@@ -76,9 +77,7 @@ def get_booking_series_occurrences(
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
-    """Returns a paginated list of all occurrences (materialized + virtual) for a given series.
-    page_size defaults to PAGE_SIZE (10) but callers can request a smaller/larger page — same
-    page_size override pattern as GET /bookings/ (list_bookings)."""
+    """Paginated list of all occurrences (materialized + virtual) for a given series."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
@@ -87,17 +86,15 @@ def get_booking_series_occurrences(
         raise HTTPException(status_code=404, detail="Booking series not found")
 
     materialized_query = db.query(Booking).filter(Booking.series_id == series.id) # materialized occurrences only part of a series
-    items, total = merge_occurrences([series], materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
-    if total is not None:
-        response.headers["X-Total-Count"] = str(total)
-    return items
+    items, total, has_more = merge_occurrences([series], materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
+    return BookingSeriesOccurrencesResponse(items=items, total=total, has_more=has_more)
 
-@router.get("/", response_model=list[BookingResponse])
+@router.get("/", response_model=BookingListResponse)
 def list_bookings(
-    response: Response,
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
     event_type_ids: list[int] = Query(default=[]),
+    student: list[str] = Query(default=[]),
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
     include_cancelled: bool = Query(default=False),
@@ -113,46 +110,50 @@ def list_bookings(
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
+    student_pairs = [tuple(s.split("|", 1)) for s in student]
+
+    # branch on pending
     if pending_only:
         # a virtual occurrence can never have a pending BookingRequest (nothing to request
         # approval on for a row that doesn't exist yet) — real rows only, no virtual merge.
-        query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
+        base_query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
         if email:
-            query = query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        if tutor_ids:
-            query = query.filter(Booking.tutor_id.in_(tutor_ids))
-        if event_type_ids:
-            query = query.filter(Booking.event_type_id.in_(event_type_ids))
-        rows = query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
-        response.headers["X-Has-More"] = str(len(rows) > page_size).lower()
-        response.headers["X-Page-Size"] = str(page_size)
-        return rows[:page_size]
+            base_query = base_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, event_type_ids, student_pairs)
+        booking_rows = scoped_query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
+        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no time_min/time_max for pending-only request
+        return BookingListResponse(
+            items=[BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]],
+            total=None, # not meaningful for pending-only request
+            has_more=len(booking_rows) > page_size,
+            page_size=page_size,
+            facets=facets,
+        )
 
-    # Get booking rows that already exist in db (materialized occurrences). Filter if needed.
+    # Get booking rows that already exist in db (materialized occurrences) and get series rows that represent weekly ocurrences.
     materialized_query = db.query(Booking)
-    if email:
-        materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-    if tutor_ids:
-        materialized_query = materialized_query.filter(Booking.tutor_id.in_(tutor_ids))
-    if event_type_ids:
-        materialized_query = materialized_query.filter(Booking.event_type_id.in_(event_type_ids))
-
-    # Get series rows in db (BookingSeries - rules). Filter if needed.
     series_query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
     if email:
+        materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
         series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
-    if tutor_ids:
-        series_query = series_query.filter(BookingSeries.tutor_id.in_(tutor_ids))
-    if event_type_ids:
-        series_query = series_query.filter(BookingSeries.event_type_id.in_(event_type_ids))
 
-    # Merge materialized + resolved virtual occurrences across all series, then paginate the combined list.
-    items, total = merge_occurrences(series_query.all(), materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
-    # pass the total count of occurrences as header in the response, so frontend can handle pagination
-    if total is not None:
-        response.headers["X-Total-Count"] = str(total)
-    response.headers["X-Page-Size"] = str(page_size)
-    return items
+    # apply scope filters to both queries, pass to merge_ocurrences to derive real occurrences from the series rules and merge with the materialized occurrences.
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs)
+    items, total, has_more = merge_occurrences(scoped_series_query.all(), scoped_materialized_query, time_min, time_max, page, page_size, settings, include_cancelled, order)
+
+    # Compute facet options (filter the list of filter options based on the remaining bookings)
+    facets_base = materialized_query
+    if not include_cancelled:
+        facets_base = facets_base.filter(Booking.status == "confirmed")
+    if time_min is not None:
+        facets_base = facets_base.filter(Booking.start >= time_min)
+    if time_max is not None:
+        facets_base = facets_base.filter(Booking.start <= time_max)
+    facets = compute_timeline_facets(facets_base, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
+
+    return BookingListResponse(items=items, total=total, has_more=has_more, page_size=page_size, facets=facets)
+    
 
 
 @router.get("/{ref}", response_model=BookingResponse)

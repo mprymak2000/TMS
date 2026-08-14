@@ -271,7 +271,7 @@ def apply_scope_filters(query, model, tutor_ids, event_type_ids, student_pairs, 
 
 
 def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
-    """Given a set of scope parameters, return the corresponding facet options for the respective fi."""    
+    """Given a set of scope parameters, return the corresponding filter/facet options for the respective fields."""    
     tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all() if tutor_ids else []
     event_types = db.query(EventType).filter(EventType.id.in_(event_type_ids)).all() if event_type_ids else []
 
@@ -281,7 +281,6 @@ def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
     event_type_options = [EventTypeFacetOption(id=e.id, name=e.name) for e in event_types]
     event_type_options.sort(key=lambda e: e.name.lower())
 
-
     student_options = [StudentFacetOption(first_name=first, last_name=last) for first, last in student_pairs]
     student_options.sort(key=lambda s: (s.first_name.lower(), s.last_name.lower()))
 
@@ -289,7 +288,7 @@ def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
 
 
 def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db):
-    """ Given scope parameters, attach them to the base query and fire it as many times as there are facets, while keeping one facet type unfiltered at a time. Do this for regualar Bookings and BookingSeries. Return the unique set of facet options for each facet type. """
+    """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. Return the unique set of facet options for each facet type. """
 
     # Deplicate query and apply scope filters, while excluding one filter at a time 
     tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
@@ -303,7 +302,6 @@ def compute_timeline_facets(materialized_base_query, series_base_query, tutor_id
         # the 3 outter queries are series which aren't dated. By calling _virtual_occurrences we can check for actual, scheduled ocurrences within the requested time range (if it's in the future, past is handled by standard Booking model above). If any exist, we add the corresponding facet to the set. This is done for each facet type.
         series_no_tutor = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="tutor").all()
         for series in series_no_tutor:
-            # if actual 
             if _virtual_occurrences(series, time_min, time_max, 1, settings):
                 tutor_id_set.add(series.tutor_id)
         series_no_event_type = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="event_type").all()
@@ -319,7 +317,7 @@ def compute_timeline_facets(materialized_base_query, series_base_query, tutor_id
 
 
 def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, db):
-    """ Given scope parameters, attach them to the base query for SERIES (not individual ocurrences) and fire it as many times as there are facets, while keeping one facet type unfiltered at a time. Return the unique set of facet options for each facet type. """
+    """ Given scope parameters, attach them to the base query for SERIES (not individual ocurrences) and ficlean upre it as many times as there are facets, while keeping one facet type unfiltered at a time. Return the unique set of facet options for each facet type. """
 
     tutor_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(BookingSeries.tutor_id).distinct().all()}
@@ -331,3 +329,8 @@ def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, 
     student_pair_set = set(student_query.with_entities(BookingSeries.student_first, BookingSeries.student_last).distinct().all())
 
     return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
+    
+
+# Once a guest/contact id exists on Booking/BookingSeries, student matching should switch from
+# (student_first, student_last) pairs to that id — same shape as tutor_id/event_type_id already
+# use, dropping the pair/tuple_ special-casing throughout this file.

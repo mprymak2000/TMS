@@ -18,7 +18,6 @@ app.add_middleware(
     allow_origin_regex=r"http://192\.168\.\d+\.\d+:\d+",
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Total-Count", "X-Has-More", "X-Page-Size"],
 )
 
 app.include_router(settings.router)

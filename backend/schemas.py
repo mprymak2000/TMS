@@ -488,8 +488,6 @@ class BookingSeriesResponse(BaseModel):
     parent_phone: str | None = None
     request: BookingRequestResponse | None = None
 
-    bookings: list[BookingResponse]
-
 
 def _convert_to_utc(dt: datetime, tz_str: str) -> datetime:
     if dt.tzinfo is None:
@@ -604,3 +602,10 @@ class BookingListResponse(BaseModel):
 class BookingSeriesListResponse(BaseModel):
     items: list[BookingSeriesResponse]
     facets: BookingFacets
+
+
+class BookingSeriesOccurrencesResponse(BaseModel):
+    """Unbounded (no time_max) occurrence list — has_more, not total; see GET /bookings/ pagination note in CLAUDE.md."""
+    items: list[BookingResponse]
+    total: int | None
+    has_more: bool
