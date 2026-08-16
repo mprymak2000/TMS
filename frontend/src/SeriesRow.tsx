@@ -238,10 +238,10 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                 onError(extractError(await res.json(), 'Failed to load occurrences.'))
                 return
             }
-            const items: Booking[] = await res.json()
-            setOccurrences(prev => append ? [...prev, ...items] : items)
+            const body = await res.json()
+            setOccurrences(prev => append ? [...prev, ...body.items] : body.items)
             setPage(pageNum)
-            setHasMore(items.length === fitColumns)
+            setHasMore(body.has_more)
             setLoaded(true)
         } catch (error) {
             console.error(error)

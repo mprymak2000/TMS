@@ -161,6 +161,7 @@ export interface EventTypeFacetOption {
   name: string
 }
 
+// todo: this will be a guestID identifier in the future
 export interface StudentFacetOption {
   first_name: string
   last_name: string

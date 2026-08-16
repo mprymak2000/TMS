@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { TextInput, Loader, Input, Button, Modal, Popover, Switch } from '@mantine/core'
 import { IconSearch, IconCalendar, IconX, IconChevronDown, IconChevronLeft, IconChevronRight, IconSortAscending, IconSortDescending, IconRepeat } from '@tabler/icons-react'
-import type { Tutor, EventType, Booking, BookingSeries } from './types'
+import type { Tutor, EventType, Booking, BookingSeries, TutorFacetOption, EventTypeFacetOption, StudentFacetOption } from './types'
 import { extractError, formatDate, formatTime, tutorBubbleClass, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
 import { useToast } from './useToast'
 import BookingRow from './BookingRow'
@@ -12,6 +12,7 @@ import Toast from './Toast'
 interface BookingFilters {
     tutorIds: string[]
     eventTypeIds: string[]
+    students: string[]
     dateFrom: string | null
     dateTo: string | null
     searchQuery: string
@@ -24,13 +25,8 @@ interface LoadErrors {
     eventTypes?: string
 }
 
-// Two independent axes, not one flat list: which VIEW (row shape/interaction model — flat
-// occurrence feed vs. series-grouped-with-manage vs. pending-decisions) is the outer tab,
-// since it changes the whole interaction paradigm; TIME SCOPE is just a filter within a view,
-// so it's an inner toggle instead — Requests has no time scope at all (nothing to filter).
 type BookingsTab = 'timeline' | 'recurring' | 'requests'
-type TimeScope = 'day' | 'week' | 'month' | 'range'
-type FetchResult = { ok: true; items: Booking[]; hasMore: boolean; total: number | null; pageSize: number } | { ok: false; error: any }
+type Granularity = 'day' | 'week' | 'month'
 
 const TABS = [
     { key: 'timeline', label: 'Schedule' },
@@ -52,7 +48,7 @@ const dateLabelOf = (iso: string) => new Date(iso).toLocaleDateString('en-US', {
 
 // Day/Week/Month bounds for the API call — always both ends, so always bounded (real
 // X-Total-Count + PageNav, never the unbounded Load-More fallback).
-const periodBounds = (scope: 'day' | 'week' | 'month', anchor: Date): { dateFrom: string; dateTo: string } => {
+const periodBounds = (scope: Granularity, anchor: Date): { dateFrom: string; dateTo: string } => {
     if (scope === 'day') { const s = toLocalDateStr(anchor); return { dateFrom: s, dateTo: s } }
     if (scope === 'week') { const start = startOfWeek(anchor); return { dateFrom: toLocalDateStr(start), dateTo: toLocalDateStr(addDays(start, 6)) } }
     return { dateFrom: toLocalDateStr(startOfMonth(anchor)), dateTo: toLocalDateStr(endOfMonth(anchor)) }
@@ -61,7 +57,7 @@ const periodBounds = (scope: 'day' | 'week' | 'month', anchor: Date): { dateFrom
 const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const MONTH_LONG = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
 
-const periodLabel = (scope: 'day' | 'week' | 'month', anchor: Date): string => {
+const periodLabel = (scope: Granularity, anchor: Date): string => {
     if (scope === 'day') return anchor.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })
     if (scope === 'month') return `${MONTH_LONG[anchor.getMonth()]} ${anchor.getFullYear()}`
     const start = startOfWeek(anchor)
@@ -82,28 +78,6 @@ const formatGap = (minutes: number): string => {
     if (hours === 0) return `${mins}m`
     if (mins === 0) return `${hours}h`
     return `${hours}h ${mins}m`
-}
-
-const fetchMyBookings = async (tab: 'timeline' | 'requests', timeMin: string | undefined, timeMax: string | undefined, order: 'asc' | 'desc', pageNum: number, pageSize: number | undefined, tutorIds: string[], eventTypeIds: string[], includeCancelled: boolean, emailFilter?: string): Promise<FetchResult> => {
-    const base = `${import.meta.env.VITE_API_URL}/bookings/`
-    const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
-    const pendingParam = tab === 'requests' ? `&pending_only=true` : ''
-    const timeMinParam = timeMin ? `&time_min=${timeMin}` : ''
-    const timeMaxParam = timeMax ? `&time_max=${timeMax}` : ''
-    const orderParam = `&order=${order}`
-    const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
-    const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
-    const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
-    const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
-
-    const res = await fetch(`${base}?page=${pageNum}${pageSizeParam}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${includeCancelledParam}${emailParam}`)
-    if (!res.ok) { return { ok: false, error: await res.json() } }
-    const items = (await res.json()) as Booking[]
-    const totalHeader = res.headers.get('x-total-count')
-    const total = totalHeader !== null ? Number(totalHeader) : null
-    const hasMore = res.headers.get('x-has-more') === 'true'
-    const usedPageSize = Number(res.headers.get('x-page-size'))
-    return { ok: true, items, hasMore, total, pageSize: usedPageSize }
 }
 
 const DateRangeInputs = ({
@@ -163,7 +137,8 @@ const OrderToggle = ({ order, onToggle }: { order: 'asc' | 'desc'; onToggle: () 
 // segmented control. Date Range is a different kind of thing (an arbitrary, manually-picked
 // window) — set apart with real spacing and its own bordered/pill styling.
 const ScopeSwitcher = ({
-    timeScope,
+    granularity,
+    isRangeMode,
     periodAnchor,
     dateFrom,
     dateTo,
@@ -175,11 +150,12 @@ const ScopeSwitcher = ({
     onDateToChange,
     leftContent,
 }: {
-    timeScope: TimeScope
+    granularity: Granularity
+    isRangeMode: boolean
     periodAnchor: Date
     dateFrom: string | null
     dateTo: string | null
-    onScopeChange: (scope: TimeScope) => void
+    onScopeChange: (scope: Granularity) => void
     onRangeToggle: () => void
     onPeriodShift: (direction: 1 | -1) => void
     onToday: () => void
@@ -199,7 +175,7 @@ const ScopeSwitcher = ({
             </div>
 
             <div className="min-w-[220px] flex items-center justify-center gap-2">
-                {timeScope !== 'range' && (
+                {!isRangeMode && (
                     <>
                         <button onClick={onToday} className="px-3 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors text-xs font-semibold shrink-0">
                             Today
@@ -208,12 +184,12 @@ const ScopeSwitcher = ({
                             <IconChevronLeft size={15} />
                         </button>
                         <span
-                            key={`${timeScope}-${dateFrom}-${dateTo}`}
+                            key={`${granularity}-${dateFrom}-${dateTo}`}
                             className={`block text-sm font-semibold text-gray-800 whitespace-nowrap text-center ${
                                 slideDirection === 1 ? 'animate-[slide-in-right_0.35s_ease-out]' : 'animate-[slide-in-left_0.35s_ease-out]'
                             }`}
                         >
-                            {periodLabel(timeScope, periodAnchor)}
+                            {periodLabel(granularity, periodAnchor)}
                         </span>
                         <button onClick={() => shift(1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
                             <IconChevronRight size={15} />
@@ -225,7 +201,7 @@ const ScopeSwitcher = ({
             <div className="flex-1 flex items-center justify-end gap-3 min-w-0">
                 {/* Day/Week/Month pills and the date inputs occupy the same slot — Date Range
                     swaps one for the other rather than the two coexisting. */}
-                {timeScope === 'range' ? (
+                {isRangeMode ? (
                     <DateRangeInputs dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={onDateFromChange} onDateToChange={onDateToChange} />
                 ) : (
                     <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 h-9 w-fit shrink-0">
@@ -234,7 +210,7 @@ const ScopeSwitcher = ({
                                 key={scope}
                                 onClick={() => onScopeChange(scope)}
                                 className={`h-full px-3.5 rounded-md text-sm font-medium transition-colors ${
-                                    timeScope === scope ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                                    granularity === scope ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'
                                 }`}
                             >
                                 {scope === 'day' ? 'Day' : scope === 'week' ? 'Week' : 'Month'}
@@ -246,7 +222,7 @@ const ScopeSwitcher = ({
                 <button
                     onClick={onRangeToggle}
                     className={`flex items-center gap-1.5 px-3.5 h-9 rounded-lg text-sm font-medium border transition-colors shrink-0 ${
-                        timeScope === 'range'
+                        isRangeMode
                             ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
                             : 'border-gray-200 text-gray-500 hover:text-gray-700 hover:border-gray-300'
                     }`}
@@ -314,23 +290,27 @@ const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }
 const ActiveFilterChips = ({
     tutorIds,
     eventTypeIds,
+    students,
     tutors,
     eventTypes,
     includeCancelled,
     onTutorRemove,
     onEventTypeRemove,
+    onStudentRemove,
     onIncludeCancelledRemove,
 }: {
     tutorIds: string[]
     eventTypeIds: string[]
+    students: string[]
     tutors: Tutor[]
     eventTypes: EventType[]
     includeCancelled: boolean
     onTutorRemove: (id: string) => void
     onEventTypeRemove: (id: string) => void
+    onStudentRemove: (value: string) => void
     onIncludeCancelledRemove: () => void
 }) => {
-    if (tutorIds.length === 0 && eventTypeIds.length === 0 && includeCancelled) return null
+    if (tutorIds.length === 0 && eventTypeIds.length === 0 && students.length === 0 && includeCancelled) return null
     return (
         <div className="flex flex-wrap gap-2 mt-3">
             {tutorIds.map(id => (
@@ -347,6 +327,13 @@ const ActiveFilterChips = ({
                     onRemove={() => onEventTypeRemove(id)}
                 />
             ))}
+            {students.map(pair => (
+                <FilterChip
+                    key={`student-${pair}`}
+                    label={`Student: ${pair.replace('|', ' ')}`}
+                    onRemove={() => onStudentRemove(pair)}
+                />
+            ))}
             {!includeCancelled && (
                 <FilterChip label="Hide cancelled" onRemove={onIncludeCancelledRemove} />
             )}
@@ -357,6 +344,17 @@ const ActiveFilterChips = ({
 interface FilterOption {
     value: string
     label: string
+}
+
+// A facet's own selection is never excluded from itself (self-exclusion), but OTHER active
+// filters/time-window still narrow it — so a checked value can legitimately drop out of a fresh
+// facets response. Keep it visible/removable anyway by falling back to fallbackLabel for
+// whatever's currently selected but missing from the fresh list, rather than letting a checked
+// option silently vanish from its own checklist.
+const withSelectionKept = (fresh: FilterOption[], selected: string[], fallbackLabel: (value: string) => string): FilterOption[] => {
+    const freshValues = new Set(fresh.map(o => o.value))
+    const missing = selected.filter(v => !freshValues.has(v)).map(v => ({ value: v, label: fallbackLabel(v) }))
+    return [...fresh, ...missing]
 }
 
 // One expandable row inside the Filters menu — clicking it expands/collapses its own option
@@ -414,6 +412,9 @@ const FiltersMenu = ({
     eventTypeOptions,
     eventTypeSelected,
     onEventTypeToggle,
+    studentOptions,
+    studentSelected,
+    onStudentToggle,
     includeCancelled,
     onIncludeCancelledToggle,
 }: {
@@ -423,17 +424,30 @@ const FiltersMenu = ({
     eventTypeOptions: FilterOption[]
     eventTypeSelected: string[]
     onEventTypeToggle: (value: string) => void
+    studentOptions: FilterOption[]
+    studentSelected: string[]
+    onStudentToggle: (value: string) => void
     includeCancelled: boolean
     onIncludeCancelledToggle: () => void
 }) => {
     const [opened, setOpened] = useState(false)
-    const [expandedSection, setExpandedSection] = useState<'tutors' | 'eventTypes' | null>(null)
-    const activeCount = tutorSelected.length + eventTypeSelected.length + (includeCancelled ? 0 : 1)
+    // Independent toggles, not a single-open accordion — expanding Students shouldn't collapse
+    // Tutors if it's already open.
+    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'eventTypes' | 'students'>>(new Set())
+    const toggleSection = (key: 'tutors' | 'eventTypes' | 'students') => {
+        setExpandedSections(prev => {
+            const next = new Set(prev)
+            if (next.has(key)) next.delete(key)
+            else next.add(key)
+            return next
+        })
+    }
+    const activeCount = tutorSelected.length + eventTypeSelected.length + studentSelected.length + (includeCancelled ? 0 : 1)
 
     return (
         <Popover
             opened={opened}
-            onChange={(v) => { setOpened(v); if (!v) setExpandedSection(null) }}
+            onChange={(v) => { setOpened(v); if (!v) setExpandedSections(new Set()) }}
             position="bottom-start"
             shadow="md"
             width={240}
@@ -454,8 +468,8 @@ const FiltersMenu = ({
                     label="Tutors"
                     options={tutorOptions}
                     selected={tutorSelected}
-                    expanded={expandedSection === 'tutors'}
-                    onToggleExpand={() => setExpandedSection(s => s === 'tutors' ? null : 'tutors')}
+                    expanded={expandedSections.has('tutors')}
+                    onToggleExpand={() => toggleSection('tutors')}
                     onToggleOption={onTutorToggle}
                 />
                 <div className="border-t border-gray-100" />
@@ -463,9 +477,18 @@ const FiltersMenu = ({
                     label="Event types"
                     options={eventTypeOptions}
                     selected={eventTypeSelected}
-                    expanded={expandedSection === 'eventTypes'}
-                    onToggleExpand={() => setExpandedSection(s => s === 'eventTypes' ? null : 'eventTypes')}
+                    expanded={expandedSections.has('eventTypes')}
+                    onToggleExpand={() => toggleSection('eventTypes')}
                     onToggleOption={onEventTypeToggle}
+                />
+                <div className="border-t border-gray-100" />
+                <FilterAccordionSection
+                    label="Students"
+                    options={studentOptions}
+                    selected={studentSelected}
+                    expanded={expandedSections.has('students')}
+                    onToggleExpand={() => toggleSection('students')}
+                    onToggleOption={onStudentToggle}
                 />
                 <div className="border-t border-gray-100" />
                 <button
@@ -544,23 +567,25 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [bookings, setBookings] = useState<Booking[]>([])
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [eventTypes, setEventTypes] = useState<EventType[]>([])
+    const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
+    const [eventTypeFacetOptions, setEventTypeFacetOptions] = useState<EventTypeFacetOption[]>([])
+    const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
+    // outter tab state — timeline, recurring, requests
     const [activeTab, setActiveTab] = useState<BookingsTab>('timeline')
-    const [timeScope, setTimeScope] = useState<TimeScope>('week')
-    // Remembers which granularity was active before switching into Range mode, so clicking
-    // "Date Range" a second time (toggling off) restores exactly where the user was, not a
-    // fixed default.
-    const [lastGranularity, setLastGranularity] = useState<'day' | 'week' | 'month'>('week')
-    // Anchor date driving Day/Week/Month bounds — preserved across granularity switches (Day ->
-    // Month lands on the month containing the day you were on, not "today's" month), only reset
-    // to now by handleToday or on tab entry.
+    // Granularity and range mode scope timeline tab. Independent axes — range mode is a toggle layered on top,
+    // never overwrites which granularity was last active, so turning it off always restores exactly where the user was
+    const [granularity, setGranularity] = useState<Granularity>('week')
+    const [isRangeMode, setIsRangeMode] = useState(false)
+    // Anchor date for Day/Week/Month bounds, preserved across granularity switches (Day ->
+    // Month lands on the month containing the day you were on, not "today's" month). handleToday() resets to now.
     const [periodAnchor, setPeriodAnchor] = useState<Date>(() => new Date())
-    // Display order — a within-session browsing preference only, not persisted across reloads
-    // (a fresh page load always starts chronological/ascending, regardless of what was last set).
+    // Client side display order, does not influence backend fetch order (load more still gets future dates, despite them now being on the bottom)
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>(() => ({
-        tutorIds: [], eventTypeIds: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], eventTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
         ...periodBounds('week', new Date()),
     }))
+    
     const [expandedId, setExpandedId] = useState<string | null>(null)
     const [cancellingSeriesId, setCancellingSeriesId] = useState<string | null>(null)
     const [isCancelling, setIsCancelling] = useState(false)
@@ -586,6 +611,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
     const [isLoadingSeries, setIsLoadingSeries] = useState(false)
 
+    // Resolution roster — session-scoped, loaded once, never touched by filters/dates/tabs.
+    const [isLoadingRoster, setIsLoadingRoster] = useState(false)
+
     const getSearchString = (b: Booking) => {
         const tutor = tutors.find(t => t.id === b.tutor_id)
         const eventType = eventTypes.find(e => e.id === b.event_type_id)
@@ -609,67 +637,104 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         ].filter(Boolean).join(' ').toLowerCase()
     }
 
-    const loadData = async ({
-        emailFilter,
-        tab = activeTab === 'requests' ? 'requests' : 'timeline',
-        scope = timeScope,
-        dateFrom = filters.dateFrom,
-        dateTo = filters.dateTo,
-        tutorIds = filters.tutorIds,
-        eventTypeIds = filters.eventTypeIds,
-        includeCancelled = filters.includeCancelled,
-        pageNum = 1,
-        append = false,
-    }: {
-        emailFilter?: string
-        tab?: 'timeline' | 'requests'
-        scope?: TimeScope
-        dateFrom?: string | null
-        dateTo?: string | null
-        tutorIds?: string[]
-        eventTypeIds?: string[]
-        includeCancelled?: boolean
-        pageNum?: number
-        append?: boolean
-    } = {}) => {
-        // Every Timeline scope (Day/Week/Month/Range) is bounded now — dateFrom/dateTo fully
-        // determine the window, no scope branching needed here anymore.
-        const timeMin = dateFrom ? `${dateFrom}T00:00:00` : undefined
-        const timeMax = dateTo ? `${dateTo}T23:59:59` : undefined
-        // Canonical fetch order for a bounded page — `order` (state) only controls the client-side
-        // display sort of the already-fetched page (see displayed's .sort()), same as it always did.
-        const fetchOrder = 'asc'
-        // Day/Week/Month omit page_size — backend default applies. Range/Requests override it.
-        const pageSize = tab === 'requests' || scope === 'range' ? PAGE_SIZE : undefined
-        if (append) setIsLoadingMore(true)
-        else setIsLoading(true)
+    const loadRoster = async () => {
+        setIsLoadingRoster(true)
         try {
-            const [bookingsRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetchMyBookings(tab, timeMin, timeMax, fetchOrder, pageNum, pageSize, tutorIds, eventTypeIds, includeCancelled, emailFilter),
+            const [tutorResponse, eventTypeResponse] = await Promise.all([
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/event_types`),
             ])
-            if (!bookingsRes.ok) {
-                setLoadErrors(prev => ({ ...prev, bookings: extractError(bookingsRes.error, 'Failed to load bookings.') }))
-                return
-            }
-            if (!tutorsRes.ok) {
-                const err = await tutorsRes.json()
+            if (!tutorResponse.ok) {
+                const err = await tutorResponse.json()
                 setLoadErrors(prev => ({ ...prev, tutors: extractError(err, 'Failed to load tutors.') }))
                 return
             }
-            if (!eventTypesRes.ok) {
-                const err = await eventTypesRes.json()
+            if (!eventTypeResponse.ok) {
+                const err = await eventTypeResponse.json()
                 setLoadErrors(prev => ({ ...prev, eventTypes: extractError(err, 'Failed to load event types.') }))
                 return
             }
-            setBookings(prev => append ? [...prev, ...bookingsRes.items] : bookingsRes.items)
-            setTutors(await tutorsRes.json())
-            setEventTypes(await eventTypesRes.json())
+            setTutors(await tutorResponse.json())
+            setEventTypes(await eventTypeResponse.json())
+        } catch (error) {
+            console.error(error)
+            setLoadErrors(prev => ({
+                ...prev,
+                tutors: 'An unknown error occurred while loading tutors.',
+                eventTypes: 'An unknown error occurred while loading event types.'
+            }))
+        } finally {
+            setIsLoadingRoster(false)
+        }
+    }
+
+    const loadBookings = async ({
+        tutorIds = filters.tutorIds,
+        eventTypeIds = filters.eventTypeIds,
+        students = filters.students,
+        tab = activeTab === 'requests' ? 'requests' : 'timeline',
+        dateFrom = filters.dateFrom,
+        dateTo = filters.dateTo,
+        includeCancelled = filters.includeCancelled,
+        isRange = isRangeMode,
+        emailFilter,
+        pageNum = 1,
+        append = false,
+    }: {
+        tutorIds?: string[]
+        eventTypeIds?: string[]
+        students?: string[]
+        tab?: 'timeline' | 'requests'
+        dateFrom?: string | null
+        dateTo?: string | null
+        includeCancelled?: boolean
+        isRange?: boolean
+        emailFilter?: string
+        pageNum?: number
+        append?: boolean
+    } = {}) => {
+        const timeMin = dateFrom ? `${dateFrom}T00:00:00` : undefined
+        const timeMax = dateTo ? `${dateTo}T23:59:59` : undefined
+        // Canonical order in which data is fetched from backend for a bounded page
+        // `order` (state) only controls the client-side display sort of the already-fetched page
+        const fetchOrder = 'asc'
+        // Day/Week/Month omit page_size — backend default applies. Range/Requests override it.
+        const pageSize = tab === 'requests' || isRange ? PAGE_SIZE : undefined
+        // can be loading on mount or be called to load more data from backend and append... set correct loading state
+        if (append) setIsLoadingMore(true)
+        else setIsLoading(true)
+        try {
+            const base = `${import.meta.env.VITE_API_URL}/bookings/`
+            const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
+            const pendingParam = tab === 'requests' ? `&pending_only=true` : ''
+            const timeMinParam = timeMin ? `&time_min=${timeMin}` : ''
+            const timeMaxParam = timeMax ? `&time_max=${timeMax}` : ''
+            const orderParam = `&order=${fetchOrder}`
+            const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
+            const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
+            const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
+            const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
+            const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
+            
+            const response = await fetch(`${base}?page=${pageNum}${pageSizeParam}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${studentParams}${includeCancelledParam}${emailParam}`)
+            if (!response.ok) {
+                const err = await response.json()
+                setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load bookings.') }))
+                return
+            }
+            const body = await response.json()
+            // data
+            setBookings(prev => append ? [...prev, ...body.items] : body.items)
+            // filter options
+            setTutorFacetOptions(body.facets.tutors)
+            setEventTypeFacetOptions(body.facets.event_types)
+            setStudentFacetOptions(body.facets.students)
+            // pagination
             setPage(pageNum)
-            setHasMore(bookingsRes.hasMore)
-            setTotal(bookingsRes.total)
-            setPageSizeUsed(bookingsRes.pageSize)
+            setHasMore(body.has_more)
+            setTotal(body.total)
+            setPageSizeUsed(body.page_size)
+            // error state cleared on success
             setLoadErrors({})
         } catch (error) {
             console.error(error)
@@ -680,38 +745,36 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         }
     }
 
-    const loadSeries = async (emailFilter?: string, tutorIds: string[] = filters.tutorIds, eventTypeIds: string[] = filters.eventTypeIds) => {
+    const loadBookingSeries = async ({
+        tutorIds = filters.tutorIds,
+        eventTypeIds = filters.eventTypeIds,
+        students = filters.students,
+        emailFilter,
+    }: {
+        tutorIds?: string[]
+        eventTypeIds?: string[]
+        students?: string[]
+        emailFilter?: string
+    } = {}) => {
         setIsLoadingSeries(true)
         try {
-            const params = [
-                emailFilter ? `email=${encodeURIComponent(emailFilter)}` : null,
-                ...tutorIds.map(id => `tutor_ids=${id}`),
-                ...eventTypeIds.map(id => `event_type_ids=${id}`),
-            ].filter(Boolean)
-            const query = params.length ? `?${params.join('&')}` : ''
-            const [seriesRes, tutorsRes, eventTypesRes] = await Promise.all([
-                fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series${query}`),
-                fetch(`${import.meta.env.VITE_API_URL}/tutors`),
-                fetch(`${import.meta.env.VITE_API_URL}/event_types`),
-            ])
-            if (!seriesRes.ok) {
-                const err = await seriesRes.json()
+            const base = `${import.meta.env.VITE_API_URL}/bookings/booking-series`
+            const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
+            const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
+            const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
+            const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
+
+            const response = await fetch(`${base}?${emailParam}${tutorParams}${eventTypeParams}${studentParams}`)
+            if (!response.ok) {
+                const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load series.') }))
                 return
             }
-            if (!tutorsRes.ok) {
-                const err = await tutorsRes.json()
-                setLoadErrors(prev => ({ ...prev, tutors: extractError(err, 'Failed to load tutors.') }))
-                return
-            }
-            if (!eventTypesRes.ok) {
-                const err = await eventTypesRes.json()
-                setLoadErrors(prev => ({ ...prev, eventTypes: extractError(err, 'Failed to load event types.') }))
-                return
-            }
-            setSeriesList(await seriesRes.json())
-            setTutors(await tutorsRes.json())
-            setEventTypes(await eventTypesRes.json())
+            const body = await response.json()
+            setSeriesList(body.items)
+            setTutorFacetOptions(body.facets.tutors)
+            setEventTypeFacetOptions(body.facets.event_types)
+            setStudentFacetOptions(body.facets.students)
             setLoadErrors({})
         } catch (error) {
             console.error(error)
@@ -722,14 +785,17 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     }
 
     useEffect(() => {
-        if (!isCustomer) { loadData({ tab: 'timeline' }); return }
+        // Top-level load every subtab depends on — fires independently, no need to await it.
+        loadRoster()
+        if (!isCustomer) { loadBookings({ tab: 'timeline' }); return }
         const saved = sessionStorage.getItem('customer_email')
-        if (saved) loadData({ emailFilter: saved, tab: 'timeline' })
+        if (saved) loadBookings({ emailFilter: saved, tab: 'timeline' })
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
     const refresh = () => {
-        if (activeTab === 'recurring') loadSeries(isCustomer ? email : undefined)
-        else loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline' })
+        if (activeTab === 'recurring') loadBookingSeries({ emailFilter: isCustomer ? email : undefined })
+        else loadBookings({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline' })
     }
 
     // Search/Tutors/Event-types/Show-cancelled are scoped to whichever tab you're looking at —
@@ -739,52 +805,58 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // day/week/month/range you had.
     const handleTabChange = (tab: BookingsTab) => {
         setActiveTab(tab)
-        setFilters(f => ({ ...f, tutorIds: [], eventTypeIds: [], searchQuery: '', includeCancelled: true }))
-        if (tab === 'recurring') loadSeries(isCustomer ? email : undefined, [], [])
-        else loadData({ emailFilter: isCustomer ? email : undefined, tab, tutorIds: [], eventTypeIds: [], includeCancelled: true })
+        setFilters(f => ({ ...f, tutorIds: [], eventTypeIds: [], students: [], searchQuery: '', includeCancelled: true }))
+        if (tab === 'recurring') loadBookingSeries({ emailFilter: isCustomer ? email : undefined, tutorIds: [], eventTypeIds: [], students: [] })
+        else loadBookings({ emailFilter: isCustomer ? email : undefined, tab, tutorIds: [], eventTypeIds: [], students: [], includeCancelled: true })
     }
 
-    const handleScopeChange = (scope: TimeScope) => {
-        setTimeScope(scope)
-        if (scope === 'range') {
-            // entering range mode — nothing to fetch until at least one date is picked
+    // Only ever changes granularity — never touches range mode (the day/week/month pills aren't
+    // even rendered while isRangeMode is true, see ScopeSwitcher), so no early-return branch and
+    // no "which mode am I in" check needed here.
+    const handleScopeChange = (scope: Granularity) => {
+        setGranularity(scope)
+        // Reuses the current anchor (not "now") — switching Day -> Month while looking at a
+        // specific day lands on that day's month, not the current month.
+        const bounds = periodBounds(scope, periodAnchor)
+        setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+    }
+
+    // Toggle: entering range mode just clears the date inputs (nothing to fetch until one is
+    // picked) — granularity is left completely untouched, so leaving range mode always restores
+    // exactly where the user was without needing a separate "remembered" state.
+    const handleRangeToggle = () => {
+        const next = !isRangeMode
+        setIsRangeMode(next)
+        if (next) {
             setFilters(f => ({ ...f, dateFrom: null, dateTo: null }))
             setBookings([])
             setHasMore(false)
             setTotal(null)
             return
         }
-        setLastGranularity(scope)
-        // Reuses the current anchor (not "now") — switching Day -> Month while looking at a
-        // specific day lands on that day's month, not the current month.
-        const bounds = periodBounds(scope, periodAnchor)
+        // isRangeMode passed explicitly — setIsRangeMode above hasn't taken effect in this closure yet
+        const bounds = periodBounds(granularity, periodAnchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        // scope passed explicitly — setTimeScope above hasn't taken effect in this closure yet
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', scope, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
-    // Toggle: Date Range button switches into range mode; clicking it again while already in
-    // range mode restores whichever granularity (day/week/month) was active before.
-    const handleRangeToggle = () => handleScopeChange(timeScope === 'range' ? lastGranularity : 'range')
-
     const handlePeriodShift = (direction: 1 | -1) => {
-        const scope = timeScope as 'day' | 'week' | 'month' // only invoked when timeScope !== 'range'
-        const nextAnchor = scope === 'day' ? addDays(periodAnchor, direction)
-            : scope === 'week' ? addDays(periodAnchor, direction * 7)
+        const nextAnchor = granularity === 'day' ? addDays(periodAnchor, direction)
+            : granularity === 'week' ? addDays(periodAnchor, direction * 7)
             : new Date(periodAnchor.getFullYear(), periodAnchor.getMonth() + direction, 1)
         setPeriodAnchor(nextAnchor)
-        const bounds = periodBounds(scope, nextAnchor)
+        const bounds = periodBounds(granularity, nextAnchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
     const handleToday = () => {
         const anchor = new Date()
-        const scope = timeScope as 'day' | 'week' | 'month'
         setPeriodAnchor(anchor)
-        const bounds = periodBounds(scope, anchor)
+        const bounds = periodBounds(granularity, anchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
     const handleDateFromChange = (value: string | null) => {
@@ -794,14 +866,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         const dateTo = value && filters.dateTo && value > filters.dateTo ? null : filters.dateTo
         setFilters(f => ({ ...f, dateFrom: value, dateTo }))
         if (!value && !dateTo) {
-            // Both dates cleared — loadData would otherwise treat this as "no bound on either
+            // Both dates cleared — loadBookings would otherwise treat this as "no bound on either
             // side" and fetch everything. Nothing should show until a date is picked again.
             setBookings([])
             setHasMore(false)
             setTotal(null)
             return
         }
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: value, dateTo })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: value, dateTo })
     }
 
     const handleDateToChange = (value: string | null) => {
@@ -816,32 +888,39 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             setTotal(null)
             return
         }
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateTo: value })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateTo: value })
+    }
+
+    const handleStudentFilterToggle = (value: string) => {
+        const next = filters.students.includes(value) ? filters.students.filter(x => x !== value) : [...filters.students, value]
+        setFilters(f => ({ ...f, students: next }))
+        if (activeTab === 'recurring') { loadBookingSeries({ emailFilter: isCustomer ? email : undefined, students: next }); return }
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', students: next })
     }
 
     // Pure display flip — displayed() re-sorts fully every render, so no refetch needed.
     const handleOrderToggle = () => setOrder(o => o === 'asc' ? 'desc' : 'asc')
 
-    const handleLoadMore = () => loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum: page + 1, append: true })
+    const handleLoadMore = () => loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum: page + 1, append: true })
 
     // Bounded range only (total is non-null) — jumps replace the page rather than appending,
     // since each page is a distinct slice of an already-fully-known set, not an incremental extension.
-    const handlePageJump = (pageNum: number) => loadData({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum, append: false })
+    const handlePageJump = (pageNum: number) => loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum, append: false })
 
     // Server-side filters now (not client-side) — same reasoning as time range: filtering an
     // already-paginated set client-side can silently hide real matches sitting on unfetched pages.
     const handleTutorFilterToggle = (id: string) => {
         const next = filters.tutorIds.includes(id) ? filters.tutorIds.filter(x => x !== id) : [...filters.tutorIds, id]
         setFilters(f => ({ ...f, tutorIds: next }))
-        if (activeTab === 'recurring') { loadSeries(isCustomer ? email : undefined, next, filters.eventTypeIds); return }
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', tutorIds: next })
+        if (activeTab === 'recurring') { loadBookingSeries({ emailFilter: isCustomer ? email : undefined, tutorIds: next }); return }
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', tutorIds: next })
     }
 
     const handleEventTypeFilterToggle = (id: string) => {
         const next = filters.eventTypeIds.includes(id) ? filters.eventTypeIds.filter(x => x !== id) : [...filters.eventTypeIds, id]
         setFilters(f => ({ ...f, eventTypeIds: next }))
-        if (activeTab === 'recurring') { loadSeries(isCustomer ? email : undefined, filters.tutorIds, next); return }
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', eventTypeIds: next })
+        if (activeTab === 'recurring') { loadBookingSeries({ emailFilter: isCustomer ? email : undefined, eventTypeIds: next }); return }
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', eventTypeIds: next })
     }
 
     // Recurring tab doesn't refetch here — BookingSeries rows carry no status of their own;
@@ -851,14 +930,15 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         const next = !filters.includeCancelled
         setFilters(f => ({ ...f, includeCancelled: next }))
         if (activeTab === 'recurring') return
-        loadData({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', includeCancelled: next })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: activeTab === 'requests' ? 'requests' : 'timeline', includeCancelled: next })
     }
 
     const handleEmailSubmit = () => {
         if (!email.trim()) return
         sessionStorage.setItem('customer_email', email.trim())
         setSubmitted(true)
-        loadData({ emailFilter: email.trim(), tab: 'timeline' })
+        loadRoster()
+        loadBookings({ emailFilter: email.trim(), tab: 'timeline' })
     }
 
     const handleCancelSeries = async (seriesId: string) => {
@@ -922,7 +1002,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         // is load-bearing there (not just cosmetic re-display like it is for Timeline).
         .sort((a, b) => order === 'desc' ? b.start.localeCompare(a.start) : a.start.localeCompare(b.start))
 
-    // Tutor/event-type narrowing happens server-side via loadSeries (see get_booking_series) —
+    // Tutor/event-type narrowing happens server-side via loadBookingSeries (see get_booking_series) —
     // search is the only genuinely client-side filter, same convention as `displayed` above.
     const displayedSeries = seriesList
         .filter(s => getSeriesSearchString(s).includes(filters.searchQuery.trim().toLowerCase()))
@@ -1032,8 +1112,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
                     {activeTab === 'recurring' ? (
                         <>
-                            {isLoadingSeries && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
-                            {!isLoadingSeries && (
+                            {(isLoadingSeries || isLoadingRoster) && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
+                            {!isLoadingSeries && !isLoadingRoster && (
                                 <RecurringList
                                     seriesByDay={orderedSeriesByDay}
                                     tutors={tutors}
@@ -1060,7 +1140,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                 Order toggle lives in its left zone (no search/filters for customers). */}
                             <div className="mb-4">
                                 <ScopeSwitcher
-                                    timeScope={timeScope}
+                                    granularity={granularity}
+                                    isRangeMode={isRangeMode}
                                     periodAnchor={periodAnchor}
                                     dateFrom={filters.dateFrom}
                                     dateTo={filters.dateTo}
@@ -1074,9 +1155,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                 />
                             </div>
 
-                            {isLoading && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
+                            {(isLoading || isLoadingRoster) && <div className="flex justify-center py-16"><Loader size="sm" /></div>}
 
-                            {!isLoading && (
+                            {!isLoading && !isLoadingRoster && (
                                 <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
                                     {displayed.length > 0 ? (
                                         <div>
@@ -1124,12 +1205,12 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                 <IconCalendar size={22} className="text-gray-400" />
                                             </div>
                                             <p className="text-sm font-medium text-gray-500">
-                                                {timeScope === 'range' && !filters.dateFrom && !filters.dateTo ? 'Pick a date range' : 'No bookings found'}
+                                                {isRangeMode && !filters.dateFrom && !filters.dateTo ? 'Pick a date range' : 'No bookings found'}
                                             </p>
                                             <p className="text-xs text-gray-400 mt-1">
-                                                {timeScope === 'range'
+                                                {isRangeMode
                                                     ? (!filters.dateFrom && !filters.dateTo ? 'Choose a start and end date above.' : 'No sessions in this range.')
-                                                    : `No sessions this ${timeScope}.`}
+                                                    : `No sessions this ${granularity}.`}
                                             </p>
                                         </div>
                                     )}
@@ -1183,7 +1264,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             {activeTab === 'timeline' && (
                 <div className="mb-5">
                     <ScopeSwitcher
-                        timeScope={timeScope}
+                        granularity={granularity}
+                        isRangeMode={isRangeMode}
                         periodAnchor={periodAnchor}
                         dateFrom={filters.dateFrom}
                         dateTo={filters.dateTo}
@@ -1207,12 +1289,27 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     size="sm"
                                 />
                                 <FiltersMenu
-                                    tutorOptions={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                                    tutorOptions={withSelectionKept(
+                                        tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` })),
+                                        filters.tutorIds,
+                                        id => { const t = tutors.find(t => String(t.id) === id); return t ? `${t.first_name} ${t.last_name}` : id }
+                                    )}
                                     tutorSelected={filters.tutorIds}
                                     onTutorToggle={handleTutorFilterToggle}
-                                    eventTypeOptions={eventTypes.map(e => ({ value: String(e.id), label: e.name }))}
+                                    eventTypeOptions={withSelectionKept(
+                                        eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name })),
+                                        filters.eventTypeIds,
+                                        id => eventTypes.find(e => String(e.id) === id)?.name ?? id
+                                    )}
                                     eventTypeSelected={filters.eventTypeIds}
                                     onEventTypeToggle={handleEventTypeFilterToggle}
+                                    studentOptions={withSelectionKept(
+                                        studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` })),
+                                        filters.students,
+                                        value => value.replace('|', ' ')
+                                    )}
+                                    studentSelected={filters.students}
+                                    onStudentToggle={handleStudentFilterToggle}
                                     includeCancelled={filters.includeCancelled}
                                     onIncludeCancelledToggle={handleIncludeCancelledToggle}
                                 />
@@ -1225,11 +1322,13 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     <ActiveFilterChips
                         tutorIds={filters.tutorIds}
                         eventTypeIds={filters.eventTypeIds}
+                        students={filters.students}
                         tutors={tutors}
                         eventTypes={eventTypes}
                         includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onEventTypeRemove={handleEventTypeFilterToggle}
+                        onStudentRemove={handleStudentFilterToggle}
                         onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
                 </div>
@@ -1253,15 +1352,31 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             size="sm"
                         />
                         <FiltersMenu
-                            tutorOptions={tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                            tutorOptions={withSelectionKept(
+                                tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` })),
+                                filters.tutorIds,
+                                id => { const t = tutors.find(t => String(t.id) === id); return t ? `${t.first_name} ${t.last_name}` : id }
+                            )}
                             tutorSelected={filters.tutorIds}
                             onTutorToggle={handleTutorFilterToggle}
-                            // A BookingSeries only ever exists for a recurring=true event type — a
-                            // non-recurring option here could never match anything on this tab.
-                            eventTypeOptions={(activeTab === 'recurring' ? eventTypes.filter(e => e.recurring) : eventTypes)
-                                .map(e => ({ value: String(e.id), label: e.name }))}
+                            // No more manual eventTypes.filter(e => e.recurring) special-case needed —
+                            // on the Recurring tab, eventTypeFacetOptions comes from get_booking_series's
+                            // facets, which are already recurring-only by construction (a BookingSeries
+                            // only ever exists for a recurring=true event type).
+                            eventTypeOptions={withSelectionKept(
+                                eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name })),
+                                filters.eventTypeIds,
+                                id => eventTypes.find(e => String(e.id) === id)?.name ?? id
+                            )}
                             eventTypeSelected={filters.eventTypeIds}
                             onEventTypeToggle={handleEventTypeFilterToggle}
+                            studentOptions={withSelectionKept(
+                                studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` })),
+                                filters.students,
+                                value => value.replace('|', ' ')
+                            )}
+                            studentSelected={filters.students}
+                            onStudentToggle={handleStudentFilterToggle}
                             includeCancelled={filters.includeCancelled}
                             onIncludeCancelledToggle={handleIncludeCancelledToggle}
                         />
@@ -1272,21 +1387,23 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     <ActiveFilterChips
                         tutorIds={filters.tutorIds}
                         eventTypeIds={filters.eventTypeIds}
+                        students={filters.students}
                         tutors={tutors}
                         eventTypes={eventTypes}
                         includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onEventTypeRemove={handleEventTypeFilterToggle}
+                        onStudentRemove={handleStudentFilterToggle}
                         onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
                 </div>
             )}
 
             {/* spinner */}
-            {(activeTab === 'recurring' ? isLoadingSeries : isLoading) && <div className="flex justify-center py-12"><Loader size="sm" /></div>}
+            {((activeTab === 'recurring' ? isLoadingSeries : isLoading) || isLoadingRoster) && <div className="flex justify-center py-12"><Loader size="sm" /></div>}
 
             {/* requests tab */}
-            {!isLoading && activeTab === 'requests' && (
+            {!isLoading && !isLoadingRoster && activeTab === 'requests' && (
                 <div className="flex flex-col gap-3">
                     {displayed.map(b => {
                         const req = b.request!
@@ -1340,7 +1457,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             )}
 
             {/* recurring tab */}
-            {!isLoadingSeries && activeTab === 'recurring' && (
+            {!isLoadingSeries && !isLoadingRoster && activeTab === 'recurring' && (
                 <RecurringList
                     seriesByDay={orderedSeriesByDay}
                     tutors={tutors}
@@ -1414,7 +1531,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 </div>
             )}
 
-            {!isLoading && activeTab === 'requests' && total === null && hasMore && (
+            {!isLoading && !isLoadingRoster && activeTab === 'requests' && total === null && hasMore && (
                 <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
             )}
 

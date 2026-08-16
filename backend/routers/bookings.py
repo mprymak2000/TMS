@@ -169,7 +169,7 @@ def list_bookings(
     needed_total = None if bounded else page * page_size + 1
     scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, needed_total, settings)
 
-    ### Combine the above two
+    ### Combine the materialized bookings and generated occurrences from series rules
     merged = merge_occurrences(scoped_virtual_bookings, scoped_materialized_query.all(), order)
 
     #### Pagination
