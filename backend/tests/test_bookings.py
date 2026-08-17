@@ -1599,3 +1599,78 @@ def test_get_booking_series_facets_exclude_cancelled_series(client):
     body = client.get("/bookings/booking-series").json()
     tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
     assert tutor_ids_in_facets == {tutor_a["id"]}
+
+
+def test_list_bookings_facets_keep_selected_tutor_with_zero_matches(client):
+    """Selecting Tutor A must keep A in facets.tutors even if event_type filtering leaves A
+    with zero matching bookings — narrowing shouldn't make the active selection disappear."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_standalone, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+
+    body = client.get(f"/bookings/?tutor_ids={tutor_a['id']}&event_type_ids={event_type_b['id']}&time_min=2099-01-01T00:00:00").json()
+    assert body["items"] == []
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_a["id"] in tutor_ids_in_facets
+
+
+def test_list_bookings_facets_keep_selected_event_type_with_zero_matches(client):
+    """Selecting Event Type A must keep A in facets.event_types even if tutor filtering leaves
+    A with zero matching bookings."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_standalone, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+
+    body = client.get(f"/bookings/?event_type_ids={event_type_a['id']}&tutor_ids={tutor_b['id']}&time_min=2099-01-01T00:00:00").json()
+    assert body["items"] == []
+    event_type_ids_in_facets = {e["id"] for e in body["facets"]["event_types"]}
+    assert event_type_a["id"] in event_type_ids_in_facets
+
+
+def test_list_bookings_facets_keep_selected_student_with_zero_matches(client):
+    """Selecting a student must keep them in facets.students even if tutor filtering leaves
+    them with zero matching bookings."""
+    tutor_a, event_type_a = setup_standalone(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"], "student_first": "Alice", "student_last": "Smith"})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "student_first": "Bob", "student_last": "Jones", "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+
+    body = client.get(f"/bookings/?student=Alice%7CSmith&tutor_ids={tutor_b['id']}&time_min=2099-01-01T00:00:00").json()
+    assert body["items"] == []
+    students_in_facets = {(s["first_name"], s["last_name"]) for s in body["facets"]["students"]}
+    assert ("Alice", "Smith") in students_in_facets
+
+
+def test_get_booking_series_facets_keep_selected_tutor_with_zero_matches(client):
+    """Selecting Tutor A must keep A in booking-series facets.tutors even if event_type
+    filtering leaves A with zero matching series — exercises compute_series_facets' union step."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_recurring, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_recurring, "name": "Tutoring B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:30:00"})
+
+    body = client.get(f"/bookings/booking-series?tutor_ids={tutor_a['id']}&event_type_ids={event_type_b['id']}").json()
+    assert body["items"] == []
+    tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
+    assert tutor_a["id"] in tutor_ids_in_facets

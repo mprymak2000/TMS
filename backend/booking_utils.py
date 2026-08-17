@@ -123,6 +123,9 @@ def _virtual_occurrences(
      Advances one week at a time — this app's recurrence is always weekly today. If a variable
      interval is ever added to BookingSeries, this is the one place that needs to change.
      """
+    if count is None and time_max is None and series.recur_until is None:
+        raise ValueError("_virtual_occurrences: unbounded walk - series is indefinite and neither count nor time_max is set")
+
     tz = ZoneInfo(settings.business_timezone)
     existing_starts = {b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC) for b in series.bookings} # existing materialized occurrences part of series, to skip when generating virtual occurrences
 
@@ -264,28 +267,39 @@ def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
 def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db):
     """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. materialized_base_query must already be time/status-scoped by the caller. Return the unique set of facet options for each facet type. """
 
-    # Deplicate query and apply scope filters, while excluding one filter at a time
+    # get tutor options filtered by the other filters (self-exclude tutor), then query to get their ids
     tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(Booking.tutor_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
+    # get event_type options filtered by the other filters (self-exclude event_type), then query to get their ids
     event_type_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="event_type")
     event_type_id_set = {row[0] for row in event_type_query.with_entities(Booking.event_type_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
+    # get student options filtered by the other filters (self-exclude student), then query to get their first/last names (from denormalized column names on bookimg, to be changed to student identity)
     student_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="student")
     student_pair_set = set(student_query.with_entities(Booking.student_first, Booking.student_last).distinct().all()) # [('John', 'Doe'), ('Jane', 'Smith'), ...] -> {('John', 'Doe'), ('Jane', 'Smith'), ...}
 
+    # walk each series' occurrences once (not once per facet type), then filter in-memory 3 ways
     if series_base_query is not None:
-        # the 3 outter queries are series which aren't dated. By calling _virtual_occurrences we can check for actual, scheduled ocurrences within the requested time range (if it's in the future, past is handled by standard Booking model above). If any exist, we add the corresponding facet to the set. This is done for each facet type.
-        series_no_tutor = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="tutor").all()
-        for series in series_no_tutor:
-            if _virtual_occurrences(series, time_min, time_max, 1, settings):
-                tutor_id_set.add(series.tutor_id)
-        series_no_event_type = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="event_type").all()
-        for series in series_no_event_type:
-            if _virtual_occurrences(series, time_min, time_max, 1, settings):
-                event_type_id_set.add(series.event_type_id)
-        series_no_student = apply_scope_filters(series_base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="student").all()
-        for series in series_no_student:
-            if _virtual_occurrences(series, time_min, time_max, 1, settings):
-                student_pair_set.add((series.student_first, series.student_last))
+        occurrences = []
+        # unbounded (no time_max) needs a cap to terminate - count=None is only safe when time_max bounds the walk
+        count = None if time_max is not None else 1
+        for series in series_base_query.all():
+            # read each occurrence's own tutor/event_type/student rather than trusting series.* - future-proofs against occurrences that diverge from their series
+            occurrences.extend(_virtual_occurrences(series, time_min, time_max, count, settings))
+
+        for occurrence in occurrences:
+            if (not event_type_ids or occurrence.event_type_id in event_type_ids) and (not student_pairs or (occurrence.student_first, occurrence.student_last) in student_pairs):
+                tutor_id_set.add(occurrence.tutor_id)
+            if (not tutor_ids or occurrence.tutor_id in tutor_ids) and (not student_pairs or (occurrence.student_first, occurrence.student_last) in student_pairs):
+                event_type_id_set.add(occurrence.event_type_id)
+            if (not tutor_ids or occurrence.tutor_id in tutor_ids) and (not event_type_ids or occurrence.event_type_id in event_type_ids):
+                student_pair_set.add((occurrence.student_first, occurrence.student_last))
+
+    # keep a selected value visible in its own facet even if other filters/the time window narrowed it out
+    # ie tutor A selected but shifting dates yields no results. Tutor a selection still needs to be visible 
+    # so user can relax the filters and get new hits for new time range
+    tutor_id_set |= set(tutor_ids)
+    event_type_id_set |= set(event_type_ids)
+    student_pair_set |= set(student_pairs)
 
     return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
 
@@ -301,6 +315,11 @@ def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, 
 
     student_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="student")
     student_pair_set = set(student_query.with_entities(BookingSeries.student_first, BookingSeries.student_last).distinct().all())
+
+    # keep a selected value visible in its own facet even if other filters narrowed it out
+    tutor_id_set |= set(tutor_ids)
+    event_type_id_set |= set(event_type_ids)
+    student_pair_set |= set(student_pairs)
 
     return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
     

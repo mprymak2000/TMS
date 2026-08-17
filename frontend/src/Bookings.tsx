@@ -346,17 +346,6 @@ interface FilterOption {
     label: string
 }
 
-// A facet's own selection is never excluded from itself (self-exclusion), but OTHER active
-// filters/time-window still narrow it — so a checked value can legitimately drop out of a fresh
-// facets response. Keep it visible/removable anyway by falling back to fallbackLabel for
-// whatever's currently selected but missing from the fresh list, rather than letting a checked
-// option silently vanish from its own checklist.
-const withSelectionKept = (fresh: FilterOption[], selected: string[], fallbackLabel: (value: string) => string): FilterOption[] => {
-    const freshValues = new Set(fresh.map(o => o.value))
-    const missing = selected.filter(v => !freshValues.has(v)).map(v => ({ value: v, label: fallbackLabel(v) }))
-    return [...fresh, ...missing]
-}
-
 // One expandable row inside the Filters menu — clicking it expands/collapses its own option
 // list in place (accordion), rather than opening a second popover.
 const FilterAccordionSection = ({
@@ -576,6 +565,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // never overwrites which granularity was last active, so turning it off always restores exactly where the user was
     const [granularity, setGranularity] = useState<Granularity>('week')
     const [isRangeMode, setIsRangeMode] = useState(false)
+    // last range picked while in range mode, restored on re-entry instead of always starting blank
+    const [lastRangeDates, setLastRangeDates] = useState<{ dateFrom: string | null; dateTo: string | null }>({ dateFrom: null, dateTo: null })
     // Anchor date for Day/Week/Month bounds, preserved across granularity switches (Day ->
     // Month lands on the month containing the day you were on, not "today's" month). handleToday() resets to now.
     const [periodAnchor, setPeriodAnchor] = useState<Date>(() => new Date())
@@ -829,10 +820,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         const next = !isRangeMode
         setIsRangeMode(next)
         if (next) {
-            setFilters(f => ({ ...f, dateFrom: null, dateTo: null }))
-            setBookings([])
-            setHasMore(false)
-            setTotal(null)
+            setFilters(f => ({ ...f, dateFrom: lastRangeDates.dateFrom, dateTo: lastRangeDates.dateTo }))
+            if (!lastRangeDates.dateFrom && !lastRangeDates.dateTo) {
+                setBookings([])
+                setHasMore(false)
+                setTotal(null)
+                return
+            }
+            loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: true, dateFrom: lastRangeDates.dateFrom, dateTo: lastRangeDates.dateTo })
             return
         }
         // isRangeMode passed explicitly — setIsRangeMode above hasn't taken effect in this closure yet
@@ -865,6 +860,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         // most such picks in the UI itself; this covers anything that slips through).
         const dateTo = value && filters.dateTo && value > filters.dateTo ? null : filters.dateTo
         setFilters(f => ({ ...f, dateFrom: value, dateTo }))
+        setLastRangeDates({ dateFrom: value, dateTo })
         if (!value && !dateTo) {
             // Both dates cleared — loadBookings would otherwise treat this as "no bound on either
             // side" and fetch everything. Nothing should show until a date is picked again.
@@ -881,6 +877,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         // other direction; the input's min attribute is the primary guard, this is the backstop.
         if (value && filters.dateFrom && value < filters.dateFrom) return
         setFilters(f => ({ ...f, dateTo: value }))
+        setLastRangeDates(prev => ({ ...prev, dateTo: value }))
         if (!filters.dateFrom && !value) {
             // Both dates cleared — same reasoning as handleDateFromChange above.
             setBookings([])
@@ -1289,25 +1286,13 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     size="sm"
                                 />
                                 <FiltersMenu
-                                    tutorOptions={withSelectionKept(
-                                        tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` })),
-                                        filters.tutorIds,
-                                        id => { const t = tutors.find(t => String(t.id) === id); return t ? `${t.first_name} ${t.last_name}` : id }
-                                    )}
+                                    tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                                     tutorSelected={filters.tutorIds}
                                     onTutorToggle={handleTutorFilterToggle}
-                                    eventTypeOptions={withSelectionKept(
-                                        eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name })),
-                                        filters.eventTypeIds,
-                                        id => eventTypes.find(e => String(e.id) === id)?.name ?? id
-                                    )}
+                                    eventTypeOptions={eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name }))}
                                     eventTypeSelected={filters.eventTypeIds}
                                     onEventTypeToggle={handleEventTypeFilterToggle}
-                                    studentOptions={withSelectionKept(
-                                        studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` })),
-                                        filters.students,
-                                        value => value.replace('|', ' ')
-                                    )}
+                                    studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
                                     studentSelected={filters.students}
                                     onStudentToggle={handleStudentFilterToggle}
                                     includeCancelled={filters.includeCancelled}
@@ -1352,29 +1337,17 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             size="sm"
                         />
                         <FiltersMenu
-                            tutorOptions={withSelectionKept(
-                                tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` })),
-                                filters.tutorIds,
-                                id => { const t = tutors.find(t => String(t.id) === id); return t ? `${t.first_name} ${t.last_name}` : id }
-                            )}
+                            tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                             tutorSelected={filters.tutorIds}
                             onTutorToggle={handleTutorFilterToggle}
                             // No more manual eventTypes.filter(e => e.recurring) special-case needed —
                             // on the Recurring tab, eventTypeFacetOptions comes from get_booking_series's
                             // facets, which are already recurring-only by construction (a BookingSeries
                             // only ever exists for a recurring=true event type).
-                            eventTypeOptions={withSelectionKept(
-                                eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name })),
-                                filters.eventTypeIds,
-                                id => eventTypes.find(e => String(e.id) === id)?.name ?? id
-                            )}
+                            eventTypeOptions={eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name }))}
                             eventTypeSelected={filters.eventTypeIds}
                             onEventTypeToggle={handleEventTypeFilterToggle}
-                            studentOptions={withSelectionKept(
-                                studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` })),
-                                filters.students,
-                                value => value.replace('|', ' ')
-                            )}
+                            studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
                             studentSelected={filters.students}
                             onStudentToggle={handleStudentFilterToggle}
                             includeCancelled={filters.includeCancelled}
