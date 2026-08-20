@@ -11,7 +11,9 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from booking_utils import apply_booking_time_status_scope, apply_scope_filters, compute_series_facets, compute_timeline_facets, resolve_ref, merge_occurrences, scoped_virtual_occurrences
+from sqlalchemy import tuple_
+
+from booking_utils import apply_booking_time_status_scope, apply_scope_filters, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, resolve_ref, merge_occurrences, scoped_virtual_occurrences
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -22,6 +24,7 @@ from policy import (
 )
 from schemas import (
     BookingCreate,
+    BookingPagedListResponse,
     BookingListResponse,
     BookingRequestResponse,
     BookingReschedule,
@@ -57,10 +60,8 @@ def get_booking_series(
     if email:
         base_query = base_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
-    results = [
-        BookingSeriesResponse.model_validate(series)
-        for series in apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs).all()
-    ]
+    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs).all()
+    results = [BookingSeriesResponse.model_validate(series) for series in scoped_series_rows]
 
     facets = compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, db)
     return BookingSeriesListResponse(items=results, facets=facets)
@@ -92,7 +93,8 @@ def get_booking_series_occurrences(
     bounded = time_max is not None
     needed_total = None if bounded else page * page_size + 1
     virtual = scoped_virtual_occurrences([series], time_min, time_max, needed_total, settings)
-    merged = merge_occurrences(virtual, materialized_query.all(), order)
+    materialized = [BookingResponse.model_validate(b) for b in materialized_query.all()]
+    merged = merge_occurrences(virtual, materialized, order)
 
     total = len(merged) if bounded else None
     has_more = False if bounded else len(merged) > page * page_size
@@ -100,6 +102,109 @@ def get_booking_series_occurrences(
     return BookingSeriesOccurrencesResponse(items=merged[start:start + page_size], total=total, has_more=has_more)
 
 @router.get("/", response_model=BookingListResponse)
+def get_bookings(
+    email: str | None = Query(default=None), # main scope
+    tutor_ids: list[int] = Query(default=[]), # facet scope
+    event_type_ids: list[int] = Query(default=[]), # facet scope
+    student: list[str] = Query(default=[]), # facet scope
+    time_min: datetime | None = Query(default=None), # main scope - time
+    time_max: datetime | None = Query(default=None), # main scope - time
+    include_cancelled: bool = Query(default=False), # facet scope
+    order: str = Query(default="asc"), 
+    pending_only: bool = Query(default=False), # main scope - branch
+    page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    settings=Depends(get_settings),
+):
+    """docstring for get_bookings"""
+    if order not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
+
+    student_pairs = [tuple(s.split("|", 1)) for s in student]
+
+    decoded_cursor = None
+    if cursor is not None:
+        decoded_cursor = decode_cursor(cursor, tutor_ids, event_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled)
+
+    # email scope is shared by both branches below - apply it once, up front (though series gets ignored for pending-only branch)
+    materialized_query = db.query(Booking)
+    series_query = db.query(BookingSeries).filter(BookingSeries.is_active == True)
+    if email:
+        materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
+        series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
+
+    ## branch on pending-only: if true, only materialized bookings with a pending request are returned. else main branch runs
+    if pending_only:
+        base_query = materialized_query.filter(Booking.request.has(BookingRequest.status == 'pending'))
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, event_type_ids, student_pairs)
+        # seek direction and sort order must flip together based on `order` - "next page" means
+        # "after" when ascending but "before" when descending
+        booking_key = tuple_(Booking.start, Booking.public_id)
+        if decoded_cursor is not None:
+            cursor_start, cursor_public_id = decoded_cursor
+            cursor_key = tuple_(cursor_start, cursor_public_id)
+            past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
+            scoped_query = scoped_query.filter(past_cursor)
+        sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
+        booking_rows = scoped_query.order_by(*sort_cols).limit(page_size + 1).all()
+        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no time_min/time_max for pending-only request
+        items = [BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]]
+        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, event_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
+        return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
+
+    ## main branch
+    # scope materialized bookings by time, calculate facets
+    materialized_query = apply_booking_time_status_scope(materialized_query, time_min, time_max, include_cancelled)
+    facets = compute_timeline_facets(
+        materialized_query,
+        series_query,
+        tutor_ids,
+        event_type_ids,
+        student_pairs,
+        time_min,
+        time_max,
+        settings,
+        db,
+    )
+    # scope Bookings and BookingSeries by tutor_ids, event_type_ids, student_pairs, using cursor as a start point
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs)
+    # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
+    if decoded_cursor is not None:
+        cursor_start, cursor_public_id = decoded_cursor
+        booking_key = tuple_(Booking.start, Booking.public_id)
+        cursor_key = tuple_(cursor_start, cursor_public_id)
+        past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
+        scoped_materialized_query = scoped_materialized_query.filter(past_cursor)
+
+    # execute queries, generate virtual occurrences from series rules
+    scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
+    scoped_series = scoped_series_query.all()
+    scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, page_size + 1, settings, decoded_cursor)
+
+    # merge into a sorted list, take first page_size's worth, encode a cursor as a bookmark and discard the tail
+    # (the merge generates up to page_size's worth of materialized bookings and virtual occurrences generate up to 
+    # page_size's worth of virtual bookings. Generate each in parallel, merge and order, cut off the tail)
+    merged = merge_occurrences(scoped_virtual_bookings, scoped_materialized_bookings, order)
+    items = merged[:page_size]
+    next_cursor = encode_cursor(
+        items[-1].start,
+        items[-1].id,
+        tutor_ids,
+        event_type_ids,
+        student_pairs,
+        time_min,
+        time_max,
+        email,
+        pending_only,
+        include_cancelled
+    ) if len(merged) > page_size else None
+
+    return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
+
+
+@router.get("/pages", response_model=BookingPagedListResponse)
 def list_bookings(
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
@@ -132,7 +237,7 @@ def list_bookings(
         scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, event_type_ids, student_pairs)
         booking_rows = scoped_query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
         facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no time_min/time_max for pending-only request
-        return BookingListResponse(
+        return BookingPagedListResponse(
             items=[BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]],
             total=None, # not meaningful for pending-only request
             has_more=len(booking_rows) > page_size,
@@ -157,7 +262,7 @@ def list_bookings(
 
     # get actual bookings (items): full scope (no exclusion) on top of the same main-scoped queries, then generate+merge virtual with materialized
     scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
-    scoped_materialized_bookings = scoped_materialized_query.all()
+    scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
 
 
     ## time/status-scope (series only) - different mechanism than bookings materialized in db
@@ -170,7 +275,7 @@ def list_bookings(
     scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, needed_total, settings)
 
     ### Combine the materialized bookings and generated occurrences from series rules
-    merged = merge_occurrences(scoped_virtual_bookings, scoped_materialized_query.all(), order)
+    merged = merge_occurrences(scoped_virtual_bookings, scoped_materialized_bookings, order)
 
     #### Pagination
     total = len(merged) if bounded else None
@@ -178,7 +283,7 @@ def list_bookings(
     start = (page - 1) * page_size
     items = merged[start:start + page_size]
 
-    return BookingListResponse(items=items, total=total, has_more=has_more, page_size=page_size, facets=facets)
+    return BookingPagedListResponse(items=items, total=total, has_more=has_more, page_size=page_size, facets=facets)
     
 
 

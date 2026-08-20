@@ -593,6 +593,11 @@ class BookingFacets(BaseModel):
 
 class BookingListResponse(BaseModel):
     items: list[BookingResponse]
+    next_cursor: str | None
+    facets: BookingFacets
+
+class BookingPagedListResponse(BaseModel):
+    items: list[BookingResponse]
     total: int | None
     has_more: bool
     page_size: int

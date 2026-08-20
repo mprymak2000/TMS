@@ -35,6 +35,11 @@ not a launch blocker). Each open item has its own design doc in `.claude/plans/`
      password). Do budget real time for rate-limiting on the code-verify endpoint — an
      unthrottled short numeric code is brute-forceable in seconds, not a corner to cut under
      deadline pressure.
+   - **Multi-tenant scoping rule**: once `tenant_id` exists, it must always be derived from the
+     authenticated session server-side and applied to every query independently — never trusted
+     from client-supplied input (cursor content, query params, body fields). Came up while
+     designing cursor pagination (`cursor-pagination-and-endpoint-split.md`) — an unsigned cursor
+     is fine precisely because tenant scope will never be sourced from it.
 
 ## Known TODOs / Planned Work
 

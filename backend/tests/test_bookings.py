@@ -349,12 +349,12 @@ def test_pending_only_has_more_and_page_size(client):
             created = client.post("/bookings/", json=payload).json()
             client.post(f"/bookings/manage-occurrence/{created['id']}/cancel")
 
-    page1 = client.get("/bookings/?pending_only=true&page=1&page_size=2").json()
+    page1 = client.get("/bookings/pages?pending_only=true&page=1&page_size=2").json()
     assert page1["has_more"] is True
     assert page1["page_size"] == 2
     assert len(page1["items"]) == 2
 
-    page2 = client.get("/bookings/?pending_only=true&page=2&page_size=2").json()
+    page2 = client.get("/bookings/pages?pending_only=true&page=2&page_size=2").json()
     assert page2["has_more"] is False
     assert len(page2["items"]) == 1
 
@@ -811,7 +811,7 @@ def test_my_bookings_bounded_range_paginates_with_total_count(client):
         created = client.post("/bookings/", json=payload).json()
 
     # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE
-    base = f"/bookings/?email={created['student_email']}&time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59&page_size={PAGE_SIZE}"
+    base = f"/bookings/pages?email={created['student_email']}&time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59&page_size={PAGE_SIZE}"
     page1 = client.get(f"{base}&page=1").json()
     assert page1["total"] == 12
     items1 = page1["items"]
@@ -836,7 +836,7 @@ def test_my_bookings_time_max_only_still_gets_total_count(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size={PAGE_SIZE}").json()
+    response = client.get(f"/bookings/pages?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1&page_size={PAGE_SIZE}").json()
     assert response["total"] == 12
     assert len(response["items"]) == PAGE_SIZE
 
@@ -849,7 +849,7 @@ def test_my_bookings_default_page_size_returns_all_in_one_page(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
-    response = client.get(f"/bookings/?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1").json()
+    response = client.get(f"/bookings/pages?email={created['student_email']}&time_max=2099-08-26T23:59:59&page=1").json()
     assert response["total"] == 12
     assert response["page_size"] == DEFAULT_PAGE_SIZE
     assert len(response["items"]) == 12
@@ -868,7 +868,7 @@ def test_my_bookings_unbounded_has_no_total(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         client.post("/bookings/", json=payload)
 
-    response = client.get("/bookings/?time_min=2099-01-01T00:00:00").json()
+    response = client.get("/bookings/pages?time_min=2099-01-01T00:00:00").json()
     assert response["total"] is None
 
 
@@ -1674,3 +1674,76 @@ def test_get_booking_series_facets_keep_selected_tutor_with_zero_matches(client)
     assert body["items"] == []
     tutor_ids_in_facets = {t["id"] for t in body["facets"]["tutors"]}
     assert tutor_a["id"] in tutor_ids_in_facets
+
+
+def test_cursor_pagination_no_duplicates_no_gaps(client):
+    """Walking every page via next_cursor must return each item exactly once, in order,
+    with no duplicates or gaps at page boundaries."""
+    tutor, event_type = setup_standalone(client)
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        for day in range(10, 15):  # 5 bookings, 2099-06-10 through 2099-06-14
+            client.post("/bookings/", json={
+                **booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+                "start": f"2099-06-{day:02d}T16:00:00", "end": f"2099-06-{day:02d}T17:00:00",
+            })
+
+    seen_ids = []
+    cursor = None
+    for _ in range(10):  # generous cap so a bug can't spin the test loop forever
+        url = f"/bookings/?time_min=2099-01-01T00:00:00&page_size=2"
+        if cursor:
+            url += f"&cursor={cursor}"
+        body = client.get(url).json()
+        seen_ids.extend(item["id"] for item in body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+
+    assert len(seen_ids) == 5
+    assert len(set(seen_ids)) == 5  # no duplicates
+
+
+def test_cursor_tiebreak_same_start_time(client):
+    """Two bookings sharing the exact same start time (different tutors) must still be split
+    correctly across pages, using public_id as the tiebreaker - no duplication, no loss."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_standalone, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
+        created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"]}).json()
+
+    page1 = client.get("/bookings/?time_min=2099-01-01T00:00:00&page_size=1").json()
+    assert len(page1["items"]) == 1
+    assert page1["next_cursor"] is not None
+
+    page2 = client.get(f"/bookings/?time_min=2099-01-01T00:00:00&page_size=1&cursor={page1['next_cursor']}").json()
+    assert len(page2["items"]) == 1
+    assert page2["next_cursor"] is None
+
+    ids = {page1["items"][0]["id"], page2["items"][0]["id"]}
+    assert ids == {created_a["id"], created_b["id"]}
+
+
+def test_cursor_rejected_when_filters_change(client):
+    """A cursor minted under one tutor_ids filter must be rejected if replayed under a
+    different one - prevents a stale/mismatched cursor from silently seeking into the wrong scope."""
+    tutor_a, availability_a = make_tutor_with_schedule(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_a = client.post("/event_types/", json={**event_type_standalone, "availability": availability_a}).json()
+    event_type_b = client.post("/event_types/", json={**event_type_standalone, "name": "One-off Session B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"], "start": "2099-06-10T16:00:00", "end": "2099-06-10T17:00:00"})
+        client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"], "start": "2099-06-11T16:00:00", "end": "2099-06-11T17:00:00"})
+
+    page1 = client.get(f"/bookings/?time_min=2099-01-01T00:00:00&tutor_ids={tutor_a['id']}&page_size=1").json()
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+
+    mismatched = client.get(f"/bookings/?time_min=2099-01-01T00:00:00&tutor_ids={tutor_b['id']}&page_size=1&cursor={cursor}")
+    assert mismatched.status_code == 400

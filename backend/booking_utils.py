@@ -1,4 +1,7 @@
+import base64
 from datetime import UTC, date, datetime, timedelta
+import hashlib
+import json
 from zoneinfo import ZoneInfo
 from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
@@ -13,6 +16,12 @@ def _occurrence_end(series: BookingSeries, start_local_date: date, tz: ZoneInfo)
     """Given a series and a candidate local start date, compute the occurrence's UTC end time."""
     end_date = start_local_date + timedelta(days=(series.end_day_of_week - series.start_day_of_week) % 7)
     return datetime.combine(end_date, series.end_time, tzinfo=tz).astimezone(UTC)
+
+
+def _to_local_date(dt: datetime, tz: ZoneInfo) -> date:
+    """Normalize a possibly-naive UTC datetime to tz-aware, return its local date. Helpful for SQLite, which doesn't support tz-aware datetimes in queries."""
+    dt_utc = dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    return dt_utc.astimezone(tz).date()
 
 
 def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, settings) -> Booking:
@@ -93,7 +102,7 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
         raise HTTPException(status_code=400, detail="Booking series has been cancelled")
     if series.recur_until is not None:
         tz = ZoneInfo(settings.business_timezone)
-        if start_utc.astimezone(tz).date() > series.recur_until:
+        if _to_local_date(start_utc, tz) > series.recur_until:
             raise HTTPException(status_code=400, detail="Occurrence is past the end of this series")
 
     try:
@@ -102,27 +111,26 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
+## -------------- Resolving recurrent occurrences from series rules -------------- ##
+
 def _virtual_occurrences(
         series: BookingSeries,
         time_min: datetime | None,
         time_max: datetime | None,
         count: int | None,
-        settings
+        settings,
+        cursor: tuple[datetime, str] | None = None, # decoded pagination cursor
     ) -> list[BookingResponse]:
-    """Generates up to `count` virtual occurrences for a series within [time_min, time_max],
-     skipping any date that already has a materialized Booking row (in db). Stops early if recur_until or
-     time_max is reached first. Never touches the DB.
+    """Generate up to `count` virtual occurrences for a series within [time_min, time_max],
+    skipping materialized dates and anything at/before `cursor`. Never touches the DB.
 
-     time_min/time_max mirror Google Calendar's timeMin/timeMax — both optional. Omitting time_min
-     means "since the series actually started" (series.start_date); omitting time_max means
-     unbounded — count (page * page_size from the caller) is what guarantees termination in that
-     case, same role pageToken/maxResults plays for Google. count=None means no cap at all — only
-     safe when time_max is set (a real range guarantees termination on its own); the caller
-     (merge_occurrences) only does this when both time_min and time_max are present.
-
-     Advances one week at a time — this app's recurrence is always weekly today. If a variable
-     interval is ever added to BookingSeries, this is the one place that needs to change.
-     """
+    time_min/time_max are optional, mirroring Google's timeMin/timeMax. count=None is only
+    safe when time_max or recur_until bounds the walk - otherwise it never terminates.
+    Cursor is a decoded (start, public_id) resume point from the client's prior page - resumes
+    from there instead of walking from series.start_date/time_min. Guaranteed to fall within
+    [time_min/flor_date, time_max]: decode_cursor rejects a cursor minted under a different time window
+    before this function ever sees it.
+    """
     if count is None and time_max is None and series.recur_until is None:
         raise ValueError("_virtual_occurrences: unbounded walk - series is indefinite and neither count nor time_max is set")
 
@@ -132,38 +140,42 @@ def _virtual_occurrences(
     # Need a FLOOR so no virtual occurrences are generated before the series actually started. 
     floor_date = series.start_date
     if time_min is not None:
-        time_min_tz = time_min if time_min.tzinfo else time_min.replace(tzinfo=UTC)
-        floor_date = max(floor_date, time_min_tz.astimezone(tz).date()) # first occ is in local timezone, convert from utc to local
+        floor_date = max(floor_date, _to_local_date(time_min, tz))
+    if cursor is not None:
+        cursor_start, _ = cursor
+        floor_date = max(floor_date, _to_local_date(cursor_start, tz))
 
-    time_max_date = None
-    if time_max is not None:
-        time_max_tz = time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)
-        time_max_date = time_max_tz.astimezone(tz).date()
+    time_max_date = _to_local_date(time_max, tz) if time_max is not None else None
 
     # point at the first occurrence in local time, then jump forward by one week (DST safe) and generate occurrence objects
-    cursor_date = floor_date
-    days_until_next_occurrence = (series.start_day_of_week - cursor_date.weekday()) % 7 # no-op if floor is the series first occurrence
-    cursor_date += timedelta(days=days_until_next_occurrence) # next occurrence of the series
+    current_date = floor_date
+    days_until_next_occurrence = (series.start_day_of_week - current_date.weekday()) % 7 # 0 if current_date is already on the right day of week
+    current_date += timedelta(days=days_until_next_occurrence) # no-op if days_until_next_occurrence is 0
 
     occurrences = []
     while count is None or len(occurrences) < count:
         # if series is finite, stop generating occurrences after recur_until - can't have more occurrences
-        if series.recur_until is not None and cursor_date > series.recur_until:
+        if series.recur_until is not None and current_date > series.recur_until:
             break
         # if upper bound date is set, stop generating occurrences after time_max
-        if time_max_date is not None and cursor_date > time_max_date:
+        if time_max_date is not None and current_date > time_max_date:
             break
-        start_utc = datetime.combine(cursor_date, series.start_time, tzinfo=tz).astimezone(UTC) # next ocurrence local -> utc
+        start_utc = datetime.combine(current_date, series.start_time, tzinfo=tz).astimezone(UTC) # next ocurrence local -> utc
+        public_id = f"{series.public_id}:{int(start_utc.timestamp())}"
 
-        # skip occurrences that were already materialized and acted on by user or background job
-        if start_utc not in existing_starts:
-            end_utc = _occurrence_end(series, cursor_date, tz)
+        # skip occurrences already materialized, or at/before the resume point (avoids duplicating the cursor's own occurrence)
+        already_materialized = start_utc in existing_starts
+        # public_id only breaks ties when two different series share the exact same start_utc - start_utc is still the primary key
+        at_or_before_cursor = cursor is not None and (start_utc, public_id) <= cursor
+
+        if not already_materialized and not at_or_before_cursor:
+            end_utc = _occurrence_end(series, current_date, tz)
             minutes_until = (start_utc - datetime.now(UTC)).total_seconds() / 60
             cancel_action = get_cancel_action(series.event_type, minutes_until)
             reschedule_action = get_reschedule_action(series.event_type, minutes_until)
             occurrences.append(
                 BookingResponse(
-                    public_id=f"{series.public_id}:{int(start_utc.timestamp())}",
+                    public_id=public_id,
                     series_public_id=series.public_id,
                     rescheduled_to_public_id=None,
                     tutor_id=series.tutor_id,
@@ -186,7 +198,7 @@ def _virtual_occurrences(
                     request=None,
                 )
             )
-        cursor_date += timedelta(days=7)
+        current_date += timedelta(days=7)
     return occurrences
 
 
@@ -196,19 +208,46 @@ def scoped_virtual_occurrences(
     time_max: datetime | None,
     needed_total: int | None,
     settings,
+    cursor: tuple[datetime, str] | None = None,
 ) -> list[BookingResponse]:
     """Generate virtual occurrences for every series in series_list within [time_min, time_max],
     capped at needed_total each (None = uncapped, only safe when time_max bounds the walk)."""
     virtual = []
     for series in series_list:
-        virtual.extend(_virtual_occurrences(series, time_min, time_max, needed_total, settings))
+        virtual.extend(_virtual_occurrences(series, time_min, time_max, needed_total, settings, cursor))
     return virtual
 
+
+## -------------- Resolving real list from materialized and virtual occurrences -------------- ##
+
+
+def merge_occurrences(
+    virtual_occurrences: list[BookingResponse],
+    materialized_bookings: list[BookingResponse],
+    order: str = "asc",
+) -> list[BookingResponse]:
+    """Merge already-generated virtual occurrences with already-validated materialized bookings
+    into one sorted list. Callers convert materialized rows to BookingResponse before calling -
+    keeps this function's inputs uniform, one type, no internal ORM/schema juggling.
+
+    order='desc' sorts most-recent-first — used for unbounded-below queries (e.g. time_max=now, no
+    time_min), where paginating from the earliest match instead of the most recent would be wrong,
+    and reversing an already-fetched page can't fix that since it doesn't change which rows got
+    fetched in the first place."""
+    def _sort_key(b):
+        # (start, id) - id breaks ties on identical start, matching the cursor's own seek comparison.
+        start = b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
+        return (start, b.id)
+    return sorted([*materialized_bookings, *virtual_occurrences], key=_sort_key, reverse=(order == "desc"))
+
+
+## -------------- Query Scoping and Facet Computation -------------- ##
 
 def apply_booking_time_status_scope(query, time_min: datetime | None, time_max: datetime | None, include_cancelled: bool):
     """Time/status scope for a Booking query — mirrors Google Calendar's showDeleted (default
     False, excludes cancelled/rescheduled-away rows). Only ever applies to Booking; BookingSeries
     has no status/start columns to scope this way."""
+    assert query.column_descriptions[0]["entity"] is Booking, "apply_booking_time_status_scope only applies to Booking queries"
     if not include_cancelled:
         query = query.filter(Booking.status == "confirmed")
     if time_min is not None:
@@ -216,22 +255,6 @@ def apply_booking_time_status_scope(query, time_min: datetime | None, time_max: 
     if time_max is not None:
         query = query.filter(Booking.start <= time_max)
     return query
-
-
-def merge_occurrences(
-    virtual_occurrences: list[BookingResponse],
-    materialized_bookings: list[Booking],
-    order: str = "asc",
-) -> list[BookingResponse]:
-    """Merge already-generated virtual occurrences with materialized bookings into one sorted list.
-    order='desc' sorts most-recent-first — used for unbounded-below queries (e.g. time_max=now, no
-    time_min), where paginating from the earliest match instead of the most recent would be wrong,
-    and reversing an already-fetched page can't fix that since it doesn't change which rows got
-    fetched in the first place."""
-    def _sort_key(b):
-        return b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC)
-    merged = sorted([*materialized_bookings, *virtual_occurrences], key=_sort_key, reverse=(order == "desc"))
-    return [BookingResponse.model_validate(b) for b in merged]
 
 
 def apply_scope_filters(query, model, tutor_ids, event_type_ids, student_pairs, email=None, exclude=None):
@@ -322,7 +345,105 @@ def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, 
     student_pair_set |= set(student_pairs)
 
     return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
-    
+
+
+## -------------- Cursor for Pagination -------------- ##
+
+
+def _filters_fingerprint(
+    tutor_ids,
+    event_type_ids,
+    student_pairs,
+    time_min,
+    time_max,
+    email,
+    pending_only,
+    include_cancelled,
+) -> str:
+    """Compute a fingerprint of everything the current query is scoped to, to be included in the cursor for pagination. This allows the
+    backend to detect when a cursor is being used against a different query than it was generated for, and reject
+    it instead of returning potentially nonsensical results and to prevent clients from building invalid cursors.
+    Deliberately excludes page_size (a display choice, not a scope change) and order/direction (Next/Prev from the
+    same resume point isn't a different query)."""
+    time_min_utc = (time_min if time_min.tzinfo else time_min.replace(tzinfo=UTC)) if time_min else None
+    time_max_utc = (time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)) if time_max else None
+    canonical = json.dumps({
+        "tutor_ids": sorted(tutor_ids),
+        "event_type_ids": sorted(event_type_ids),
+        "student_pairs": sorted(student_pairs),
+        "time_min": int(time_min_utc.timestamp()) if time_min_utc else None,
+        "time_max": int(time_max_utc.timestamp()) if time_max_utc else None,
+        "email": email,
+        "pending_only": pending_only,
+        "include_cancelled": include_cancelled,
+    }, sort_keys=True)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+def encode_cursor(
+    start: datetime,
+    public_id: str,
+    tutor_ids: list[int],
+    event_type_ids: list[int],
+    student_pairs: list[tuple[int, int]],
+    time_min: datetime | None,
+    time_max: datetime | None,
+    email: str | None,
+    pending_only: bool,
+    include_cancelled: bool,
+) -> str:
+    """Encode a cursor for pagination. Opaque token wrapping containing start timestamp, public_id tiebreaker and filter fingerprint"""
+    fingerprint = _filters_fingerprint(
+        tutor_ids,
+        event_type_ids,
+        student_pairs,
+        time_min,
+        time_max,
+        email,
+        pending_only,
+        include_cancelled,
+    )
+    start_utc = start if start.tzinfo else start.replace(tzinfo=UTC)
+    payload = {"start": int(start_utc.timestamp()), "public_id": public_id, "fingerprint": fingerprint}
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+
+def decode_cursor(
+    cursor: str,
+    tutor_ids,
+    event_type_ids,
+    student_pairs,
+    time_min,
+    time_max,
+    email,
+    pending_only,
+    include_cancelled,
+) -> tuple[datetime, str]:
+    """Decode a cursor for pagination. Extract start timestamp, public_id tiebreaker and filter fingerprint from opaque token"""
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))) # add = padding to make multipke of 4 for b64 correctness, then decode
+        start = datetime.fromtimestamp(payload["start"], tz=UTC)
+        public_id = payload["public_id"]
+        fingerprint = payload["fingerprint"]
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+    expected_fingerprint = _filters_fingerprint(
+        tutor_ids,
+        event_type_ids,
+        student_pairs,
+        time_min,
+        time_max,
+        email,
+        pending_only,
+        include_cancelled,
+    )
+    if fingerprint != expected_fingerprint:
+        raise HTTPException(status_code=400, detail="Cursor does not match current filters")
+    return start, public_id
+
+
 
 # Once a guest/contact id exists on Booking/BookingSeries, student matching should switch from
 # (student_first, student_last) pairs to that id — same shape as tutor_id/event_type_id already
