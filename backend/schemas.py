@@ -610,7 +610,6 @@ class BookingSeriesListResponse(BaseModel):
 
 
 class BookingSeriesOccurrencesResponse(BaseModel):
-    """Unbounded (no time_max) occurrence list — has_more, not total; see GET /bookings/ pagination note in CLAUDE.md."""
+    """Cursor-paginated occurrence list for one series."""
     items: list[BookingResponse]
-    total: int | None
-    has_more: bool
+    next_cursor: str | None

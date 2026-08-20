@@ -359,12 +359,14 @@ def _filters_fingerprint(
     email,
     pending_only,
     include_cancelled,
+    series_id: str | None = None,
 ) -> str:
     """Compute a fingerprint of everything the current query is scoped to, to be included in the cursor for pagination. This allows the
     backend to detect when a cursor is being used against a different query than it was generated for, and reject
     it instead of returning potentially nonsensical results and to prevent clients from building invalid cursors.
     Deliberately excludes page_size (a display choice, not a scope change) and order/direction (Next/Prev from the
-    same resume point isn't a different query)."""
+    same resume point isn't a different query). series_id scopes a cursor to one series' own occurrences endpoint,
+    None for the multi-series /bookings/ endpoint."""
     time_min_utc = (time_min if time_min.tzinfo else time_min.replace(tzinfo=UTC)) if time_min else None
     time_max_utc = (time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)) if time_max else None
     canonical = json.dumps({
@@ -376,6 +378,7 @@ def _filters_fingerprint(
         "email": email,
         "pending_only": pending_only,
         "include_cancelled": include_cancelled,
+        "series_id": series_id,
     }, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
@@ -391,6 +394,7 @@ def encode_cursor(
     email: str | None,
     pending_only: bool,
     include_cancelled: bool,
+    series_id: str | None = None,
 ) -> str:
     """Encode a cursor for pagination. Opaque token wrapping containing start timestamp, public_id tiebreaker and filter fingerprint"""
     fingerprint = _filters_fingerprint(
@@ -402,6 +406,7 @@ def encode_cursor(
         email,
         pending_only,
         include_cancelled,
+        series_id,
     )
     start_utc = start if start.tzinfo else start.replace(tzinfo=UTC)
     payload = {"start": int(start_utc.timestamp()), "public_id": public_id, "fingerprint": fingerprint}
@@ -420,6 +425,7 @@ def decode_cursor(
     email,
     pending_only,
     include_cancelled,
+    series_id: str | None = None, # only used when getting occurrences of a series
 ) -> tuple[datetime, str]:
     """Decode a cursor for pagination. Extract start timestamp, public_id tiebreaker and filter fingerprint from opaque token"""
     try:
@@ -438,6 +444,7 @@ def decode_cursor(
         email,
         pending_only,
         include_cancelled,
+        series_id,
     )
     if fingerprint != expected_fingerprint:
         raise HTTPException(status_code=400, detail="Cursor does not match current filters")

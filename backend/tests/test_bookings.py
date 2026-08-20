@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, UTC
+import time
 from unittest.mock import patch, MagicMock
 from conftest import TestingSessionLocal
 from models import Booking, BookingSeries
@@ -1461,16 +1462,21 @@ def test_booking_series_occurrences_time_max_stops_virtual_generation(client):
     assert items[-1]["start"].startswith("2099-06-24")
 
 
-def test_booking_series_occurrences_bounded_range_returns_total(client):
+def test_booking_series_occurrences_bounded_range_paginates_with_cursor(client):
     tutor, event_type = setup_recurring(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
 
     # weekly from 06-10 through 08-26 = 12 occurrences, more than PAGE_SIZE (10)
-    response = client.get(f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59").json()
-    assert response["total"] == 12
-    assert len(response["items"]) == 10
+    base = f"/bookings/booking-series/{created['series_id']}/occurrences?time_min=2099-06-01T00:00:00&time_max=2099-08-26T23:59:59"
+    page1 = client.get(base).json()
+    assert len(page1["items"]) == 10
+    assert page1["next_cursor"] is not None
+
+    page2 = client.get(f"{base}&cursor={page1['next_cursor']}").json()
+    assert len(page2["items"]) == 2
+    assert page2["next_cursor"] is None
 
 
 def test_booking_series_occurrences_time_min_narrows(client):
@@ -1747,3 +1753,43 @@ def test_cursor_rejected_when_filters_change(client):
 
     mismatched = client.get(f"/bookings/?time_min=2099-01-01T00:00:00&tutor_ids={tutor_b['id']}&page_size=1&cursor={cursor}")
     assert mismatched.status_code == 400
+
+
+def test_booking_series_occurrences_cursor_rejected_for_different_series(client):
+    """A cursor minted against series A's occurrences must be rejected if replayed against
+    series B - series_id is part of the cursor's fingerprint, not just the other filters."""
+    tutor_a, event_type_a = setup_recurring(client)
+    tutor_b = client.post("/tutors/", json={**tutor_payload, "last_name": "Other"}).json()
+    schedule_b = client.post("/schedules/", json={**_schedule, "tutor_id": tutor_b["id"]}).json()
+    availability_b = [{"tutor_id": tutor_b["id"], "schedule_id": schedule_b["id"]}]
+    event_type_b = client.post("/event_types/", json={**event_type_recurring, "name": "Tutoring B", "availability": availability_b}).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created_a = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_a["id"], "event_type_id": event_type_a["id"]}).json()
+        created_b = client.post("/bookings/", json={**booking_payload, "tutor_id": tutor_b["id"], "event_type_id": event_type_b["id"]}).json()
+
+    page1 = client.get(f"/bookings/booking-series/{created_a['series_id']}/occurrences?page_size=1").json()
+    cursor = page1["next_cursor"]
+    assert cursor is not None
+
+    mismatched = client.get(f"/bookings/booking-series/{created_b['series_id']}/occurrences?page_size=1&cursor={cursor}")
+    assert mismatched.status_code == 400
+
+
+def test_wide_window_does_not_trigger_unbounded_walk(client):
+    """Regression test: a request spanning a huge time window against an indefinite series must
+    stay cheap and capped at page_size, since cursor-seeking bounds cost by page_size, not by
+    window width. Before this, a wide window walked every week of the range - here that's ~100
+    years, which would be far too slow to still pass a tight time budget if it regressed."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+
+    start = time.time()
+    response = client.get("/bookings/?time_min=2000-01-01T00:00:00&time_max=2099-12-31T23:59:59&page_size=5")
+    elapsed = time.time() - start
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) <= 5
+    assert elapsed < 2.0

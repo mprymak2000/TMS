@@ -73,12 +73,15 @@ def get_booking_series_occurrences(
     time_max: datetime | None = Query(default=None),
     include_cancelled: bool = Query(default=False),
     order: str = Query(default="asc"),
-    page: int = Query(default=1, ge=1),
     page_size: int = Query(default=PAGE_SIZE, ge=1, le=500),
+    cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
-    """Paginated list of all occurrences (materialized + virtual) for a given series."""
+    """Cursor-paginated occurrences for one series. Separate endpoint, not a series_id filter
+    on GET /bookings/: a series already pins tutor/event_type/student, so facets would be
+    meaningless here, and this is a sub-resource of one specific series, not a filterable
+    collection - REST nested-resource shape."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
@@ -86,20 +89,30 @@ def get_booking_series_occurrences(
     if not series:
         raise HTTPException(status_code=404, detail="Booking series not found")
 
+    decoded_cursor = None
+    if cursor is not None:
+        decoded_cursor = decode_cursor(cursor, [], [], [], time_min, time_max, None, False, include_cancelled, series.public_id)
+
     materialized_query = apply_booking_time_status_scope(
         db.query(Booking).filter(Booking.series_id == series.id), time_min, time_max, include_cancelled
     )
+    # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
+    if decoded_cursor is not None:
+        cursor_start, cursor_public_id = decoded_cursor
+        booking_key = tuple_(Booking.start, Booking.public_id)
+        cursor_key = tuple_(cursor_start, cursor_public_id)
+        past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
+        materialized_query = materialized_query.filter(past_cursor)
 
-    bounded = time_max is not None
-    needed_total = None if bounded else page * page_size + 1
-    virtual = scoped_virtual_occurrences([series], time_min, time_max, needed_total, settings)
+    # execute queries, generate virtual occurrences from series rules
+    virtual = scoped_virtual_occurrences([series], time_min, time_max, page_size + 1, settings, decoded_cursor)
     materialized = [BookingResponse.model_validate(b) for b in materialized_query.all()]
-    merged = merge_occurrences(virtual, materialized, order)
 
-    total = len(merged) if bounded else None
-    has_more = False if bounded else len(merged) > page * page_size
-    start = (page - 1) * page_size
-    return BookingSeriesOccurrencesResponse(items=merged[start:start + page_size], total=total, has_more=has_more)
+    # merge into a sorted list, take first page_size's worth, encode a cursor as a bookmark and discard the tail
+    merged = merge_occurrences(virtual, materialized, order)
+    items = merged[:page_size]
+    next_cursor = encode_cursor(items[-1].start, items[-1].id, [], [], [], time_min, time_max, None, False, include_cancelled, series.public_id) if len(merged) > page_size else None
+    return BookingSeriesOccurrencesResponse(items=items, next_cursor=next_cursor)
 
 @router.get("/", response_model=BookingListResponse)
 def get_bookings(
@@ -117,7 +130,10 @@ def get_bookings(
     db: Session = Depends(get_db),
     settings=Depends(get_settings),
 ):
-    """docstring for get_bookings"""
+    """Cursor-paginated, flat list of all bookings (materialized and virtual occurrences),
+    filtered by tutor_ids/event_type_ids/student/email/pending_only, scoped by time_min/time_max.
+    Facets returned alongside items. See GET /bookings/pages for the total/page-based equivalent,
+    kept for API completeness only, not called by the frontend."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
