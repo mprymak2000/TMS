@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import tuple_
 
-from booking_utils import apply_booking_time_status_scope, apply_scope_filters, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, resolve_ref, merge_occurrences, scoped_virtual_occurrences
+from booking_utils import apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, resolve_ref, merge_occurrences, scoped_virtual_occurrences
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -93,7 +93,7 @@ def get_booking_series_occurrences(
     if cursor is not None:
         decoded_cursor = decode_cursor(cursor, [], [], [], time_min, time_max, None, False, include_cancelled, series.public_id)
 
-    materialized_query = apply_booking_time_status_scope(
+    materialized_query = apply_booking_time_scope(
         db.query(Booking).filter(Booking.series_id == series.id), time_min, time_max, include_cancelled
     )
     # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
@@ -164,25 +164,17 @@ def get_bookings(
             scoped_query = scoped_query.filter(past_cursor)
         sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
         booking_rows = scoped_query.order_by(*sort_cols).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no time_min/time_max for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
         items = [BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]]
         next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, event_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
         return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
 
     ## main branch
-    # scope materialized bookings by time, calculate facets
-    materialized_query = apply_booking_time_status_scope(materialized_query, time_min, time_max, include_cancelled)
-    facets = compute_timeline_facets(
-        materialized_query,
-        series_query,
-        tutor_ids,
-        event_type_ids,
-        student_pairs,
-        time_min,
-        time_max,
-        settings,
-        db,
-    )
+    # scope materialized bookings by time, series by time overlap, then calculate facets
+    materialized_query = apply_booking_time_scope(materialized_query, time_min, time_max, include_cancelled)
+    series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
+    
     # scope Bookings and BookingSeries by tutor_ids, event_type_ids, student_pairs, using cursor as a start point
     scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
     scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs)
@@ -252,7 +244,7 @@ def list_bookings(
             base_query = base_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
         scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, event_type_ids, student_pairs)
         booking_rows = scoped_query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no time_min/time_max for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
         return BookingPagedListResponse(
             items=[BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]],
             total=None, # not meaningful for pending-only request
@@ -270,8 +262,9 @@ def list_bookings(
         materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
         series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
-    ## time/status-scope (materialized bookings only)
-    materialized_query = apply_booking_time_status_scope(materialized_query, time_min, time_max, include_cancelled)
+    ## time/status-scope (materialized bookings only); series time-scoped by overlap instead
+    materialized_query = apply_booking_time_scope(materialized_query, time_min, time_max, include_cancelled)
+    series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
 
     # get facets: self-excluding (narrows down filter types and which tutors/event types/students are available for further filtering)
     facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
@@ -279,7 +272,6 @@ def list_bookings(
     # get actual bookings (items): full scope (no exclusion) on top of the same main-scoped queries, then generate+merge virtual with materialized
     scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
     scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
-
 
     ## time/status-scope (series only) - different mechanism than bookings materialized in db
     scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs) # first scope series

@@ -1,5 +1,5 @@
 import { MantineProvider, createTheme } from '@mantine/core'
-import { Routes, Route, NavLink } from 'react-router-dom'
+import { Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import LessonsTable from './LessonsTable'
 import Availability from './Availability'
 import EventTypes from './EventTypes'
@@ -26,8 +26,10 @@ const navItems = [
 ]
 
 function App() {
-  
+
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const location = useLocation()
+  const isBookings = location.pathname === '/bookings'
 
   return (
     <MantineProvider theme={theme}>
@@ -37,11 +39,11 @@ function App() {
         <Route path="/manage-series/:ref" element={<ManageSeries />} />
         <Route path="/my-bookings" element={<Bookings isCustomer={true} />} />
         <Route path="/*" element={
-      <div className="flex h-screen bg-gray-50">
+      <div className="flex h-screen bg-gray-800 p-3 gap-3">
 
         {/* Sidebar */}
-        {/* line below this one does logic and makes w=0 for sidebar */} 
-        <aside className={`shrink-0 bg-gray-900 flex flex-col overflow-hidden transition-all duration-300 ease-in-out ${sidebarCollapsed ? 'w-0' : 'w-52'}`}>
+        {/* line below this one does logic and makes w=0 for sidebar */}
+        <aside className={`shrink-0 flex flex-col overflow-hidden transition-all duration-300 ease-in-out ${sidebarCollapsed ? 'w-0' : 'w-52'}`}>
           <div className="px-5 py-5 text-lg font-bold text-white tracking-tight whitespace-nowrap">TMS</div>
           <nav className="flex flex-col gap-0.5 px-3">
             {navItems.map(item => (
@@ -59,13 +61,14 @@ function App() {
           </nav>
         </aside>
 
-        {/* Main area */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        {/* Main area — a rounded card floating on the dark shell, instead of meeting the
+            sidebar/header at a hard right angle. */}
+        <div className="flex-1 flex flex-col overflow-hidden bg-white rounded-2xl shadow-xl">
 
           {/* Header */}
-          <header className="h-14 shrink-0 bg-white border-b border-gray-200 flex items-center justify-between px-5">
+          <header className="h-14 shrink-0 border-b border-gray-200 flex items-center justify-between px-5">
             {/* Hamburger — wire onClick to toggle sidebar */}
-            <button 
+            <button
               className="text-gray-500 hover:text-gray-800 transition-colors p-1 rounded hover:bg-gray-100"
               onClick={() => setSidebarCollapsed(prev => !prev)}
             >
@@ -91,8 +94,8 @@ function App() {
             </div>
           </header>
 
-          <main className="flex-1 overflow-y-auto py-8 px-16">
-            <div className="max-w-7xl mx-auto">
+          <main className={`flex-1 overflow-y-auto ${isBookings ? 'py-4 px-6' : 'py-8 px-16'}`}>
+            <div className={`h-full ${isBookings ? '' : 'max-w-7xl mx-auto'}`}>
               <Routes>
                 <Route path="/" element={<LessonsTable />} />
                 <Route path="/students" element={<div className="text-gray-400">Students — coming soon</div>} />

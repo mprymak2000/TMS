@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 from zoneinfo import ZoneInfo
-from sqlalchemy import func, tuple_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session
 from models import Booking, BookingSeries, EventType, Tutor
 from schemas import BookingFacets, BookingResponse, EventTypeFacetOption, StudentFacetOption, TutorFacetOption
@@ -243,17 +243,30 @@ def merge_occurrences(
 
 ## -------------- Query Scoping and Facet Computation -------------- ##
 
-def apply_booking_time_status_scope(query, time_min: datetime | None, time_max: datetime | None, include_cancelled: bool):
+def apply_booking_time_scope(query, time_min: datetime | None, time_max: datetime | None, include_cancelled: bool):
     """Time/status scope for a Booking query — mirrors Google Calendar's showDeleted (default
     False, excludes cancelled/rescheduled-away rows). Only ever applies to Booking; BookingSeries
     has no status/start columns to scope this way."""
-    assert query.column_descriptions[0]["entity"] is Booking, "apply_booking_time_status_scope only applies to Booking queries"
+    assert query.column_descriptions[0]["entity"] is Booking, "apply_booking_time_scope only applies to Booking queries"
     if not include_cancelled:
         query = query.filter(Booking.status == "confirmed")
     if time_min is not None:
         query = query.filter(Booking.start >= time_min)
     if time_max is not None:
         query = query.filter(Booking.start <= time_max)
+    return query
+
+
+def apply_series_time_scope(query, time_min: datetime | None, time_max: datetime | None, tz: ZoneInfo):
+    """Return the query filtered to only series that could have occurrences within [time_min, time_max].
+    Floor from the series' own first Booking row (not the mutable start_date). Ceiling is
+    recur_until when set, else the series is indefinite/always still running - no ceiling check."""
+    assert query.column_descriptions[0]["entity"] is BookingSeries, "apply_series_time_scope only applies to BookingSeries queries"
+    if time_max is not None:
+        query = query.filter(BookingSeries.bookings.any(Booking.start <= time_max))
+    if time_min is not None:
+        time_min_local = _to_local_date(time_min, tz)
+        query = query.filter(or_(BookingSeries.recur_until == None, BookingSeries.recur_until >= time_min_local))
     return query
 
 
@@ -288,7 +301,7 @@ def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
 
 
 def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db):
-    """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. materialized_base_query must already be time/status-scoped by the caller. Return the unique set of facet options for each facet type. """
+    """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. materialized_base_query must already be time/status-scoped, and series_base_query already time-scoped (apply_series_time_scope, a cheap pre-filter), by the caller. Return the unique set of facet options for each facet type. """
 
     # get tutor options filtered by the other filters (self-exclude tutor), then query to get their ids
     tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
@@ -300,22 +313,19 @@ def compute_timeline_facets(materialized_base_query, series_base_query, tutor_id
     student_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="student")
     student_pair_set = set(student_query.with_entities(Booking.student_first, Booking.student_last).distinct().all()) # [('John', 'Doe'), ('Jane', 'Smith'), ...] -> {('John', 'Doe'), ('Jane', 'Smith'), ...}
 
-    # walk each series' occurrences once (not once per facet type), then filter in-memory 3 ways
+    # apply_series_time_scope already dropped series that can't possibly overlap; here we confirm
+    # each survivor actually has an occurrence in [time_min, time_max] (count=1 - existence only,
+    # not the full list, since every occurrence of a series shares the same tutor/event_type/student)
     if series_base_query is not None:
-        occurrences = []
-        # unbounded (no time_max) needs a cap to terminate - count=None is only safe when time_max bounds the walk
-        count = None if time_max is not None else 1
         for series in series_base_query.all():
-            # read each occurrence's own tutor/event_type/student rather than trusting series.* - future-proofs against occurrences that diverge from their series
-            occurrences.extend(_virtual_occurrences(series, time_min, time_max, count, settings))
-
-        for occurrence in occurrences:
-            if (not event_type_ids or occurrence.event_type_id in event_type_ids) and (not student_pairs or (occurrence.student_first, occurrence.student_last) in student_pairs):
-                tutor_id_set.add(occurrence.tutor_id)
-            if (not tutor_ids or occurrence.tutor_id in tutor_ids) and (not student_pairs or (occurrence.student_first, occurrence.student_last) in student_pairs):
-                event_type_id_set.add(occurrence.event_type_id)
-            if (not tutor_ids or occurrence.tutor_id in tutor_ids) and (not event_type_ids or occurrence.event_type_id in event_type_ids):
-                student_pair_set.add((occurrence.student_first, occurrence.student_last))
+            if not _virtual_occurrences(series, time_min, time_max, 1, settings):
+                continue
+            if (not event_type_ids or series.event_type_id in event_type_ids) and (not student_pairs or (series.student_first, series.student_last) in student_pairs):
+                tutor_id_set.add(series.tutor_id)
+            if (not tutor_ids or series.tutor_id in tutor_ids) and (not student_pairs or (series.student_first, series.student_last) in student_pairs):
+                event_type_id_set.add(series.event_type_id)
+            if (not tutor_ids or series.tutor_id in tutor_ids) and (not event_type_ids or series.event_type_id in event_type_ids):
+                student_pair_set.add((series.student_first, series.student_last))
 
     # keep a selected value visible in its own facet even if other filters/the time window narrowed it out
     # ie tutor A selected but shifting dates yields no results. Tutor a selection still needs to be visible 

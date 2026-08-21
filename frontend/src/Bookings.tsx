@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
-import { TextInput, Loader, Input, Button, Modal, Popover, Switch } from '@mantine/core'
+import { TextInput, Loader, Button, Modal, Popover, Switch } from '@mantine/core'
 import { IconSearch, IconCalendar, IconX, IconChevronDown, IconChevronLeft, IconChevronRight, IconSortAscending, IconSortDescending, IconRepeat } from '@tabler/icons-react'
 import type { Tutor, EventType, Booking, BookingSeries, TutorFacetOption, EventTypeFacetOption, StudentFacetOption } from './types'
-import { extractError, formatDate, formatTime, tutorBubbleClass, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
+import { DatePicker } from '@mantine/dates'
+import { extractError, formatDate, formatTime, tutorBubbleClass, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, parseLocalDateStr, DAY_NAMES } from './utils'
 import { useToast } from './useToast'
 import BookingRow from './BookingRow'
 import SeriesRow from './SeriesRow'
@@ -27,6 +28,8 @@ interface LoadErrors {
 
 type BookingsTab = 'timeline' | 'recurring' | 'requests'
 type Granularity = 'day' | 'week' | 'month'
+// 'custom' = an arbitrary pick via the date-range pill, not one of the three presets.
+type Scope = Granularity | 'custom'
 
 const TABS = [
     { key: 'timeline', label: 'Schedule' },
@@ -46,8 +49,7 @@ const dateKeyOf = (iso: string) => {
 }
 const dateLabelOf = (iso: string) => new Date(iso).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
 
-// Day/Week/Month bounds for the API call — always both ends, so always bounded (real
-// X-Total-Count + PageNav, never the unbounded Load-More fallback).
+// Day/Week/Month bounds for the API call — always both ends, so always bounded.
 const periodBounds = (scope: Granularity, anchor: Date): { dateFrom: string; dateTo: string } => {
     if (scope === 'day') { const s = toLocalDateStr(anchor); return { dateFrom: s, dateTo: s } }
     if (scope === 'week') { const start = startOfWeek(anchor); return { dateFrom: toLocalDateStr(start), dateTo: toLocalDateStr(addDays(start, 6)) } }
@@ -55,16 +57,56 @@ const periodBounds = (scope: Granularity, anchor: Date): { dateFrom: string; dat
 }
 
 const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-const MONTH_LONG = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+
+// Year only shown when it's not the current one - "Sep 1-7" most of the time, "Sep 1-7, 2027"
+// when looking at a different year.
+const yearIfNotCurrent = (year: number): string => year === new Date().getFullYear() ? '' : `${year}`
 
 const periodLabel = (scope: Granularity, anchor: Date): string => {
-    if (scope === 'day') return anchor.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })
-    if (scope === 'month') return `${MONTH_LONG[anchor.getMonth()]} ${anchor.getFullYear()}`
+    if (scope === 'day') {
+        const year = yearIfNotCurrent(anchor.getFullYear())
+        return `${MONTH_SHORT[anchor.getMonth()]} ${anchor.getDate()}${year ? `, ${year}` : ''}`
+    }
+    if (scope === 'month') {
+        const lastDay = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 0).getDate()
+        const year = yearIfNotCurrent(anchor.getFullYear())
+        return `${MONTH_SHORT[anchor.getMonth()]} 1-${lastDay}${year ? `, ${year}` : ''}`
+    }
     const start = startOfWeek(anchor)
     const end = addDays(start, 6)
     const startStr = `${MONTH_SHORT[start.getMonth()]} ${start.getDate()}`
     const endStr = start.getMonth() === end.getMonth() ? `${end.getDate()}` : `${MONTH_SHORT[end.getMonth()]} ${end.getDate()}`
-    return `${startStr} – ${endStr}, ${end.getFullYear()}`
+    const year = yearIfNotCurrent(end.getFullYear())
+    return `${startStr}-${endStr}${year ? `, ${year}` : ''}`
+}
+
+// The weekday sub-line shown under the pill's main label when scope is 'day'.
+const weekdayLabel = (anchor: Date): string => anchor.toLocaleDateString('en-US', { weekday: 'long' })
+
+// A custom pick that exactly matches a calendar grid snaps to that preset instead of staying
+// custom — same Monday-start convention as startOfWeek everywhere else in this codebase.
+const matchesFullWeek = (dateFrom: string, dateTo: string): boolean => {
+    const start = startOfWeek(parseLocalDateStr(dateFrom))
+    return toLocalDateStr(start) === dateFrom && toLocalDateStr(addDays(start, 6)) === dateTo
+}
+const matchesFullMonth = (dateFrom: string, dateTo: string): boolean => {
+    const d = parseLocalDateStr(dateFrom)
+    return toLocalDateStr(startOfMonth(d)) === dateFrom && toLocalDateStr(endOfMonth(d)) === dateTo
+}
+
+// dateFrom === dateTo never reaches here in practice — handleCustomSelect snaps a single-date
+// pick to scope='day' before this would be called — but the fallback stays cheap to keep anyway.
+const customRangeLabel = (dateFrom: string, dateTo: string): string => {
+    const start = parseLocalDateStr(dateFrom)
+    const end = parseLocalDateStr(dateTo)
+    if (dateFrom === dateTo) {
+        const year = yearIfNotCurrent(start.getFullYear())
+        return `${MONTH_SHORT[start.getMonth()]} ${start.getDate()}${year ? `, ${year}` : ''}`
+    }
+    const startStr = `${MONTH_SHORT[start.getMonth()]} ${start.getDate()}`
+    const endStr = start.getMonth() === end.getMonth() ? `${end.getDate()}` : `${MONTH_SHORT[end.getMonth()]} ${end.getDate()}`
+    const year = yearIfNotCurrent(end.getFullYear())
+    return `${startStr}-${endStr}${year ? `, ${year}` : ''}`
 }
 
 // Same-day only — a gap indicator is only meaningful within one day's flow;
@@ -80,37 +122,126 @@ const formatGap = (minutes: number): string => {
     return `${hours}h ${mins}m`
 }
 
-const DateRangeInputs = ({
-    dateFrom,
-    dateTo,
-    onDateFromChange,
-    onDateToChange,
+// A literal desk-flip-calendar page turn: front page ("1") rotates down and away on hover,
+// revealing the back page ("2") underneath — not just the whole icon spinning in place.
+const FlipCalendarIcon = ({ active }: { active: boolean }) => {
+    return (
+        <div className="relative w-5 h-5 shrink-0 [perspective:200px]">
+            {/* back page */}
+            <div className={`absolute inset-0 rounded-[3px] border flex flex-col overflow-hidden ${active ? 'border-indigo-300' : 'border-gray-300'}`}>
+                <div className="h-[6px] w-full border-b border-gray-300" />
+                <div className={`flex-1 flex items-center justify-center text-[10px] font-bold leading-none ${active ? 'text-indigo-600' : 'text-gray-500'}`}>2</div>
+            </div>
+            {/* front page - flips down to reveal the back page underneath */}
+            <div
+                className={`absolute inset-0 rounded-[3px] border bg-white flex flex-col overflow-hidden origin-bottom [backface-visibility:hidden] transition-transform duration-500 group-hover:[transform:rotateX(-180deg)] ${active ? 'border-indigo-300' : 'border-gray-300'}`}
+            >
+                <div className="h-[6px] w-full border-b border-gray-300" />
+                <div className={`flex-1 flex items-center justify-center text-[10px] font-bold leading-none ${active ? 'text-indigo-600' : 'text-gray-700'}`}>1</div>
+            </div>
+        </div>
+    )
+}
+
+// Always-visible, always-live pill next to the Day/Week/Month segmented control. Displays
+// whatever the current view's dates are regardless of what's driving it. Clicking it hands
+// control to a calendar picker (Airbnb/Cal.com style): one date picked = a day, two = a range.
+// Closing with only one date picked collapses to a single date, same as a range of one day.
+const DateRangePill = ({
+    label,
+    sublabel,
+    active,
+    onSelect,
 }: {
-    dateFrom: string | null
-    dateTo: string | null
-    onDateFromChange: (value: string | null) => void
-    onDateToChange: (value: string | null) => void
-}) => (
-    <div className="flex gap-2 items-center">
-        <Input
-            type="date"
-            size="sm"
-            value={dateFrom ?? ''}
-            max={dateTo ?? undefined}
-            onChange={(e) => onDateFromChange(e.target.value || null)}
-            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-        />
-        <span className="text-gray-400 text-sm shrink-0">to</span>
-        <Input
-            type="date"
-            size="sm"
-            value={dateTo ?? ''}
-            min={dateFrom ?? undefined}
-            onChange={(e) => onDateToChange(e.target.value || null)}
-            styles={{ input: { borderRadius: '8px', fontFamily: 'inherit', borderColor: '#e5e7eb' } }}
-        />
-    </div>
-)
+    label: string
+    sublabel?: string
+    active: boolean
+    onSelect: (dateFrom: string, dateTo: string) => void
+}) => {
+    const [opened, setOpened] = useState(false)
+    const [value, setValue] = useState<[string | null, string | null]>([null, null])
+    const [displayDate, setDisplayDate] = useState(new Date())
+    // The outgoing month, kept mounted just long enough to animate off-screen while the new one
+    // (the in-flow DatePicker below) slides in from the opposite side - a real two-pane carousel
+    // shift, not a fade-in-place.
+    const [outgoing, setOutgoing] = useState<{ date: Date; direction: 1 | -1 } | null>(null)
+
+    const handleChange = (v: boolean) => {
+        setOpened(v)
+        if (!v) setValue([null, null]) // dismissed without hitting Search — discard the pending pick
+    }
+
+    const handleSearch = () => {
+        const [start, end] = value
+        if (!start) return
+        onSelect(start, end ?? start)
+        setValue([null, null])
+        setOpened(false)
+    }
+
+    const handleMonthChange = (direction: 1 | -1) => (date: string) => {
+        setOutgoing({ date: displayDate, direction })
+        setDisplayDate(parseLocalDateStr(date))
+    }
+
+    return (
+        <Popover opened={opened} onChange={handleChange} position="bottom" shadow="lg" radius="lg">
+            <Popover.Target>
+                <button
+                    onClick={() => setOpened(o => !o)}
+                    className={`group flex items-center justify-center gap-2 leading-tight whitespace-nowrap text-center rounded-lg border px-4 h-9 min-w-[11rem] transition-all ${
+                        active ? 'border-indigo-300 bg-indigo-50 text-indigo-700' : 'border-gray-200 bg-white text-gray-800 hover:border-gray-300 hover:shadow-sm'
+                    }`}
+                >
+                    <FlipCalendarIcon active={active} />
+                    <span className="flex flex-col items-start">
+                        <span className="text-sm font-semibold">{label}</span>
+                        {sublabel && <span className="text-[10px] font-medium text-gray-500 -mt-0.5">{sublabel}</span>}
+                    </span>
+                </button>
+            </Popover.Target>
+            <Popover.Dropdown className="!p-4">
+                <div className="relative overflow-hidden">
+                    {outgoing && (
+                        <div
+                            key={`out-${toLocalDateStr(outgoing.date)}`}
+                            className={`absolute inset-0 pointer-events-none ${outgoing.direction === 1 ? 'animate-[pane-slide-out-left_0.3s_ease-out_forwards]' : 'animate-[pane-slide-out-right_0.3s_ease-out_forwards]'}`}
+                            onAnimationEnd={() => setOutgoing(null)}
+                        >
+                            <DatePicker type="range" allowSingleDateInRange numberOfColumns={2} columnsToScroll={1} size="sm" date={outgoing.date} value={value} onChange={setValue} />
+                        </div>
+                    )}
+                    <div
+                        key={toLocalDateStr(displayDate)}
+                        className={outgoing ? (outgoing.direction === 1 ? 'animate-[pane-slide-in-from-right_0.3s_ease-out]' : 'animate-[pane-slide-in-from-left_0.3s_ease-out]') : ''}
+                    >
+                        <DatePicker
+                            type="range"
+                            allowSingleDateInRange
+                            numberOfColumns={2}
+                            columnsToScroll={1}
+                            size="sm"
+                            date={displayDate}
+                            onNextMonth={handleMonthChange(1)}
+                            onPreviousMonth={handleMonthChange(-1)}
+                            value={value}
+                            onChange={setValue}
+                        />
+                    </div>
+                </div>
+                <div className="flex justify-end mt-3 pt-3 border-t border-gray-100">
+                    <button
+                        onClick={handleSearch}
+                        disabled={!value[0]}
+                        className="px-4 h-9 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                        Search
+                    </button>
+                </div>
+            </Popover.Dropdown>
+        </Popover>
+    )
+}
 
 // Normal (ascending, dates going down the list) is the quiet default — no border. Inverted
 // (descending) is the deviation from default, so it gets a visible border + accent color to
@@ -129,38 +260,28 @@ const OrderToggle = ({ order, onToggle }: { order: 'asc' | 'desc'; onToggle: () 
     </button>
 )
 
-// Three-zone layout (classic centered-header trick — two equal-growing flex-1 sides pin their
-// content to the outer edges, leaving the middle genuinely centered regardless of how wide either
-// side's content is): left = the actual navigator (Today + prev/next), center = the current
-// period's label (or the date inputs, in Range mode), right = the granularity switcher itself.
-// Day/Week/Month are one kind of thing (granularity of the same live view) — grouped tightly as a
-// segmented control. Date Range is a different kind of thing (an arbitrary, manually-picked
-// window) — set apart with real spacing and its own bordered/pill styling.
+// Three-zone layout: left = Day/Week/Month + Today, center = prev/next + the date-range pill,
+// right = search/filters. Prev/next are hidden on scope === 'custom' - no single right answer for
+// "shift by what" on a range that doesn't align to a grid, so reopen the picker instead.
 const ScopeSwitcher = ({
-    granularity,
-    isRangeMode,
+    scope,
     periodAnchor,
     dateFrom,
     dateTo,
     onScopeChange,
-    onRangeToggle,
     onPeriodShift,
     onToday,
-    onDateFromChange,
-    onDateToChange,
+    onCustomSelect,
     leftContent,
 }: {
-    granularity: Granularity
-    isRangeMode: boolean
+    scope: Scope
     periodAnchor: Date
     dateFrom: string | null
     dateTo: string | null
     onScopeChange: (scope: Granularity) => void
-    onRangeToggle: () => void
     onPeriodShift: (direction: 1 | -1) => void
     onToday: () => void
-    onDateFromChange: (value: string | null) => void
-    onDateToChange: (value: string | null) => void
+    onCustomSelect: (dateFrom: string, dateTo: string) => void
     leftContent?: ReactNode
 }) => {
     // Slide direction is a pure presentational concern (which way the label animates in), not
@@ -168,84 +289,56 @@ const ScopeSwitcher = ({
     const [slideDirection, setSlideDirection] = useState<1 | -1>(1)
     const shift = (direction: 1 | -1) => { setSlideDirection(direction); onPeriodShift(direction) }
 
+    const label = scope !== 'custom' ? periodLabel(scope, periodAnchor) : (dateFrom && dateTo ? customRangeLabel(dateFrom, dateTo) : 'Pick dates')
+    const sublabel = scope === 'day' ? weekdayLabel(periodAnchor) : undefined
+
     return (
         <div className="flex items-center gap-3 flex-wrap">
-            <div className="flex-1 flex items-center gap-2 min-w-0">
-                {leftContent}
+            <div className="flex-1 flex items-center gap-3 min-w-0">
+                <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 h-9 w-fit shrink-0">
+                    {(['day', 'week', 'month'] as const).map(g => (
+                        <button
+                            key={g}
+                            onClick={() => onScopeChange(g)}
+                            className={`h-full px-3.5 rounded-md text-sm font-medium transition-colors ${
+                                scope === g ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                            }`}
+                        >
+                            {g === 'day' ? 'Day' : g === 'week' ? 'Week' : 'Month'}
+                        </button>
+                    ))}
+                </div>
+                <button onClick={onToday} className="px-3 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors text-xs font-semibold shrink-0">
+                    Today
+                </button>
             </div>
 
             <div className="min-w-[220px] flex items-center justify-center gap-2">
-                {!isRangeMode && (
-                    <>
-                        <button onClick={onToday} className="px-3 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors text-xs font-semibold shrink-0">
-                            Today
-                        </button>
-                        <button onClick={() => shift(-1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
-                            <IconChevronLeft size={15} />
-                        </button>
-                        <span
-                            key={`${granularity}-${dateFrom}-${dateTo}`}
-                            className={`block text-sm font-semibold text-gray-800 whitespace-nowrap text-center ${
-                                slideDirection === 1 ? 'animate-[slide-in-right_0.35s_ease-out]' : 'animate-[slide-in-left_0.35s_ease-out]'
-                            }`}
-                        >
-                            {periodLabel(granularity, periodAnchor)}
-                        </span>
-                        <button onClick={() => shift(1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
-                            <IconChevronRight size={15} />
-                        </button>
-                    </>
+                {/* No prev/next on a custom range - it doesn't align to a grid, so "shift by what"
+                    is a judgment call with no single right answer. Reopen the picker instead. */}
+                {scope !== 'custom' && (
+                    <button onClick={() => shift(-1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
+                        <IconChevronLeft size={15} />
+                    </button>
                 )}
-            </div>
-
-            <div className="flex-1 flex items-center justify-end gap-3 min-w-0">
-                {/* Day/Week/Month pills and the date inputs occupy the same slot — Date Range
-                    swaps one for the other rather than the two coexisting. */}
-                {isRangeMode ? (
-                    <DateRangeInputs dateFrom={dateFrom} dateTo={dateTo} onDateFromChange={onDateFromChange} onDateToChange={onDateToChange} />
-                ) : (
-                    <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1 h-9 w-fit shrink-0">
-                        {(['day', 'week', 'month'] as const).map(scope => (
-                            <button
-                                key={scope}
-                                onClick={() => onScopeChange(scope)}
-                                className={`h-full px-3.5 rounded-md text-sm font-medium transition-colors ${
-                                    granularity === scope ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-                                }`}
-                            >
-                                {scope === 'day' ? 'Day' : scope === 'week' ? 'Week' : 'Month'}
-                            </button>
-                        ))}
-                    </div>
-                )}
-
-                <button
-                    onClick={onRangeToggle}
-                    className={`flex items-center gap-1.5 px-3.5 h-9 rounded-lg text-sm font-medium border transition-colors shrink-0 ${
-                        isRangeMode
-                            ? 'border-indigo-300 bg-indigo-50 text-indigo-700'
-                            : 'border-gray-200 text-gray-500 hover:text-gray-700 hover:border-gray-300'
-                    }`}
+                {/* The date-range pill lives in the label's own slot — it IS the current-period
+                    display, just clickable now, instead of a separate element elsewhere. */}
+                <span
+                    key={`${scope}-${dateFrom}-${dateTo}`}
+                    className={slideDirection === 1 ? 'animate-[slide-in-right_0.35s_ease-out]' : 'animate-[slide-in-left_0.35s_ease-out]'}
                 >
-                    <IconCalendar size={15} />
-                    Date Range
-                </button>
+                    <DateRangePill label={label} sublabel={sublabel} active={scope === 'custom'} onSelect={onCustomSelect} />
+                </span>
+                {scope !== 'custom' && (
+                    <button onClick={() => shift(1)} className="flex items-center justify-center w-9 h-9 rounded-lg bg-gray-100 text-gray-500 hover:text-gray-700 hover:bg-gray-200 transition-colors shrink-0">
+                        <IconChevronRight size={15} />
+                    </button>
+                )}
             </div>
-        </div>
-    )
-}
 
-const PageNav = ({ page, total, pageSize, onJump }: { page: number; total: number; pageSize: number; onJump: (pageNum: number) => void }) => {
-    const totalPages = Math.ceil(total / pageSize)
-    return (
-        <div className="flex items-center justify-center gap-3 pt-2">
-            <Button variant="default" size="xs" disabled={page <= 1} onClick={() => onJump(page - 1)}>
-                Previous
-            </Button>
-            <span className="text-xs text-gray-500">Page {page} of {totalPages} · {total} total</span>
-            <Button variant="default" size="xs" disabled={page >= totalPages} onClick={() => onJump(page + 1)}>
-                Next
-            </Button>
+            <div className="flex-1 flex items-center justify-end gap-2 min-w-0">
+                {leftContent}
+            </div>
         </div>
     )
 }
@@ -561,13 +654,10 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
     // outter tab state — timeline, recurring, requests
     const [activeTab, setActiveTab] = useState<BookingsTab>('timeline')
-    // Granularity and range mode scope timeline tab. Independent axes — range mode is a toggle layered on top,
-    // never overwrites which granularity was last active, so turning it off always restores exactly where the user was
-    const [granularity, setGranularity] = useState<Granularity>('week')
-    const [isRangeMode, setIsRangeMode] = useState(false)
-    // last range picked while in range mode, restored on re-entry instead of always starting blank
-    const [lastRangeDates, setLastRangeDates] = useState<{ dateFrom: string | null; dateTo: string | null }>({ dateFrom: null, dateTo: null })
-    // Anchor date for Day/Week/Month bounds, preserved across granularity switches (Day ->
+    // What's driving the timeline view — one of the three presets, or 'custom' via the date-range
+    // pill. Single source of truth; no separate toggle layered on top.
+    const [scope, setScope] = useState<Scope>('week')
+    // Anchor date for Day/Week/Month bounds, preserved across scope switches (Day ->
     // Month lands on the month containing the day you were on, not "today's" month). handleToday() resets to now.
     const [periodAnchor, setPeriodAnchor] = useState<Date>(() => new Date())
     // Client side display order, does not influence backend fetch order (load more still gets future dates, despite them now being on the bottom)
@@ -590,13 +680,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
     //pagination state
     const [isLoadingMore, setIsLoadingMore] = useState(false)
-    const [page, setPage] = useState(1)
-    const [hasMore, setHasMore] = useState(false)
-    // Non-null whenever Timeline is loaded (always bounded now) — drives real page-number
-    // navigation there; null only for the Requests tab, which uses incremental Load More instead.
-    const [total, setTotal] = useState<number | null>(null)
-    // Actual page_size the backend used (from X-Page-Size) — PageNav shows only if total exceeds it.
-    const [pageSizeUsed, setPageSizeUsed] = useState(PAGE_SIZE)
+    const [cursor, setCursor] = useState<string | null>(null)
 
     // recurring tab — separate state, separate shape (BookingSeries, not Booking), unpaginated
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
@@ -667,9 +751,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         dateFrom = filters.dateFrom,
         dateTo = filters.dateTo,
         includeCancelled = filters.includeCancelled,
-        isRange = isRangeMode,
+        isRange = scope === 'custom',
         emailFilter,
-        pageNum = 1,
+        cursor: cursorParam = null,
         append = false,
     }: {
         tutorIds?: string[]
@@ -681,7 +765,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         includeCancelled?: boolean
         isRange?: boolean
         emailFilter?: string
-        pageNum?: number
+        cursor?: string | null
         append?: boolean
     } = {}) => {
         const timeMin = dateFrom ? `${dateFrom}T00:00:00` : undefined
@@ -706,8 +790,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
             const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
             const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
-            
-            const response = await fetch(`${base}?page=${pageNum}${pageSizeParam}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${studentParams}${includeCancelledParam}${emailParam}`)
+            const cursorParamStr = cursorParam ? `&cursor=${encodeURIComponent(cursorParam)}` : ''
+
+            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${pendingParam}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${studentParams}${includeCancelledParam}${emailParam}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load bookings.') }))
@@ -721,10 +806,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             setEventTypeFacetOptions(body.facets.event_types)
             setStudentFacetOptions(body.facets.students)
             // pagination
-            setPage(pageNum)
-            setHasMore(body.has_more)
-            setTotal(body.total)
-            setPageSizeUsed(body.page_size)
+            setCursor(body.next_cursor)
             // error state cleared on success
             setLoadErrors({})
         } catch (error) {
@@ -801,91 +883,70 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         else loadBookings({ emailFilter: isCustomer ? email : undefined, tab, tutorIds: [], eventTypeIds: [], students: [], includeCancelled: true })
     }
 
-    // Only ever changes granularity — never touches range mode (the day/week/month pills aren't
-    // even rendered while isRangeMode is true, see ScopeSwitcher), so no early-return branch and
-    // no "which mode am I in" check needed here.
-    const handleScopeChange = (scope: Granularity) => {
-        setGranularity(scope)
+    const handleScopeChange = (g: Granularity) => {
+        setScope(g)
         // Reuses the current anchor (not "now") — switching Day -> Month while looking at a
         // specific day lands on that day's month, not the current month.
-        const bounds = periodBounds(scope, periodAnchor)
+        const bounds = periodBounds(g, periodAnchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
         loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
-    // Toggle: entering range mode just clears the date inputs (nothing to fetch until one is
-    // picked) — granularity is left completely untouched, so leaving range mode always restores
-    // exactly where the user was without needing a separate "remembered" state.
-    const handleRangeToggle = () => {
-        const next = !isRangeMode
-        setIsRangeMode(next)
-        if (next) {
-            setFilters(f => ({ ...f, dateFrom: lastRangeDates.dateFrom, dateTo: lastRangeDates.dateTo }))
-            if (!lastRangeDates.dateFrom && !lastRangeDates.dateTo) {
-                setBookings([])
-                setHasMore(false)
-                setTotal(null)
-                return
-            }
-            loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: true, dateFrom: lastRangeDates.dateFrom, dateTo: lastRangeDates.dateTo })
+    // Called when the date-range pill's picker closes with a selection. A pick exactly matching
+    // Mon-Sun or a full calendar month snaps to that preset instead of staying custom (fills the
+    // Week/Month pill, same as picking it directly) — a single date snaps to Day. Anything else
+    // stays a genuine custom range.
+    const handleCustomSelect = (pickedFrom: string, pickedTo: string) => {
+        if (pickedFrom === pickedTo) {
+            setScope('day')
+            setPeriodAnchor(parseLocalDateStr(pickedFrom))
+            setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedFrom }))
+            loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: pickedFrom, dateTo: pickedFrom })
             return
         }
-        // isRangeMode passed explicitly — setIsRangeMode above hasn't taken effect in this closure yet
-        const bounds = periodBounds(granularity, periodAnchor)
-        setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        if (matchesFullWeek(pickedFrom, pickedTo)) {
+            setScope('week')
+            setPeriodAnchor(parseLocalDateStr(pickedFrom))
+            setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedTo }))
+            loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: pickedFrom, dateTo: pickedTo })
+            return
+        }
+        if (matchesFullMonth(pickedFrom, pickedTo)) {
+            setScope('month')
+            setPeriodAnchor(parseLocalDateStr(pickedFrom))
+            setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedTo }))
+            loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: pickedFrom, dateTo: pickedTo })
+            return
+        }
+        setScope('custom')
+        setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedTo }))
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: true, dateFrom: pickedFrom, dateTo: pickedTo })
     }
 
     const handlePeriodShift = (direction: 1 | -1) => {
-        const nextAnchor = granularity === 'day' ? addDays(periodAnchor, direction)
-            : granularity === 'week' ? addDays(periodAnchor, direction * 7)
+        // Unreachable in practice - the prev/next arrows are hidden for scope === 'custom' (see
+        // ScopeSwitcher) - just here to narrow the type below.
+        if (scope === 'custom') return
+        const nextAnchor = scope === 'day' ? addDays(periodAnchor, direction)
+            : scope === 'week' ? addDays(periodAnchor, direction * 7)
             : new Date(periodAnchor.getFullYear(), periodAnchor.getMonth() + direction, 1)
         setPeriodAnchor(nextAnchor)
-        const bounds = periodBounds(granularity, nextAnchor)
+        const bounds = periodBounds(scope, nextAnchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
         loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
+    // Preserves the current Day/Week/Month scope, just re-anchored to today. Custom mode has no
+    // well-defined "today" of its own, so it collapses to Day rather than inventing "shift the
+    // custom span to include today" semantics.
     const handleToday = () => {
         const anchor = new Date()
         setPeriodAnchor(anchor)
-        const bounds = periodBounds(granularity, anchor)
+        const nextScope: Granularity = scope === 'custom' ? 'day' : scope
+        setScope(nextScope)
+        const bounds = periodBounds(nextScope, anchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
-    }
-
-    const handleDateFromChange = (value: string | null) => {
-        // A dateFrom later than the current dateTo would make the range inverted/nonsensical —
-        // clear dateTo rather than silently allow it (the input's max attribute already blocks
-        // most such picks in the UI itself; this covers anything that slips through).
-        const dateTo = value && filters.dateTo && value > filters.dateTo ? null : filters.dateTo
-        setFilters(f => ({ ...f, dateFrom: value, dateTo }))
-        setLastRangeDates({ dateFrom: value, dateTo })
-        if (!value && !dateTo) {
-            // Both dates cleared — loadBookings would otherwise treat this as "no bound on either
-            // side" and fetch everything. Nothing should show until a date is picked again.
-            setBookings([])
-            setHasMore(false)
-            setTotal(null)
-            return
-        }
-        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateFrom: value, dateTo })
-    }
-
-    const handleDateToChange = (value: string | null) => {
-        // Ignore a dateTo earlier than the current dateFrom — same reasoning as above, just the
-        // other direction; the input's min attribute is the primary guard, this is the backstop.
-        if (value && filters.dateFrom && value < filters.dateFrom) return
-        setFilters(f => ({ ...f, dateTo: value }))
-        setLastRangeDates(prev => ({ ...prev, dateTo: value }))
-        if (!filters.dateFrom && !value) {
-            // Both dates cleared — same reasoning as handleDateFromChange above.
-            setBookings([])
-            setHasMore(false)
-            setTotal(null)
-            return
-        }
-        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', dateTo: value })
+        loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
     const handleStudentFilterToggle = (value: string) => {
@@ -898,11 +959,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // Pure display flip — displayed() re-sorts fully every render, so no refetch needed.
     const handleOrderToggle = () => setOrder(o => o === 'asc' ? 'desc' : 'asc')
 
-    const handleLoadMore = () => loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum: page + 1, append: true })
-
-    // Bounded range only (total is non-null) — jumps replace the page rather than appending,
-    // since each page is a distinct slice of an already-fully-known set, not an incremental extension.
-    const handlePageJump = (pageNum: number) => loadBookings({ emailFilter: isCustomer ? email : undefined, tab: 'timeline', pageNum, append: false })
+    const handleLoadMore = () => loadBookings({ emailFilter: isCustomer ? email : undefined, cursor, append: true })
 
     // Server-side filters now (not client-side) — same reasoning as time range: filtering an
     // already-paginated set client-side can silently hide real matches sitting on unfetched pages.
@@ -1137,17 +1194,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                 Order toggle lives in its left zone (no search/filters for customers). */}
                             <div className="mb-4">
                                 <ScopeSwitcher
-                                    granularity={granularity}
-                                    isRangeMode={isRangeMode}
+                                    scope={scope}
                                     periodAnchor={periodAnchor}
                                     dateFrom={filters.dateFrom}
                                     dateTo={filters.dateTo}
                                     onScopeChange={handleScopeChange}
-                                    onRangeToggle={handleRangeToggle}
                                     onPeriodShift={handlePeriodShift}
                                     onToday={handleToday}
-                                    onDateFromChange={handleDateFromChange}
-                                    onDateToChange={handleDateToChange}
+                                    onCustomSelect={handleCustomSelect}
                                     leftContent={<OrderToggle order={order} onToggle={handleOrderToggle} />}
                                 />
                             </div>
@@ -1202,21 +1256,15 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                 <IconCalendar size={22} className="text-gray-400" />
                                             </div>
                                             <p className="text-sm font-medium text-gray-500">
-                                                {isRangeMode && !filters.dateFrom && !filters.dateTo ? 'Pick a date range' : 'No bookings found'}
+                                                No bookings found
                                             </p>
                                             <p className="text-xs text-gray-400 mt-1">
-                                                {isRangeMode
-                                                    ? (!filters.dateFrom && !filters.dateTo ? 'Choose a start and end date above.' : 'No sessions in this range.')
-                                                    : `No sessions this ${granularity}.`}
+                                                {scope === 'custom' ? 'No sessions in this range.' : `No sessions this ${scope}.`}
                                             </p>
                                         </div>
                                     )}
 
-                                    {total !== null && total > pageSizeUsed ? (
-                                        <div className="border-t border-gray-100 px-5 py-3">
-                                            <PageNav page={page} total={total} pageSize={pageSizeUsed} onJump={handlePageJump} />
-                                        </div>
-                                    ) : total === null && hasMore && (
+                                    {cursor !== null && (
                                         <div className="border-t border-gray-100">
                                             <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
                                         </div>
@@ -1232,7 +1280,8 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     }
 
     return (
-        <div>
+        <div className="h-full flex flex-col">
+            <div className="shrink-0">
             {/* load errors */}
             {loadErrors.bookings && <p className="text-sm text-red-500 mb-2">{loadErrors.bookings}</p>}
             {loadErrors.tutors && <p className="text-sm text-red-500 mb-2">{loadErrors.tutors}</p>}
@@ -1261,17 +1310,14 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             {activeTab === 'timeline' && (
                 <div className="mb-5">
                     <ScopeSwitcher
-                        granularity={granularity}
-                        isRangeMode={isRangeMode}
+                        scope={scope}
                         periodAnchor={periodAnchor}
                         dateFrom={filters.dateFrom}
                         dateTo={filters.dateTo}
                         onScopeChange={handleScopeChange}
-                        onRangeToggle={handleRangeToggle}
                         onPeriodShift={handlePeriodShift}
                         onToday={handleToday}
-                        onDateFromChange={handleDateFromChange}
-                        onDateToChange={handleDateToChange}
+                        onCustomSelect={handleCustomSelect}
                         leftContent={
                             <>
                                 <TextInput
@@ -1371,7 +1417,9 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     />
                 </div>
             )}
+            </div>
 
+            <div className="flex-1 min-h-0 overflow-y-auto">
             {/* spinner */}
             {((activeTab === 'recurring' ? isLoadingSeries : isLoading) || isLoadingRoster) && <div className="flex justify-center py-12"><Loader size="sm" /></div>}
 
@@ -1492,11 +1540,7 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         <p className="text-sm text-gray-400 text-center py-12">No bookings found.</p>
                     )}
 
-                    {total !== null && total > pageSizeUsed ? (
-                        <div className="border-t border-gray-100 px-5 py-3">
-                            <PageNav page={page} total={total} pageSize={pageSizeUsed} onJump={handlePageJump} />
-                        </div>
-                    ) : total === null && hasMore && (
+                    {cursor !== null && (
                         <div className="border-t border-gray-100">
                             <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
                         </div>
@@ -1504,9 +1548,10 @@ const Bookings = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 </div>
             )}
 
-            {!isLoading && !isLoadingRoster && activeTab === 'requests' && total === null && hasMore && (
+            {!isLoading && !isLoadingRoster && activeTab === 'requests' && cursor !== null && (
                 <LoadMoreSentinel onVisible={handleLoadMore} loading={isLoadingMore} />
             )}
+            </div>
 
             {/* approve/deny request modal — admin only */}
             {!isCustomer && <Modal

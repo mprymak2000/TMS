@@ -190,8 +190,7 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
     const navigate = useNavigate()
     const [loaded, setLoaded] = useState(false)
     const [occurrences, setOccurrences] = useState<Booking[]>([])
-    const [page, setPage] = useState(1)
-    const [hasMore, setHasMore] = useState(false)
+    const [cursor, setCursor] = useState<string | null>(null)
     const [isLoading, setIsLoading] = useState(false)
     const [isLoadingMore, setIsLoadingMore] = useState(false)
     // frozen at mount — a series row only has one pagination lifetime per mount, no tab/scope
@@ -228,20 +227,20 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
     // empty trailing grid cells just because the row could technically fit more.
     const gridColumns = Math.max(1, Math.min(fitColumns, occurrences.length || 1))
 
-    const loadOccurrences = async (pageNum: number, append: boolean) => {
+    const loadOccurrences = async (cursorParam: string | null, append: boolean) => {
         if (append) setIsLoadingMore(true)
         else setIsLoading(true)
         try {
             const includeCancelledParam = includeCancelled ? '&include_cancelled=true' : ''
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}/occurrences?time_min=${boundaryRef.current}&page=${pageNum}&page_size=${fitColumns}${includeCancelledParam}`)
+            const cursorParamStr = cursorParam ? `&cursor=${encodeURIComponent(cursorParam)}` : ''
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}/occurrences?time_min=${boundaryRef.current}&page_size=${fitColumns}${cursorParamStr}${includeCancelledParam}`)
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to load occurrences.'))
                 return
             }
             const body = await res.json()
             setOccurrences(prev => append ? [...prev, ...body.items] : body.items)
-            setPage(pageNum)
-            setHasMore(body.has_more)
+            setCursor(body.next_cursor)
             setLoaded(true)
         } catch (error) {
             console.error(error)
@@ -256,15 +255,15 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
     // list, so this can flip true either from clicking this row directly or (indirectly) from the
     // single-expansion logic collapsing/opening rows elsewhere.
     useEffect(() => {
-        if (expanded && !loaded) loadOccurrences(1, false)
+        if (expanded && !loaded) loadOccurrences(null, false)
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [expanded])
 
-    // Reload from page 1 whenever the "Show cancelled" filter flips while this row is already
+    // Reload from the start whenever the "Show cancelled" filter flips while this row is already
     // loaded — same reasoning as any other filter change, just scoped to this one series' own
     // fetch instead of the parent list's.
     useEffect(() => {
-        if (loaded) loadOccurrences(1, false)
+        if (loaded) loadOccurrences(null, false)
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [includeCancelled])
 
@@ -371,10 +370,10 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                             )}
                         </div>
                     )}
-                    {hasMore && (
+                    {cursor !== null && (
                         <div className="flex justify-center py-3">
                             <button
-                                onClick={() => loadOccurrences(page + 1, true)}
+                                onClick={() => loadOccurrences(cursor, true)}
                                 disabled={isLoadingMore}
                                 className="group flex items-center gap-1.5 px-4 py-1.5 rounded-full border border-gray-200 bg-white text-xs font-medium text-gray-600 hover:border-indigo-300 hover:text-indigo-600 hover:bg-indigo-50 transition-colors disabled:opacity-50 disabled:pointer-events-none"
                             >
