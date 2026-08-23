@@ -5,7 +5,10 @@ import Availability from './Availability'
 import EventTypes from './EventTypes'
 import EventTypePage from './EventTypePage'
 import BookingPage from './BookingPage'
-import Bookings from './Bookings'
+import BookingsLayout from './BookingsLayout'
+import ScheduleTab from './ScheduleTab'
+import RecurringTab from './RecurringTab'
+import RequestsTab from './RequestsTab'
 import Tutors from './Tutors'
 import ManageOccurrence from './ManageOccurrence'
 import ManageSeries from './ManageSeries'
@@ -29,7 +32,7 @@ function App() {
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const location = useLocation()
-  const isBookings = location.pathname === '/bookings'
+  const isBookings = location.pathname.startsWith('/bookings')
 
   return (
     <MantineProvider theme={theme}>
@@ -37,7 +40,10 @@ function App() {
         <Route path="/book/:eventTypeId" element={<BookingPage />} />
         <Route path="/manage-occurrence/:ref" element={<ManageOccurrence />} />
         <Route path="/manage-series/:ref" element={<ManageSeries />} />
-        <Route path="/my-bookings" element={<Bookings isCustomer={true} />} />
+        <Route path="/my-bookings" element={<BookingsLayout />}>
+          <Route index element={<ScheduleTab isCustomer={true} />} />
+          <Route path="recurring" element={<RecurringTab isCustomer={true} />} />
+        </Route>
         <Route path="/*" element={
       <div className="flex h-screen bg-gray-800 p-3 gap-3">
 
@@ -50,7 +56,7 @@ function App() {
               <NavLink
                 key={item.to}
                 to={item.to}
-                end
+                end={item.to === '/'}
                 className={({ isActive }) =>
                   `px-3 py-2 rounded text-sm transition-colors ${isActive ? 'bg-indigo-600 text-white font-medium' : 'text-gray-400 hover:bg-gray-800 hover:text-white'}`
                 }
@@ -103,7 +109,11 @@ function App() {
                 <Route path="/availability" element={<Availability />} />
                 <Route path="/event-types" element={<EventTypes />} />
                 <Route path="/event-types/:id" element={<EventTypePage />} />
-                <Route path="/bookings" element={<Bookings />} />
+                <Route path="/bookings" element={<BookingsLayout />}>
+                  <Route index element={<ScheduleTab />} />
+                  <Route path="recurring" element={<RecurringTab />} />
+                  <Route path="requests" element={<RequestsTab />} />
+                </Route>
               </Routes>
             </div>
           </main>
