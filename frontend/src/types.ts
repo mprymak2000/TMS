@@ -131,13 +131,15 @@ export interface BookingSeries {
   tutor_id: number
   event_type_id: number
   student_id: number | null
+  created: string
+  last_modified: string
+  dtstart: string
+  dtend: string
+  status: string | null
+  until: string | null
+  rescheduled_to: string | null
+  rescheduled_from: string | null
   is_active: boolean
-  start_day_of_week: number
-  end_day_of_week: number
-  start_time: string
-  end_time: string
-  timezone: string | null
-  recur_until: string | null
   google_event_id: string | null
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'

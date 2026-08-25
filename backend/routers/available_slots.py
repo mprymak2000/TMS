@@ -46,9 +46,10 @@ Two different mechanisms, for two different comparisons:
     Only the final survivors get resolved to a real date, once, at the very end
     (resolve_to_first_occurrence) — not every row up front.
 
-SCHEMA (as explicitly decided): BookingSeries stores explicit start/end weekday + time
-(start_day_of_week, start_time, end_day_of_week, end_time) — no duration field. This
-was a direct decision, not an assumption: keeps the overlap check simple to read
+SCHEMA (as explicitly decided): BookingSeries stores explicit local start/end datetimes
+(dtstart, dtend) — weekday + time-of-day pairs are derived from these (.weekday(), .time()),
+not stored separately, and there's no separate duration field (series.duration = dtend - dtstart).
+This was a direct decision, not an assumption: keeps the overlap check simple to read
 (WeekdayTime pairs) and gives an overnight infinite series an unambiguous end.
 
 EDGE CASES
@@ -97,11 +98,11 @@ time silently shifts wall-clock time by ±1hr across DST boundaries. With one ca
 timezone, all of a tutor's series always share the same DST regime: no gap or overlap
 between adjacent lessons can appear when clocks change.
 
-Schedule.timezone and BookingSeries.timezone are currently stored but redundant —
-both always equal Settings.business_timezone. They are nullable pending a refactor
-that replaces them with a single Settings load. Migration: on canonical timezone
-change, shift all series/schedule times by the old→new offset (using .now() for the
-current DST state), then update Settings.
+Schedule.timezone is currently stored but redundant — always equals Settings.business_timezone.
+Nullable pending a refactor that replaces it with a single Settings load (BookingSeries dropped
+its own timezone column already — dtstart/dtend are local values resolved via Settings directly,
+no per-row timezone at all). Migration: on canonical timezone change, shift all series/schedule
+times by the old→new offset (using .now() for the current DST state), then update Settings.
 
 Display timezone is separate from storage timezone. The frontend converts canonical
 times to the viewer's browser timezone (or a user-selected display timezone) for
@@ -120,6 +121,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from booking_utils import active_series_filter
 from database import get_db
 from gcal import SCOPES, get_calendar_service
 from models import Booking, BookingSeries, EventType, EventTypeAvailability, Settings, Tutor
@@ -648,10 +650,11 @@ def get_available_slots(
     # candidates in one pass can span multiple weekdays anyway). Holes come from any
     # of the series' own occurrences that were cancelled/rescheduled.
     inf_rules = {t.id: [] for t in db_tutors}
+    today = datetime.now(business_tz).date()
     for series in db.query(BookingSeries).filter(
         BookingSeries.tutor_id.in_(tutor_ids),
-        BookingSeries.is_active == True,
-        BookingSeries.recur_until == None,
+        active_series_filter(today),
+        BookingSeries.until == None,
     ).all():
         dev_starts = set()
         for booked in series.bookings:
@@ -659,8 +662,8 @@ def get_available_slots(
                 dev_start_utc = booked.start if booked.start.tzinfo else booked.start.replace(tzinfo=UTC)
                 dev_starts.add(dev_start_utc.astimezone(business_tz).date())
 
-        rule_start = WeekdayTime(series.start_day_of_week, series.start_time)
-        rule_end = WeekdayTime(series.end_day_of_week, series.end_time)
+        rule_start = WeekdayTime(series.dtstart.weekday(), series.dtstart.time())
+        rule_end = WeekdayTime(series.dtend.weekday(), series.dtend.time())
         inf_rules[series.tutor_id].append((rule_start, rule_end, dev_starts))
 
     # freebusy merged upfront for standalone/finite — infinite needs its own per-tutor

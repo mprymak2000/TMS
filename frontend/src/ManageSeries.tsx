@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import type { BookingSeries, EventType } from './types'
-import { formatDate, formatUTCTime, extractError, DAY_NAMES } from './utils'
+import { formatDate, formatUTCTime, extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
 
 interface LoadErrors {
     series?: string
@@ -144,10 +144,10 @@ const ManageSeries = () => {
                 {/* series details */}
                 <div className="bg-gray-50 rounded-xl px-5 py-4 mb-6">
                     <p className="text-sm font-semibold text-gray-900">
-                        Every {DAY_NAMES[series.start_day_of_week]} at {formatUTCTime(series.start_time)}
+                        Every {DAY_NAMES[weekdayOf(series.dtstart)]} at {formatUTCTime(timeOf(series.dtstart))}
                     </p>
-                    {series.recur_until && (
-                        <p className="text-sm text-gray-500 mt-0.5">Until {formatDate(series.recur_until)}</p>
+                    {series.until && (
+                        <p className="text-sm text-gray-500 mt-0.5">Until {formatDate(series.until)}</p>
                     )}
                     <p className="text-sm text-gray-400 mt-1">{series.student_first} {series.student_last}</p>
                 </div>
@@ -175,8 +175,8 @@ const ManageSeries = () => {
                                         onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
-                                            originalDayOfWeek: series.start_day_of_week,
-                                            originalStartTime: series.start_time,
+                                            originalDayOfWeek: weekdayOf(series.dtstart),
+                                            originalStartTime: timeOf(series.dtstart),
                                             studentFirst: series.student_first,
                                             studentLast: series.student_last,
                                             studentEmail: series.student_email,
@@ -200,8 +200,8 @@ const ManageSeries = () => {
                                         onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
-                                            originalDayOfWeek: series.start_day_of_week,
-                                            originalStartTime: series.start_time,
+                                            originalDayOfWeek: weekdayOf(series.dtstart),
+                                            originalStartTime: timeOf(series.dtstart),
                                             studentFirst: series.student_first,
                                             studentLast: series.student_last,
                                             studentEmail: series.student_email,

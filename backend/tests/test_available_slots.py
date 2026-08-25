@@ -7,8 +7,8 @@ independence, deviation holes, and finite-vs-infinite series distinction.
 
 Setup strategy: tutors/schedules/event_types are created via the HTTP client
 (same as other test files). BookingSeries and Booking rows that need precise
-schema control (e.g. start_day_of_week, end_day_of_week) are inserted directly
-via a db session that shares the same SQLite file as the client.
+schema control (e.g. exact dtstart/dtend, including midnight-crossing cases)
+are inserted directly via a db session that shares the same SQLite file as the client.
 
 June 2099 starts on a Monday: 2099-06-07=Sun, 2099-06-08=Mon, 2099-06-10=Wed.
 """
@@ -105,14 +105,14 @@ def _mon_9_17(client, tutor_id: int) -> dict:
 def _insert_series(db, tutor_id: int, event_type_id: int, *,
                    start_dow: int, start_t: time,
                    end_dow: int, end_t: time,
-                   timezone: str = "UTC",
-                   recur_until: date | None = None) -> BookingSeries:
+                   until: date | None = None) -> BookingSeries:
+    start_date = MON + timedelta(days=start_dow)  # value doesn't matter to available_slots
+    end_date = start_date + timedelta(days=(end_dow - start_dow) % 7)  # wraps forward for midnight-crossing cases
     s = BookingSeries(
         tutor_id=tutor_id, event_type_id=event_type_id,
-        start_date=MON + timedelta(days=start_dow),  # value doesn't matter to available_slots
-        start_day_of_week=start_dow, start_time=start_t,
-        end_day_of_week=end_dow, end_time=end_t,
-        timezone=timezone, is_active=True, recur_until=recur_until,
+        dtstart=datetime.combine(start_date, start_t),
+        dtend=datetime.combine(end_date, end_t),
+        until=until,
         google_event_id=str(uuid4()),
         student_first="A", student_last="B",
         student_email="a@b.com", student_phone="555-0000",
@@ -303,17 +303,17 @@ def test_infinite_existing_series_thins_schedule_at_its_span(client, db):
 
 
 def test_infinite_finite_series_does_not_thin_schedule(client, db):
-    """Series with recur_until set is excluded from inf_rules — it doesn't thin
+    """Series with until set is excluded from inf_rules — it doesn't thin
     the schedule, so those time ranges remain bookable for a new infinite series."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
     et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True)
 
-    # finite series (recur_until in the past — completely done)
+    # finite series (until in the past — completely done)
     series = _insert_series(db, tutor["id"], et["id"],
                             start_dow=0, start_t=time(9, 0),
                             end_dow=0, end_t=time(10, 30),
-                            recur_until=date(2020, 1, 1))
+                            until=date(2020, 1, 1))
     _insert_booking(db, tutor["id"], et["id"],
                     _dt(date(2020, 1, 6), 9), _dt(date(2020, 1, 6), 10, 30), series=series)
 
@@ -604,13 +604,11 @@ def test_dst_adjacent_infinite_series_no_gap_across_spring_forward(client, db):
     # Series A: SF student booked Mon 09:00–10:30 NY (stored in canonical NY)
     series_a = _insert_series(db, tutor["id"], et["id"],
                               start_dow=0, start_t=time(9, 0),
-                              end_dow=0, end_t=time(10, 30),
-                              timezone="America/New_York")
+                              end_dow=0, end_t=time(10, 30))
     # Series B: Spain student booked Mon 10:30–12:00 NY (different local DST dates, same canonical)
     series_b = _insert_series(db, tutor["id"], et["id"],
                               start_dow=0, start_t=time(10, 30),
-                              end_dow=0, end_t=time(12, 0),
-                              timezone="America/New_York")
+                              end_dow=0, end_t=time(12, 0))
 
     # Seed one confirmed occurrence each so the series appear in busy_dict
     _insert_booking(db, tutor["id"], et["id"],

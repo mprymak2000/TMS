@@ -3,7 +3,7 @@ import { Loader, Menu } from '@mantine/core'
 import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconArrowBackUp, IconPlus, IconMinus } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingSeries, Tutor, EventType } from './types'
-import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime } from './utils'
+import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf } from './utils'
 import { statusConfig } from './BookingRow'
 import { useBookingActions } from './useBookingActions'
 
@@ -267,7 +267,7 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [includeCancelled])
 
-    const timeStr = `${formatUTCTime(series.start_time)} – ${formatUTCTime(series.end_time)}`
+    const timeStr = `${formatUTCTime(timeOf(series.dtstart))} – ${formatUTCTime(timeOf(series.dtend))}`
 
     return (
         <div ref={containerRef}>
@@ -283,7 +283,7 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                     {tutor.first_name} {tutor.last_name} · {series.student_first} {series.student_last}
                 </span>
                 <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
-                    {eventType.name}{series.recur_until ? ` · until ${formatDate(series.recur_until)}` : ''}
+                    {eventType.name}{series.until ? ` · until ${formatDate(series.until)}` : ''}
                 </span>
                 <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} onClick={e => e.stopPropagation()}>
                     {isCustomer ? (
@@ -307,8 +307,8 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                                         state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
-                                            originalDayOfWeek: series.start_day_of_week,
-                                            originalStartTime: series.start_time,
+                                            originalDayOfWeek: weekdayOf(series.dtstart),
+                                            originalStartTime: timeOf(series.dtstart),
                                             studentFirst: series.student_first,
                                             studentLast: series.student_last,
                                             studentEmail: series.student_email,

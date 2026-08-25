@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 from zoneinfo import ZoneInfo
-from sqlalchemy import func, or_, tuple_
+from sqlalchemy import and_, func, or_, tuple_
 from sqlalchemy.orm import Session
 from models import Booking, BookingSeries, EventType, Tutor
 from schemas import BookingFacets, BookingResponse, EventTypeFacetOption, StudentFacetOption, TutorFacetOption
@@ -14,8 +14,8 @@ from fastapi import HTTPException
 
 def _occurrence_end(series: BookingSeries, start_local_date: date, tz: ZoneInfo) -> datetime:
     """Given a series and a candidate local start date, compute the occurrence's UTC end time."""
-    end_date = start_local_date + timedelta(days=(series.end_day_of_week - series.start_day_of_week) % 7)
-    return datetime.combine(end_date, series.end_time, tzinfo=tz).astimezone(UTC)
+    start_local = datetime.combine(start_local_date, series.dtstart.time(), tzinfo=tz)
+    return (start_local + series.duration).astimezone(UTC)
 
 
 def _to_local_date(dt: datetime, tz: ZoneInfo) -> date:
@@ -32,7 +32,7 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         return booking
     tz = ZoneInfo(settings.business_timezone)
     start_local = start_utc.astimezone(tz)
-    if start_local.weekday() != series.start_day_of_week or start_local.time() != series.start_time:
+    if start_local.weekday() != series.dtstart.weekday() or start_local.time() != series.dtstart.time():
         raise ValueError("Datetime does not match series schedule")
     earliest = db.query(func.min(Booking.start)).filter(Booking.series_id == series.id).scalar()
     if earliest is not None:
@@ -63,6 +63,37 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
     db.flush()
     db.refresh(new_booking)
     return new_booking
+
+
+def active_series_filter(today: date):
+    """SQL filter expression - a series is active unless explicitly cancelled/rescheduled, or its
+    until has passed. Full (customer-facing) definition - admin routes use a narrower status-only
+    check instead, see routers/bookings.py."""
+    return and_(
+        # NULL NOT IN (...) evaluates to NULL in SQL, not True - a fresh series (status IS NULL)
+        # would otherwise get silently filtered out. Handle NULL explicitly instead of relying on notin_.
+        or_(BookingSeries.status == None, BookingSeries.status.notin_(['cancelled', 'rescheduled'])),
+        or_(BookingSeries.until == None, BookingSeries.until >= today)
+    )
+
+
+def is_series_active(series: BookingSeries, today: date) -> bool:
+    """Python-side equivalent of active_series_filter, for a single already-loaded series."""
+    if series.status in ('cancelled', 'rescheduled'):
+        return False
+    return series.until is None or series.until >= today
+
+
+def series_inactive_reason(series: BookingSeries, today: date) -> str:
+    """Human-readable reason a series is no longer active. Verifies its claim rather than assuming -
+    only meaningful once is_series_active(series, today) is already known False."""
+    if series.status == 'cancelled':
+        return "This series has been cancelled"
+    if series.status == 'rescheduled':
+        return "This series has been rescheduled"
+    if series.until is not None and series.until < today:
+        return "This series has ended"
+    return "This series is not currently active"  # defensive fallback - shouldn't be reachable
 
 
 def resolve_ref(ref: str, db: Session, settings) -> Booking:
@@ -98,11 +129,12 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
     series = db.query(BookingSeries).filter(BookingSeries.public_id == series_public_id).first()
     if not series:
         raise HTTPException(status_code=404, detail="Booking not found")
-    if not series.is_active:
-        raise HTTPException(status_code=400, detail="Booking series has been cancelled")
-    if series.recur_until is not None:
-        tz = ZoneInfo(settings.business_timezone)
-        if _to_local_date(start_utc, tz) > series.recur_until:
+    tz = ZoneInfo(settings.business_timezone)
+    today = datetime.now(tz).date()
+    if not is_series_active(series, today):
+        raise HTTPException(status_code=400, detail=series_inactive_reason(series, today))
+    if series.until is not None:
+        if _to_local_date(start_utc, tz) > series.until:
             raise HTTPException(status_code=400, detail="Occurrence is past the end of this series")
 
     try:
@@ -125,20 +157,20 @@ def _virtual_occurrences(
     skipping materialized dates and anything at/before `cursor`. Never touches the DB.
 
     time_min/time_max are optional, mirroring Google's timeMin/timeMax. count=None is only
-    safe when time_max or recur_until bounds the walk - otherwise it never terminates.
+    safe when time_max or until bounds the walk - otherwise it never terminates.
     Cursor is a decoded (start, public_id) resume point from the client's prior page - resumes
-    from there instead of walking from series.start_date/time_min. Guaranteed to fall within
+    from there instead of walking from series.dtstart/time_min. Guaranteed to fall within
     [time_min/flor_date, time_max]: decode_cursor rejects a cursor minted under a different time window
     before this function ever sees it.
     """
-    if count is None and time_max is None and series.recur_until is None:
+    if count is None and time_max is None and series.until is None:
         raise ValueError("_virtual_occurrences: unbounded walk - series is indefinite and neither count nor time_max is set")
 
     tz = ZoneInfo(settings.business_timezone)
     existing_starts = {b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC) for b in series.bookings} # existing materialized occurrences part of series, to skip when generating virtual occurrences
 
-    # Need a FLOOR so no virtual occurrences are generated before the series actually started. 
-    floor_date = series.start_date
+    # Need a FLOOR so no virtual occurrences are generated before the series actually started.
+    floor_date = series.dtstart.date()
     if time_min is not None:
         floor_date = max(floor_date, _to_local_date(time_min, tz))
     if cursor is not None:
@@ -149,18 +181,18 @@ def _virtual_occurrences(
 
     # point at the first occurrence in local time, then jump forward by one week (DST safe) and generate occurrence objects
     current_date = floor_date
-    days_until_next_occurrence = (series.start_day_of_week - current_date.weekday()) % 7 # 0 if current_date is already on the right day of week
+    days_until_next_occurrence = (series.dtstart.weekday() - current_date.weekday()) % 7 # 0 if current_date is already on the right day of week
     current_date += timedelta(days=days_until_next_occurrence) # no-op if days_until_next_occurrence is 0
 
     occurrences = []
     while count is None or len(occurrences) < count:
-        # if series is finite, stop generating occurrences after recur_until - can't have more occurrences
-        if series.recur_until is not None and current_date > series.recur_until:
+        # if series is finite, stop generating occurrences after until - can't have more occurrences
+        if series.until is not None and current_date > series.until:
             break
         # if upper bound date is set, stop generating occurrences after time_max
         if time_max_date is not None and current_date > time_max_date:
             break
-        start_utc = datetime.combine(current_date, series.start_time, tzinfo=tz).astimezone(UTC) # next ocurrence local -> utc
+        start_utc = datetime.combine(current_date, series.dtstart.time(), tzinfo=tz).astimezone(UTC) # next ocurrence local -> utc
         public_id = f"{series.public_id}:{int(start_utc.timestamp())}"
 
         # skip occurrences already materialized, or at/before the resume point (avoids duplicating the cursor's own occurrence)
@@ -246,7 +278,7 @@ def merge_occurrences(
 def apply_booking_time_scope(query, time_min: datetime | None, time_max: datetime | None, include_cancelled: bool):
     """Time/status scope for a Booking query — mirrors Google Calendar's showDeleted (default
     False, excludes cancelled/rescheduled-away rows). Only ever applies to Booking; BookingSeries
-    has no status/start columns to scope this way."""
+    has no real occurrence timestamp to scope this way directly (see apply_series_time_scope)."""
     assert query.column_descriptions[0]["entity"] is Booking, "apply_booking_time_scope only applies to Booking queries"
     if not include_cancelled:
         query = query.filter(Booking.status == "confirmed")
@@ -259,14 +291,14 @@ def apply_booking_time_scope(query, time_min: datetime | None, time_max: datetim
 
 def apply_series_time_scope(query, time_min: datetime | None, time_max: datetime | None, tz: ZoneInfo):
     """Return the query filtered to only series that could have occurrences within [time_min, time_max].
-    Floor from the series' own first Booking row (not the mutable start_date). Ceiling is
-    recur_until when set, else the series is indefinite/always still running - no ceiling check."""
+    Floor from the series' own first Booking row (not the mutable dtstart). Ceiling is
+    until when set, else the series is indefinite/always still running - no ceiling check."""
     assert query.column_descriptions[0]["entity"] is BookingSeries, "apply_series_time_scope only applies to BookingSeries queries"
     if time_max is not None:
         query = query.filter(BookingSeries.bookings.any(Booking.start <= time_max))
     if time_min is not None:
         time_min_local = _to_local_date(time_min, tz)
-        query = query.filter(or_(BookingSeries.recur_until == None, BookingSeries.recur_until >= time_min_local))
+        query = query.filter(or_(BookingSeries.until == None, BookingSeries.until >= time_min_local))
     return query
 
 

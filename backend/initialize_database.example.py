@@ -1,6 +1,6 @@
 import requests
 import psycopg2
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 API = "http://localhost:8000"
@@ -215,16 +215,17 @@ insert_standalone_booking(
 
 # Recurring series: John, Tutoring Session, weekly Wednesdays 5:00-6:30pm, 8 occurrences.
 series_start = next_weekday(2)  # Wednesday
-recur_until = series_start + timedelta(weeks=7)
+series_dtstart = datetime.combine(series_start, time(17, 0))
+series_dtend = datetime.combine(series_start, time(18, 30))
+series_until = series_start + timedelta(weeks=7)
 cur.execute("""
     INSERT INTO booking_series (
-        tutor_id, event_type_id, start_day_of_week, end_day_of_week, start_time, end_time,
-        timezone, is_active, recur_until, google_event_id,
+        tutor_id, event_type_id, dtstart, dtend, until, google_event_id,
         student_id, student_first, student_last, student_email, student_phone
-    ) VALUES (%s, %s, 2, 2, '17:00', '18:30', %s, true, %s, %s, %s, %s, %s, %s, %s)
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     RETURNING id
 """, (
-    tutor_id, event_type_recurring["id"], "America/New_York", recur_until,
+    tutor_id, event_type_recurring["id"], series_dtstart, series_dtend, series_until,
     "demo-series-fake-event-id",
     john_id, "John", "Smith", "john.smith@example.com", "555-0101",
 ))

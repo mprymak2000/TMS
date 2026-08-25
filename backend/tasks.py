@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import SessionLocal
 from models import Booking, BookingSeries, Lesson, Settings
-from booking_utils import _ensure_occurrence
+from booking_utils import _ensure_occurrence, active_series_filter
 
 # Strip SQLAlchemy dialect prefix (+psycopg2) — psycopg3 expects plain postgresql://
 _dsn = os.getenv("DATABASE_URL", "").replace("+psycopg2", "")
@@ -41,9 +41,13 @@ def extend_all_series(timestamp: int):
     """Daily: fan out one extend_single_series job per active indefinite series."""
     db = SessionLocal()
     try:
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+        if settings is None:
+            raise RuntimeError("Settings row not found")
+        today = datetime.now(ZoneInfo(settings.business_timezone)).date()
         series_list = db.query(BookingSeries).filter(
-            BookingSeries.is_active == True,
-            BookingSeries.recur_until == None,
+            active_series_filter(today),
+            BookingSeries.until == None,
         ).all()
         for series in series_list:
             # .defer() inserts a row into procrastinate_jobs — the worker picks it up and
@@ -95,7 +99,7 @@ def extend_single_series(series_id: int):
             return
 
         next_date = latest.start.astimezone(tz).date() + timedelta(weeks=1)
-        next_start_utc = datetime.combine(next_date, series.start_time, tzinfo=tz).astimezone(UTC)
+        next_start_utc = datetime.combine(next_date, series.dtstart.time(), tzinfo=tz).astimezone(UTC)
         _ensure_occurrence(series, next_start_utc, db, settings)
         db.commit()
     except Exception:

@@ -1,7 +1,7 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime
+from sqlalchemy import Column, Integer, String, Float, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime, func
 from sqlalchemy.orm import relationship, backref
 from database import Base
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from uuid import uuid4
 from policy import get_cancel_action, get_reschedule_action
 
@@ -190,22 +190,15 @@ class BookingSeries(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
+    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
     event_type_id = Column(Integer, ForeignKey("event_types.id"), nullable=False)
-    start_date = Column(Date, nullable=False)
-    start_day_of_week = Column(Integer, nullable=False)  # 0 Monday, 6 Sunday — local schedule timezone
-    end_day_of_week = Column(Integer, nullable=False)    # usually same as start; differs only for midnight-crossing sessions
-    # stored as local time (schedule timezone) — intentionally NOT UTC, same reasoning as ScheduleDay:
-    # time-only fields have no date, so UTC offset is indeterminate across DST transitions.
-    start_time = Column(Time, nullable=False)
-    end_time = Column(Time, nullable=False)
-    # TODO: redundant — always equals Settings.business_timezone. Migration plan: on canonical timezone change,
-    # shift all series start_time/end_time by the old→new offset using .now() for the current DST offset,
-    # then update Settings. Drop this column and load from Settings everywhere. Make nullable for now so
-    # nothing breaks while frontend still passes it.
-    timezone = Column(String, nullable=True)
-    is_active = Column(Boolean, nullable=False, default=True)
-    recur_until = Column(Date, nullable=True)      # null = infinite; date = series ends on this date
+    dtstart = Column(DateTime, nullable=False)  # naive local time, not UTC — see ScheduleDay.start_time
+    dtend = Column(DateTime, nullable=False)
+    status = Column(String, nullable=True)  # 'cancelled' | 'rescheduled' | null (active/finished derived, see is_active)
+    until = Column(Date, nullable=True)      # null = indefinite
+    rescheduled_to = Column(Integer, ForeignKey("booking_series.id", ondelete="SET NULL"), nullable=True)
     google_event_id = Column(String, nullable=True) # google calendar series master event
 
     student_id = Column(Integer, ForeignKey("students.id"), nullable=True)
@@ -221,6 +214,27 @@ class BookingSeries(Base):
     student_record = relationship("Student")
     bookings = relationship("Booking", back_populates="series")
     request = relationship("BookingRequest", back_populates="series", uselist=False)
+    # backref: rescheduled_from_series (uselist=False) — the predecessor series that got
+    # rescheduled into this one, if any. Not a stored column, resolved on access.
+    rescheduled_to_series = relationship(
+        "BookingSeries",
+        remote_side=[id],
+        foreign_keys=[rescheduled_to],
+        backref=backref("rescheduled_from_series", uselist=False),
+    )
+
+    @property
+    def rescheduled_to_public_id(self) -> str | None:
+        return self.rescheduled_to_series.public_id if self.rescheduled_to_series else None
+
+    @property
+    def rescheduled_from_public_id(self) -> str | None:
+        return self.rescheduled_from_series.public_id if self.rescheduled_from_series else None
+
+    @property
+    def duration(self) -> timedelta:
+        return self.dtend - self.dtstart
+
 
     @property
     def _next_upcoming_minutes_until(self) -> float:

@@ -469,13 +469,18 @@ class BookingSeriesResponse(BaseModel):
     tutor_id: int
     event_type_id: int
     student_id: int | None = None
-    is_active: bool
-    start_day_of_week: int
-    end_day_of_week: int
-    start_time: time
-    end_time: time
-    timezone: str | None = None  # redundant — always Settings.business_timezone; nullable pending refactor
-    recur_until: date | None = None
+    created: datetime
+    last_modified: datetime
+    dtstart: datetime
+    dtend: datetime
+    status: str | None = None
+    until: date | None = None
+    rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
+    rescheduled_from: str | None = Field(default=None, validation_alias="rescheduled_from_public_id")
+    # Not read from the ORM object (no such attribute exists there) - always set explicitly by the
+    # router via is_series_active(series, today), since it needs business-local "today" to compute
+    # correctly. See routers/bookings.py response-construction sites.
+    is_active: bool | None = None
     google_event_id: str | None = None
     cancel_action: str
     reschedule_action: str

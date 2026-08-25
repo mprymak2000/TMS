@@ -13,6 +13,12 @@ export const formatShortDate = (iso: string) =>
 export const formatUTCTime = (timeStr: string) =>
     new Date(`1970-01-01T${timeStr}Z`).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'UTC' })
 
+// dtstart/dtend are naive local datetime strings (no Z) — series' own business-local wall-clock
+// time, not the viewer's. Appending Z is just a neutral, dependency-free way to read the digits
+// back out unchanged (any consistent frame round-trips correctly; UTC needs no extra library).
+export const weekdayOf = (dtstart: string) => (new Date(dtstart + 'Z').getUTCDay() + 6) % 7  // Mon=0..Sun=6
+export const timeOf = (dtstart: string) => dtstart.split('T')[1]
+
 export const extractError = (err: any, fallback: string): string => {
     if (typeof err.detail === 'string') return err.detail
     console.error(err.detail?.map((e: any) => `${e.loc.join('.')} - ${e.msg}`).join('\n'))
@@ -54,6 +60,6 @@ export const parseLocalDateStr = (s: string): Date => {
     return new Date(y, m - 1, d)
 }
 
-// start_day_of_week convention used by BookingSeries: 0 = Monday .. 6 = Sunday.
+// weekdayOf's convention (and BookingSeries.dtstart's derived weekday): 0 = Monday .. 6 = Sunday.
 export const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 export const DAY_LABELS = DAY_NAMES.map(d => d.slice(0, 3))

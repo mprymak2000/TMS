@@ -4,7 +4,7 @@ import { useOutletContext } from 'react-router-dom'
 import { TextInput, Loader, Button, Modal } from '@mantine/core'
 import { IconSearch } from '@tabler/icons-react'
 import type { Tutor, EventType, BookingSeries, TutorFacetOption, EventTypeFacetOption, StudentFacetOption } from './types'
-import { extractError, DAY_NAMES } from './utils'
+import { extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
 import SeriesRow from './SeriesRow'
 import type { BookingsOutletContext } from './BookingsLayout'
 import { FiltersMenu, ActiveFilterChips, OrderToggle } from './BookingToolbar'
@@ -199,15 +199,15 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const displayedSeries = seriesList
         .filter(s => getSeriesSearchString(s).includes(filters.searchQuery.trim().toLowerCase()))
 
-    // Grouped Monday(0)..Sunday(6), skipping days with nothing to show, sorted by start_time
+    // Grouped Monday(0)..Sunday(6), skipping days with nothing to show, sorted by time-of-day
     // within each day — "HH:MM:SS" strings compare correctly lexicographically.
     const seriesByDay = DAY_NAMES
         .map((name, day) => ({
             day,
             name,
             series: displayedSeries
-                .filter(s => s.start_day_of_week === day)
-                .sort((a, b) => order === 'desc' ? b.start_time.localeCompare(a.start_time) : a.start_time.localeCompare(b.start_time)),
+                .filter(s => weekdayOf(s.dtstart) === day)
+                .sort((a, b) => order === 'desc' ? timeOf(b.dtstart).localeCompare(timeOf(a.dtstart)) : timeOf(a.dtstart).localeCompare(timeOf(b.dtstart))),
         }))
         .filter(({ series }) => series.length > 0)
     const orderedSeriesByDay = order === 'desc' ? [...seriesByDay].reverse() : seriesByDay

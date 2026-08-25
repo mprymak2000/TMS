@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta, UTC
+from datetime import datetime, timedelta, UTC
 import time
 from unittest.mock import patch, MagicMock
 from conftest import TestingSessionLocal
@@ -771,7 +771,7 @@ def test_my_bookings_never_writes_to_db(client):
 
 def test_my_bookings_no_bounds_returns_since_inception(client):
     """Omitting time_min entirely must not implicitly default to 'now' — it means unbounded,
-    starting from the series' actual start_date, however far in the past that is."""
+    starting from the series' actual dtstart, however far in the past that is."""
     tutor, event_type = setup_recurring(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
@@ -779,7 +779,7 @@ def test_my_bookings_no_bounds_returns_since_inception(client):
 
     db = TestingSessionLocal()
     series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
-    series.start_date = date(2020, 1, 8)  # well before "now" and far before the booking's 2099 start
+    series.dtstart = datetime(2020, 1, 8, 16, 0)  # well before "now" and far before the booking's 2099 start
     db.commit()
     db.close()
 
@@ -828,7 +828,7 @@ def test_my_bookings_bounded_range_paginates_with_total_count(client):
 
 def test_my_bookings_time_max_only_still_gets_total_count(client):
     """time_max alone is enough to guarantee termination (the walk's floor is always a real
-    anchor — series.start_date when time_min is omitted), so a time_max-only query is just as
+    anchor — series.dtstart when time_min is omitted), so a time_max-only query is just as
     safely bounded as a fully-specified range and should get the same real total, not fall back
     to the unbounded/Load-More path. Same 12-occurrence series as the fully-bounded test above,
     with time_min dropped entirely (the series itself starts 2099-06-10, same effective floor)."""
@@ -928,8 +928,8 @@ def test_my_bookings_order_rejects_invalid_value(client):
     assert client.get("/bookings/?order=sideways").status_code == 400
 
 
-def test_virtual_occurrences_anchored_to_start_date_not_earliest_booking(client):
-    """The lower bound for virtual generation must come from series.start_date, not from
+def test_virtual_occurrences_anchored_to_dtstart_not_earliest_booking(client):
+    """The lower bound for virtual generation must come from series.dtstart, not from
     scanning for the earliest surviving real row — proven by deleting that row entirely."""
     tutor, event_type = setup_recurring(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
@@ -1074,7 +1074,10 @@ def test_manage_series_reschedule_direct(client):
             json={**reschedule_payload, "tutor_id": tutor["id"]},
         )
     assert response.status_code == 200
-    assert response.json()["id"] == created["series_id"]
+    # Reschedule inserts a new, immutable series row rather than mutating the old one in place -
+    # the response is the new series, distinct from (but linked back to) the original.
+    assert response.json()["id"] != created["series_id"]
+    assert response.json()["rescheduled_from"] == created["series_id"]
     all_bookings = _all_bookings()
     assert any(b["start"].startswith("2099-08-10") for b in all_bookings)
 
@@ -1396,14 +1399,15 @@ def test_booking_series_occurrences_past(client):
 
     db = TestingSessionLocal()
     booking = db.query(Booking).filter(Booking.public_id == created["id"]).first()
-    booking.start = datetime(2020, 1, 7, 16, 0, tzinfo=UTC)
-    booking.end = datetime(2020, 1, 7, 17, 0, tzinfo=UTC)
-    # series.start_date must move too — otherwise the series still legitimately claims to start
+    # Jan 8 2020 — must be a Wednesday, matching the series' own dtstart-derived weekday.
+    booking.start = datetime(2020, 1, 8, 16, 0, tzinfo=UTC)
+    booking.end = datetime(2020, 1, 8, 17, 0, tzinfo=UTC)
+    # series.dtstart must move too — otherwise the series still legitimately claims to start
     # in 2099, the floor stays clamped there regardless of time_min, and virtual generation
     # regenerates a phantom duplicate of the now-orphaned 2099 slot (existing_starts no longer
     # contains it once the row's start moved away from it).
     series = db.query(BookingSeries).filter(BookingSeries.id == booking.series_id).first()
-    series.start_date = date(2020, 1, 7)
+    series.dtstart = datetime(2020, 1, 8, 16, 0)
     db.commit()
     db.close()
 
@@ -1443,7 +1447,7 @@ def test_booking_series_occurrences_no_bounds_returns_since_inception(client):
 
     db = TestingSessionLocal()
     series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
-    series.start_date = date(2020, 1, 8)
+    series.dtstart = datetime(2020, 1, 8, 16, 0)
     db.commit()
     db.close()
 
