@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, UTC
+from datetime import date, datetime, timedelta, UTC
 import time
 from unittest.mock import patch, MagicMock
 from conftest import TestingSessionLocal
@@ -1311,6 +1311,25 @@ def test_get_booking_series_excludes_cancelled_series(client):
         client.delete(f"/bookings/booking-series/{created['series_id']}")
 
     assert client.get("/bookings/booking-series").json()["items"] == []
+
+
+def test_get_booking_series_excludes_naturally_expired_series(client):
+    """A series never cancelled, whose `until` has simply passed, must read as inactive too —
+    not just explicitly cancelled/rescheduled ones."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    db = TestingSessionLocal()
+    series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+    series.until = date.today() - timedelta(days=1)
+    db.commit()
+    db.close()
+
+    assert client.get("/bookings/booking-series").json()["items"] == []
+    manage = client.get(f"/bookings/manage-series/{created['series_id']}").json()
+    assert manage["is_active"] is False
 
 
 def test_get_booking_series_email_filter(client):

@@ -31,7 +31,11 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         # if exists, return. no-op. idempotent
         return booking
     tz = ZoneInfo(settings.business_timezone)
+    if series.status in ('cancelled', 'rescheduled'):
+        raise ValueError("Cannot materialize an occurrence for a cancelled or rescheduled series")
     start_local = start_utc.astimezone(tz)
+    if series.until is not None and start_local.date() > series.until:
+        raise ValueError("Datetime is past this series' until date")
     if start_local.weekday() != series.dtstart.weekday() or start_local.time() != series.dtstart.time():
         raise ValueError("Datetime does not match series schedule")
     earliest = db.query(func.min(Booking.start)).filter(Booking.series_id == series.id).scalar()
@@ -291,11 +295,15 @@ def apply_booking_time_scope(query, time_min: datetime | None, time_max: datetim
 
 def apply_series_time_scope(query, time_min: datetime | None, time_max: datetime | None, tz: ZoneInfo):
     """Return the query filtered to only series that could have occurrences within [time_min, time_max].
-    Floor from the series' own first Booking row (not the mutable dtstart). Ceiling is
-    until when set, else the series is indefinite/always still running - no ceiling check."""
+    Floor from the series' own dtstart (immutable, always honest - safe to trust directly now).
+    Ceiling is until when set, else the series is indefinite/always still running - no ceiling check."""
     assert query.column_descriptions[0]["entity"] is BookingSeries, "apply_series_time_scope only applies to BookingSeries queries"
     if time_max is not None:
-        query = query.filter(BookingSeries.bookings.any(Booking.start <= time_max))
+        # Convert time_max once, in Python, to a naive local datetime - dtstart is already naive
+        # local, so this keeps the comparison entirely in one frame (no per-row SQL conversion).
+        time_max_utc = time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)
+        time_max_local = time_max_utc.astimezone(tz).replace(tzinfo=None)
+        query = query.filter(BookingSeries.dtstart <= time_max_local)
     if time_min is not None:
         time_min_local = _to_local_date(time_min, tz)
         query = query.filter(or_(BookingSeries.until == None, BookingSeries.until >= time_min_local))

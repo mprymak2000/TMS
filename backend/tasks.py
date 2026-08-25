@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import SessionLocal
 from models import Booking, BookingSeries, Lesson, Settings
-from booking_utils import _ensure_occurrence, active_series_filter
+from booking_utils import _ensure_occurrence, active_series_filter, is_series_active
 
 # Strip SQLAlchemy dialect prefix (+psycopg2) — psycopg3 expects plain postgresql://
 _dsn = os.getenv("DATABASE_URL", "").replace("+psycopg2", "")
@@ -75,6 +75,13 @@ def extend_single_series(series_id: int):
         series = db.query(BookingSeries).filter(BookingSeries.id == series_id).first()
         if series is None:
             logging.warning(f"extend_single_series: series {series_id} not found")
+            return
+        # Enqueued when the series was active - may have been cancelled/closed since (a real
+        # race, since jobs sit queued before a worker picks them up). Expected, not an error:
+        # return cleanly rather than let _ensure_occurrence's ValueError trigger a retry loop
+        # that would just hit the same permanent state forever.
+        today = datetime.now(tz).date()
+        if not is_series_active(series, today):
             return
 
         has_future = (
