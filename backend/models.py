@@ -42,7 +42,7 @@ class Tutor(Base):
     check_calendar_conflicts = Column(Boolean, nullable=False, default=False)
 
     lessons = relationship("Lesson", back_populates="tutor")
-    schedules = relationship("Schedule", back_populates="tutor")
+    schedules = relationship("Schedule", back_populates="tutor", passive_deletes=True)
     bookings = relationship("Booking", back_populates="tutor")
     availability = relationship("EventTypeAvailability", back_populates="tutor", passive_deletes=True)
     series = relationship("BookingSeries", back_populates="tutor")
@@ -74,7 +74,7 @@ class ScheduleDay(Base):
     __tablename__ = "schedule_days"
 
     id = Column(Integer, primary_key=True, index=True)
-    schedule_id = Column(Integer, ForeignKey("schedules.id"), nullable=False)
+    schedule_id = Column(Integer, ForeignKey("schedules.id", ondelete="CASCADE"), nullable=False)
     day_of_week = Column(Integer, nullable=False)  # 0=Monday, 6=Sunday
     # stored as local time — intentionally NOT converted to UTC. Time-only fields have no date, so UTC offset
     # is indeterminate across DST transitions (e.g. "4pm EST" = 21:00 UTC in winter, 20:00 UTC in summer).
@@ -89,7 +89,7 @@ class Schedule(Base):
     __table_args__ = (UniqueConstraint("tutor_id", "name", name="uq_schedule_tutor_name"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
+    tutor_id = Column(Integer, ForeignKey("tutors.id", ondelete="CASCADE"), nullable=False)  # CASCADES only if other tutor 
     name = Column(String, nullable=False) # e.g. "Regular Hours", "Summer Hours"
     is_default = Column(Boolean, nullable=False, default=False) # if true, this is the default schedule for a new event type
     # TODO: redundant — always equals Settings.business_timezone. Drop and load from Settings everywhere.
@@ -97,7 +97,7 @@ class Schedule(Base):
 
     tutor = relationship("Tutor", back_populates="schedules")
     availability = relationship("EventTypeAvailability", back_populates="schedule", passive_deletes=True)
-    days = relationship("ScheduleDay", back_populates="schedule", cascade="all, delete-orphan")
+    days = relationship("ScheduleDay", back_populates="schedule", cascade="all, delete-orphan", passive_deletes=True)
 
 
 #todo: consider making duration variable (1hr, 1.5hr, 2hr) instead of fixed 1hr, which would allow for more flexible scheduling

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Loader, Menu } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconArrowBackUp, IconPlus, IconMinus } from '@tabler/icons-react'
+import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconTrash, IconArrowBackUp, IconPlus, IconMinus } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingSeries, Tutor, EventType } from './types'
 import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf } from './utils'
@@ -177,6 +177,7 @@ interface SeriesRowProps {
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onCancelSeries: (seriesId: string) => void
+    onPermanentDeleteSeries: (seriesId: string) => void
     // Expansion is controlled by the parent list (RecurringList) so only one series can be open
     // at a time — expanding one collapses whichever other row was open, instead of each row
     // managing its own independent open/closed state.
@@ -186,7 +187,7 @@ interface SeriesRowProps {
     includeCancelled?: boolean
 }
 
-const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCancelSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
+const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
     const navigate = useNavigate()
     const [loaded, setLoaded] = useState(false)
     const [occurrences, setOccurrences] = useState<Booking[]>([])
@@ -327,6 +328,13 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                                     onClick={() => onCancelSeries(series.id)}
                                 >
                                     Cancel series
+                                </Menu.Item>
+                                <Menu.Item
+                                    leftSection={<IconTrash size={14} />}
+                                    color="red"
+                                    onClick={() => onPermanentDeleteSeries(series.id)}
+                                >
+                                    Delete permanently
                                 </Menu.Item>
                             </Menu.Dropdown>
                         </Menu>

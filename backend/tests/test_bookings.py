@@ -570,6 +570,26 @@ def test_reschedule_not_confirmed(client):
         assert client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).status_code == 400
 
 
+def test_reschedule_booking_inactive_tutor_rejected(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        original = client.post("/bookings/", json=payload).json()
+        client.put(f"/tutors/{tutor['id']}", json={**tutor_payload, "is_active": False})
+        response = client.post(f"/bookings/{original['id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]})
+    assert response.status_code == 400
+
+
+def test_reschedule_series_inactive_tutor_rejected(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        client.put(f"/tutors/{tutor['id']}", json={**tutor_payload, "is_active": False})
+        response = client.put(f"/bookings/booking-series/{created['series_id']}", json={**reschedule_payload, "tutor_id": tutor["id"]})
+    assert response.status_code == 400
+
+
 def test_admin_reschedule_ignores_not_allowed_policy(client):
     """Admin's POST /{ref}/reschedule deliberately ignores event-type reschedule_mode policy —
     same reasoning as test_admin_cancel_ignores_not_allowed_policy above."""

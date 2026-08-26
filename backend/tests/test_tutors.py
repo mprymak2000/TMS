@@ -112,3 +112,18 @@ def test_delete_tutor_with_lessons(client, setup):
     client.post("/lessons/", json=lesson)
     response = client.delete(f"/tutors/{tutor['id']}")
     assert response.status_code == 409
+
+# a tutor with schedules but zero bookings is a normal, freely-deletable state — the schedules
+# cascade away with it (nothing worth preserving once the tutor itself is gone)
+def test_delete_tutor_cascades_schedules(client):
+    tutor = client.post("/tutors/", json=test_tutor).json()
+    schedule = client.post("/schedules/", json={
+        "tutor_id": tutor["id"],
+        "name": "Regular Hours",
+        "is_default": True,
+        "timezone": "America/New_York",
+        "days": [{"day_of_week": 0, "start_time": "16:00:00", "end_time": "18:00:00"}],
+    }).json()
+    response = client.delete(f"/tutors/{tutor['id']}")
+    assert response.status_code == 200
+    assert client.get(f"/schedules/{schedule['id']}").status_code == 404

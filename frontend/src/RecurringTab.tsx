@@ -32,6 +32,7 @@ const RecurringList = ({
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onCancelSeries: (seriesId: string) => void
+    onPermanentDeleteSeries: (seriesId: string) => void
     emptyState: ReactNode
 }) => {
     // Only one series open at a time across the whole list — expanding one collapses whichever
@@ -55,6 +56,7 @@ const RecurringList = ({
                                 onRefresh={onRefresh}
                                 onError={onError}
                                 onCancelSeries={onCancelSeries}
+                                onPermanentDeleteSeries={onPermanentDeleteSeries}
                                 expanded={expandedSeriesId === s.id}
                                 onToggleExpand={() => setExpandedSeriesId(prev => prev === s.id ? null : s.id)}
                                 isCustomer={isCustomer}
@@ -85,6 +87,9 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
     const [cancellingSeriesId, setCancellingSeriesId] = useState<string | null>(null)
     const [isCancelling, setIsCancelling] = useState(false)
+    const [permanentDeleteSeriesId, setPermanentDeleteSeriesId] = useState<string | null>(null)
+    const [confirmingCascadeDeleteSeriesId, setConfirmingCascadeDeleteSeriesId] = useState<string | null>(null)
+    const [isPermanentDeleting, setIsPermanentDeleting] = useState(false)
 
     const getSeriesSearchString = (s: BookingSeries) => {
         const tutor = tutors.find(t => t.id === s.tutor_id)
@@ -194,6 +199,39 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         }
     }
 
+    // Two-step cascade pattern, same as useBookingActions.tsx's handlePermanentDelete: first call
+    // (cascade=false) returns 409 if a rescheduled predecessor exists, which triggers the cascade
+    // confirm modal. User confirms → second call (cascade=true) walks and deletes the whole chain.
+    const handlePermanentDeleteSeries = async (seriesId: string, cascade = false) => {
+        setIsPermanentDeleting(true)
+        try {
+            const url = `${import.meta.env.VITE_API_URL}/bookings/booking-series/${seriesId}/permanent${cascade ? '?cascade=true' : ''}`
+            const res = await fetch(url, { method: 'DELETE' })
+            if (res.status === 409) {
+                setPermanentDeleteSeriesId(null)
+                setConfirmingCascadeDeleteSeriesId(seriesId)
+                return
+            }
+            if (!res.ok) {
+                showToast(extractError(await res.json(), 'Failed to permanently delete series.'), 'error')
+                setPermanentDeleteSeriesId(null)
+                setConfirmingCascadeDeleteSeriesId(null)
+                return
+            }
+            setPermanentDeleteSeriesId(null)
+            setConfirmingCascadeDeleteSeriesId(null)
+            refresh()
+            showToast('Series deleted')
+        } catch (error) {
+            console.error(error)
+            showToast('Failed to permanently delete series.', 'error')
+            setPermanentDeleteSeriesId(null)
+            setConfirmingCascadeDeleteSeriesId(null)
+        } finally {
+            setIsPermanentDeleting(false)
+        }
+    }
+
     // Tutor/event-type narrowing happens server-side via loadBookingSeries (see get_booking_series) —
     // search is the only genuinely client-side filter.
     const displayedSeries = seriesList
@@ -282,6 +320,7 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         onRefresh={msg => { refresh(); showToast(msg) }}
                         onError={msg => showToast(msg, 'error')}
                         onCancelSeries={setCancellingSeriesId}
+                        onPermanentDeleteSeries={setPermanentDeleteSeriesId}
                         emptyState={<p className="text-sm text-gray-400 text-center py-12">No recurring series.</p>}
                     />
                 )}
@@ -302,6 +341,44 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     <Button variant="default" onClick={() => setCancellingSeriesId(null)}>Keep it</Button>
                     <Button color="red" loading={isCancelling} onClick={() => cancellingSeriesId !== null && handleCancelSeries(cancellingSeriesId)}>
                         Cancel series
+                    </Button>
+                </div>
+            </Modal>}
+
+            {/* permanent delete confirm modal — admin only */}
+            {!isCustomer && <Modal
+                opened={permanentDeleteSeriesId !== null}
+                onClose={() => setPermanentDeleteSeriesId(null)}
+                title="Permanently delete this series?"
+                centered
+                size="sm"
+            >
+                <p className="text-sm text-gray-600 mb-4">
+                    This cannot be undone. Every booking in this series, past and future, will be permanently deleted along with the recurring calendar event.
+                </p>
+                <div className="flex justify-end gap-2">
+                    <Button variant="default" onClick={() => setPermanentDeleteSeriesId(null)}>Keep it</Button>
+                    <Button color="red" loading={isPermanentDeleting} onClick={() => permanentDeleteSeriesId !== null && handlePermanentDeleteSeries(permanentDeleteSeriesId)}>
+                        Delete permanently
+                    </Button>
+                </div>
+            </Modal>}
+
+            {/* cascade delete confirm modal — admin only, shown when the series has a rescheduled predecessor chain */}
+            {!isCustomer && <Modal
+                opened={confirmingCascadeDeleteSeriesId !== null}
+                onClose={() => setConfirmingCascadeDeleteSeriesId(null)}
+                title="Delete entire reschedule chain?"
+                centered
+                size="sm"
+            >
+                <p className="text-sm text-gray-600 mb-4">
+                    This series was created by rescheduling an earlier one. All series in the reschedule chain, and every booking in each, will be permanently deleted.
+                </p>
+                <div className="flex justify-end gap-2">
+                    <Button variant="default" onClick={() => setConfirmingCascadeDeleteSeriesId(null)}>Cancel</Button>
+                    <Button color="red" loading={isPermanentDeleting} onClick={() => confirmingCascadeDeleteSeriesId !== null && handlePermanentDeleteSeries(confirmingCascadeDeleteSeriesId, true)}>
+                        Delete all
                     </Button>
                 </div>
             </Modal>}

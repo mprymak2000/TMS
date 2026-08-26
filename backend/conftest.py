@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 import sys
 import os
@@ -14,6 +14,14 @@ SQLALCHEMY_TEST_DATABASE_URL = "sqlite:///./test.db"
 
 engine = create_engine(SQLALCHEMY_TEST_DATABASE_URL, connect_args={"check_same_thread": False})
 TestingSessionLocal = sessionmaker(bind=engine)
+
+
+# SQLite ships with FK enforcement off by default, unlike Postgres which always enforces it.
+# The pragma is per-connection (not persisted in the DB file), so it has to be set on every
+# new connection — without this, ON DELETE CASCADE/RESTRICT silently no-op in tests.
+@event.listens_for(engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+    dbapi_connection.execute("PRAGMA foreign_keys=ON")
 
 
 @pytest.fixture

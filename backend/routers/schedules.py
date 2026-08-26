@@ -98,6 +98,10 @@ def delete_schedule(schedule_id: int, db: Session = Depends(get_db)):
     if db.query(EventTypeAvailability).filter(EventTypeAvailability.schedule_id == schedule_id).first():
         raise HTTPException(status_code=409, detail="Cannot delete a schedule still in use by an event type. Reassign those event types to a different schedule first.")
 
+    # Build the response before deleting — passive_deletes=True (needed so DB-level CASCADE from a
+    # Tutor delete also reaches ScheduleDay) means .days is never loaded during the delete itself,
+    # so the ORM object can't serialize .days anymore once it's detached post-commit.
+    response = ScheduleResponse.model_validate(db_schedule)
     db.delete(db_schedule)
     db.commit()
-    return db_schedule
+    return response

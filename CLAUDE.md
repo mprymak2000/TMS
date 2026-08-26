@@ -162,9 +162,13 @@ docker-compose.yml # PostgreSQL service with named volume
 
 **Naming conventions**: `_in` suffix for input params (`lesson_in`), `db_` prefix for queried ORM objects (`db_student`).
 
-**Delete protection**: Deleting a student or tutor with existing lessons returns 409. Lessons must be deleted first (or done directly in DB). Cascade delete is intentionally removed to protect financial records.
+**Delete protection, by referenced entity** — what's allowed to reference what, and what happens on delete:
+- **Tutor** — referenced by `Lesson`, `Booking`, `BookingSeries` (all app-level RESTRICT, 409 if any exist — hard delete only succeeds with zero references of any kind, past or future; `is_active=False` is the normal offboarding path otherwise), `Schedule` (DB-level `CASCADE` — safe only because the three RESTRICTs above already guarantee zero bookings exist by the time a tutor delete reaches Postgres), `EventTypeAvailability` (DB-level `CASCADE` — junction row, nothing worth preserving).
+- **Schedule** — referenced by `EventTypeAvailability` (DB FK is `CASCADE`, but `delete_schedule` 409s first while any link exists — the cascade only ever fires for an already-unlinked schedule, so this behaves as a RESTRICT from the outside); the *default* schedule additionally can't be deleted at all until another schedule is made default first.
+- **EventType** — referenced by `EventTypeAvailability` (DB-level `CASCADE`, junction row), `Booking`/`BookingSeries` (**no guard yet** — deleting an `EventType` with existing bookings raises a raw unhandled `IntegrityError`/500 today; planned fix is an app-level RESTRICT scoped to active references only, see `tms-roadmap` skill's Priority Order — not yet implemented).
+- **Student** — referenced by `Lesson` (app-level RESTRICT, 409; cascade delete intentionally removed to protect financial records). `Booking.student_id`/`BookingSeries.student_id` are rarely populated today (see the `tms-roadmap` skill's `Contact`/`Student` identity-split note) and have no delete guard.
 
-**Tutor `is_active`**: Both Student and Tutor have `is_active`. Retiring a student/tutor means setting `is_active=False`, not deleting them.
+**Tutor `is_active`**: Both Student and Tutor have `is_active`. Retiring a student/tutor means setting `is_active=False`, not deleting them. For Tutor specifically, this is enforced, not just a display flag: `create_booking`/`_reschedule_booking`/`_reschedule_series` (`routers/bookings.py`) reject an inactive `tutor_id`, `get_available_slots` excludes inactive tutors, and `extend_single_series` (`tasks.py`) stops materializing new occurrences for a series whose tutor has gone inactive. Already-confirmed/already-materialized bookings are untouched either way.
 
 **Booking system** (`routers/bookings.py`):
 - `POST /bookings/` — creates Google Calendar event first, then DB record atomically. Recurring event types: creates one RRULE Google Calendar event + one `BookingSeries` row + one `Booking` row per occurrence (generated inline via a loop). Standalone: one event + one `Booking` row. If DB fails, compensating delete on Calendar. If compensating delete also fails, logs warning.
