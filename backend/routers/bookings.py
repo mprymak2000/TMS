@@ -325,6 +325,8 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
         raise HTTPException(status_code=404, detail="Tutor not found")
     if not db_tutor.calendar_id:
         raise HTTPException(status_code=400, detail="Tutor must have a calendar ID")
+    if not db_tutor.is_active:
+        raise HTTPException(status_code=400, detail="Tutor is not active")
     db_event_type = db.query(EventType).filter(EventType.id == booking_in.event_type_id).first()
     if not db_event_type:
         raise HTTPException(status_code=404, detail="Event type not found")
@@ -463,6 +465,8 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         raise HTTPException(status_code=404, detail="Tutor not found")
     if not db_tutor.calendar_id:
         raise HTTPException(status_code=400, detail="Tutor must have a calendar ID")
+    if not db_tutor.is_active:
+        raise HTTPException(status_code=400, detail="Tutor is not active")
 
     is_series = db_booking.series_id is not None
     # Save all relationship-accessed values upfront before any op that could expire the session
@@ -803,6 +807,8 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         raise HTTPException(status_code=404, detail="Tutor not found")
     if not db_tutor.calendar_id:
         raise HTTPException(status_code=400, detail="Tutor must have a calendar ID")
+    if not db_tutor.is_active:
+        raise HTTPException(status_code=400, detail="Tutor is not active")
     db_event_type = db.query(EventType).filter(EventType.id == db_series.event_type_id).first()
     if not db_event_type:
         raise HTTPException(status_code=404, detail="Event type not found")
@@ -962,6 +968,44 @@ def delete_booking_series(id: str, db: Session = Depends(get_db), settings=Depen
     service = get_calendar_service(SCOPES)
     result = _cancel_series(db_series, today, db, service)
     return _series_response(result, today)
+
+
+@router.delete("/booking-series/{id}/permanent", status_code=204)
+def permanently_delete_booking_series(id: str, cascade: bool = False, db: Session = Depends(get_db)):
+    """Hard-delete a series and all its Bookings (past and future). Same two-round-trip
+    predecessor-chain confirm flow as permanently_delete_booking above"""
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
+    if not db_series:
+        raise HTTPException(status_code=404, detail="Booking series not found")
+
+    immediate_predecessor = db.query(BookingSeries).filter(BookingSeries.rescheduled_to == db_series.id).first()
+    if immediate_predecessor and not cascade:
+        raise HTTPException(status_code=409, detail="This series has a rescheduled predecessor.")
+
+    predecessors = []
+    if cascade:
+        current = immediate_predecessor
+        while current is not None:
+            predecessors.append(current)
+            current = db.query(BookingSeries).filter(BookingSeries.rescheduled_to == current.id).first()
+
+    all_series = predecessors + [db_series]
+    service = get_calendar_service(SCOPES)
+    for series in all_series:
+        calendar_id = series.tutor.calendar_id
+        if calendar_id and series.google_event_id:
+            try:
+                service.events().delete(calendarId=calendar_id, eventId=series.google_event_id).execute()
+            except Exception as e:
+                logging.warning(f"Permanent delete: calendar event {series.google_event_id} could not be deleted: {e}")
+        db.query(Booking).filter(Booking.series_id == series.id).delete(synchronize_session=False)
+        db.delete(series)
+    try:
+        db.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to permanently delete booking series") from e
+    return Response(status_code=204)
+
 
 
 def _cancel_booking(db_booking: Booking, db: Session, service) -> Booking:

@@ -438,6 +438,73 @@ def test_permanent_delete_cascade(client):
     assert client.get(f"/bookings/{original['id']}").status_code == 404
 
 
+def test_permanent_delete_series(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.delete(f"/bookings/booking-series/{created['series_id']}/permanent")
+    assert response.status_code == 204
+    assert client.get(f"/bookings/manage-series/{created['series_id']}").status_code == 404
+    assert client.get(f"/bookings/{created['id']}").status_code == 404
+
+
+def test_permanent_delete_series_cascade(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        original = client.post("/bookings/", json=payload).json()
+        rescheduled = client.put(f"/bookings/booking-series/{original['series_id']}", json={**reschedule_payload, "tutor_id": tutor["id"]}).json()
+        assert client.delete(f"/bookings/booking-series/{rescheduled['id']}/permanent").status_code == 409
+        assert client.delete(f"/bookings/booking-series/{rescheduled['id']}/permanent?cascade=true").status_code == 204
+    assert client.get(f"/bookings/manage-series/{rescheduled['id']}").status_code == 404
+    assert client.get(f"/bookings/manage-series/{original['series_id']}").status_code == 404
+
+
+def test_permanent_delete_series_not_found(client):
+    assert client.delete("/bookings/booking-series/bad-ref/permanent").status_code == 404
+
+
+# ── DELETION SAFETY: TUTOR ─────────────────────────────────────────────────────
+
+def test_delete_tutor_blocked_with_active_booking(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+    assert client.delete(f"/tutors/{tutor['id']}").status_code == 409
+
+
+def test_delete_tutor_blocked_with_active_series(client):
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post("/bookings/", json=payload)
+    assert client.delete(f"/tutors/{tutor['id']}").status_code == 409
+
+
+def test_create_booking_inactive_tutor_rejected(client):
+    tutor, event_type = setup_standalone(client)
+    client.put(f"/tutors/{tutor['id']}", json={**tutor_payload, "is_active": False})
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 400
+
+
+def test_available_slots_excludes_inactive_tutor(client):
+    tutor, event_type = setup_standalone(client)
+    client.put(f"/tutors/{tutor['id']}", json={**tutor_payload, "is_active": False})
+    response = client.get("/available-slots/", params={
+        "tutor_ids": [tutor["id"]],
+        "event_type_id": event_type["id"],
+        "time_min": "2099-06-01T00:00:00Z",
+        "time_max": "2099-06-30T00:00:00Z",
+    })
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 # ── UPDATE (contact + no-show) ────────────────────────────────────────────────
 
 def test_update_contact(client):

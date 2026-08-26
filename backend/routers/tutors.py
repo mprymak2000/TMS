@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Tutor, Lesson
+from models import Tutor, Lesson, Booking, BookingSeries
 from schemas import TutorCreate, TutorUpdate, TutorResponse
 
 router = APIRouter(prefix="/tutors", tags=["tutors"])
@@ -51,6 +51,10 @@ def delete_tutor(tutor_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Tutor not found")
     if db.query(Lesson).filter(Lesson.tutor_id == tutor_id).first():
         raise HTTPException(status_code=409, detail="Cannot delete tutor with existing lessons")
+    if db.query(Booking).filter(Booking.tutor_id == tutor_id).first():
+        raise HTTPException(status_code=409, detail="Cannot delete tutor with existing bookings")
+    if db.query(BookingSeries).filter(BookingSeries.tutor_id == tutor_id).first():
+        raise HTTPException(status_code=409, detail="Cannot delete tutor with existing booking series")
     db.delete(db_tutor)
     db.commit()
     return db_tutor

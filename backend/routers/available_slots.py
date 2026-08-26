@@ -567,7 +567,7 @@ def get_available_slots(
     calendar_service=None,
 ) -> list:
 
-    db_tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all()
+    db_tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids), Tutor.is_active == True).all()
     db_event_type = db.query(EventType).filter(EventType.id == event_type_id).first()
 
     availability_by_tutor = {

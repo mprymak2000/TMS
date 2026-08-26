@@ -83,6 +83,10 @@ def extend_single_series(series_id: int):
         today = datetime.now(tz).date()
         if not is_series_active(series, today):
             return
+        # Same race as above, different cause: the series' tutor may have gone inactive since this
+        # job was enqueued. Don't attach new future occurrences to a tutor no longer taking them.
+        if not series.tutor.is_active:
+            return
 
         has_future = (
             db.query(Booking)

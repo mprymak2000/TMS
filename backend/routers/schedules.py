@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Schedule, ScheduleDay, Tutor
+from models import EventTypeAvailability, Schedule, ScheduleDay, Tutor
 from schemas import ScheduleCreate, ScheduleUpdate, ScheduleResponse
 
 router = APIRouter(prefix="/schedules", tags=["schedules"])
@@ -94,6 +94,9 @@ def delete_schedule(schedule_id: int, db: Session = Depends(get_db)):
 
     if db_schedule.is_default:
         raise HTTPException(status_code=400, detail="Cannot delete the default schedule. Set another schedule as default first.")
+
+    if db.query(EventTypeAvailability).filter(EventTypeAvailability.schedule_id == schedule_id).first():
+        raise HTTPException(status_code=409, detail="Cannot delete a schedule still in use by an event type. Reassign those event types to a different schedule first.")
 
     db.delete(db_schedule)
     db.commit()
