@@ -103,10 +103,19 @@ class Schedule(Base):
 #todo: consider making duration variable (1hr, 1.5hr, 2hr) instead of fixed 1hr, which would allow for more flexible scheduling
 
 _WINDOW_MODES_SQL = "('auto_window_block', 'auto_window_request', 'request_window')"
+_ALL_MODES_SQL = "('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')"
 
 class EventType(Base):
     __tablename__ = "event_types"
     __table_args__ = (
+        CheckConstraint(
+            f"cancel_mode IS NULL OR cancel_mode IN {_ALL_MODES_SQL}",
+            name="chk_event_type_cancel_mode"
+        ),
+        CheckConstraint(
+            f"reschedule_mode IS NULL OR reschedule_mode IN {_ALL_MODES_SQL}",
+            name="chk_event_type_reschedule_mode"
+        ),
         CheckConstraint(
             f"cancel_mode NOT IN {_WINDOW_MODES_SQL} OR (cancel_notice_minutes IS NOT NULL AND cancel_notice_minutes > 0)",
             name="chk_event_type_cancel_notice_required"

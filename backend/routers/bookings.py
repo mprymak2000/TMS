@@ -468,6 +468,14 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     if not db_tutor.is_active:
         raise HTTPException(status_code=400, detail="Tutor is not active")
 
+    # Rescheduling to the exact same slot is a no-op and almost certainly a misclick — reject it.
+    # Overlapping its own old time is fine and deliberately allowed (a 15-min nudge); that's what
+    # get_available_slots' exclude_booking_id is for.
+    _old_start = db_booking.start if db_booking.start.tzinfo else db_booking.start.replace(tzinfo=UTC)
+    _old_end = db_booking.end if db_booking.end.tzinfo else db_booking.end.replace(tzinfo=UTC)
+    if booking_in.start == _old_start and booking_in.end == _old_end:
+        raise HTTPException(status_code=400, detail="New time is identical to the current booking time")
+
     is_series = db_booking.series_id is not None
     # Save all relationship-accessed values upfront before any op that could expire the session
     original_start = db_booking.start
@@ -814,6 +822,20 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         raise HTTPException(status_code=404, detail="Event type not found")
     BUSINESS_TZ = ZoneInfo(settings.business_timezone)
     today = datetime.now(BUSINESS_TZ).date()
+
+    # Same no-op guard as the occurrence-level reschedule, but a series' identity is its weekly
+    # *pattern* (weekday + time-of-day + tutor), not an absolute instant — dtstart/dtend are naive
+    # local. Shifting the pattern by any amount is allowed, including into its own old band;
+    # get_available_slots' exclude_series_id is what makes those slots offerable in the first place.
+    _new_start_local = booking_in.start.astimezone(BUSINESS_TZ).replace(tzinfo=None)
+    _new_end_local = booking_in.end.astimezone(BUSINESS_TZ).replace(tzinfo=None)
+    if (
+        booking_in.tutor_id == db_series.tutor_id
+        and _new_start_local.weekday() == db_series.dtstart.weekday()
+        and _new_start_local.time() == db_series.dtstart.time()
+        and _new_end_local.time() == db_series.dtend.time()
+    ):
+        raise HTTPException(status_code=400, detail="New schedule is identical to the current series schedule")
 
     today_str = datetime.now(UTC).strftime("%Y%m%d")
     old_calendar_id = db_series.tutor.calendar_id

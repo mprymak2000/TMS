@@ -184,6 +184,11 @@ const BookingPage = () => {
         const timeMax = new Date(Date.UTC(dateTo.getFullYear(), dateTo.getMonth(), dateTo.getDate(), 23, 59, 59)).toISOString()
         const params = new URLSearchParams({ event_type_id: String(eventType.id), time_min: timeMin, time_max: timeMax })
         params.append('tutor_ids', selectedTutorId)
+        // When rescheduling, the row being moved must not count as busy against itself — otherwise
+        // it can't be nudged into a slot overlapping its own current time. Rescheduling to the
+        // exact same slot is still rejected, by the reschedule endpoints themselves.
+        if (rescheduleFromId) params.append('exclude_ref', rescheduleFromId)
+        if (rescheduleSeriesId) params.append('exclude_series_ref', rescheduleSeriesId)
         setLoadSlotsError(null)
         setLoading(true)
         try {

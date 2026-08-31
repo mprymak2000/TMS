@@ -89,6 +89,16 @@ EDGE CASES
   7 days past time_min. Fix: if b_end - 1 week >= time_min, step back one week —
   the seam piece already reaches into the window from the prior week.
 
+RESCHEDULE SELF-EXCLUSION
+
+Whatever is being rescheduled must not block itself, or it can't move into a slot
+overlapping its own current time (4:00-5:30 -> 4:15-5:45). Its own exact slot is
+withheld instead, since rescheduling to an identical time is a no-op.
+
+The mode is chosen by the OPERATION, not just the event type: moving one occurrence is
+a standalone booking (one date), not a claim on the weekly band, so exclude_ref forces
+standalone mode. That's why no un-thinning is needed — thinning never runs.
+
 TIMEZONE DESIGN
 
 All schedule times, series patterns, and busy blocks are stored in the business
@@ -565,6 +575,8 @@ def get_available_slots(
     time_max: datetime,  # UTC
     db,
     calendar_service=None,
+    exclude_ref: str | None = None,         # public_id of the booking being rescheduled
+    exclude_series_ref: str | None = None,  # public_id of the series being rescheduled
 ) -> list:
 
     db_tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids), Tutor.is_active == True).all()
@@ -583,12 +595,43 @@ def get_available_slots(
     # business canonical timezone — all schedule/series times are stored in this zone
     business_tz = ZoneInfo(_settings.business_timezone)
 
+    # See RESCHEDULE SELF-EXCLUSION in the module docstring.
+    # exclude_booking_id  a real Booking row to drop from busy_dict
+    # exclude_hole        (series_id, date) — opens one date of a series' band. Read off the ref,
+    #                     which encodes its own start ("{series_public_id}:{unix_timestamp}"), so
+    #                     this works for a virtual occurrence with no row at all.
+    # exclude_span        the exact slot to withhold from the results
+    exclude_booking_id = exclude_hole = exclude_span = None
+    if exclude_ref is not None:
+        row = db.query(Booking).filter(Booking.public_id == exclude_ref).first()
+        if row is not None:
+            exclude_booking_id = row.id
+            r_start = row.start if row.start.tzinfo else row.start.replace(tzinfo=UTC)
+            r_end = row.end if row.end.tzinfo else row.end.replace(tzinfo=UTC)
+            exclude_span = (r_start.astimezone(business_tz), r_end.astimezone(business_tz))
+        series_pub, sep, ts = exclude_ref.rpartition(":")
+        if sep and ts.isdigit():
+            s = db.query(BookingSeries).filter(BookingSeries.public_id == series_pub).first()
+            if s is not None:
+                occ_start = datetime.fromtimestamp(int(ts), UTC).astimezone(business_tz)
+                exclude_hole = (s.id, occ_start.date())
+                if exclude_span is None:  # virtual occurrence — span comes from the series
+                    exclude_span = (occ_start, occ_start + (s.dtend - s.dtstart))
+
+    exclude_series_id = exclude_series_pattern = None
+    if exclude_series_ref is not None:
+        s = db.query(BookingSeries).filter(BookingSeries.public_id == exclude_series_ref).first()
+        if s is not None:
+            exclude_series_id = s.id
+            exclude_series_pattern = (s.dtstart.weekday(), s.dtstart.time(), s.dtend.time())
+
     duration = timedelta(minutes=db_event_type.duration_minutes)
     interval = timedelta(minutes=db_event_type.interval_minutes or db_event_type.duration_minutes)
     expires_on = db_event_type.expires_on
     recur_weeks = db_event_type.recur_weeks
 
-    if not db_event_type.recurring:
+    if not db_event_type.recurring or exclude_ref is not None:
+        # exclude_ref means one occurrence is moving — one date, not a recurring claim
         mode = "standalone"
     elif expires_on is not None or recur_weeks is not None:
         mode = "finite"
@@ -633,6 +676,11 @@ def get_available_slots(
         )
         .order_by(Booking.start)
     )
+    if exclude_booking_id is not None:
+        booking_q = booking_q.filter(Booking.id != exclude_booking_id)
+    if exclude_series_id is not None:
+        # the series' already-materialized occurrences would otherwise still block its own band
+        booking_q = booking_q.filter(Booking.series_id != exclude_series_id)
     if query_max is not None:
         booking_q = booking_q.filter(Booking.start < query_max)
 
@@ -651,16 +699,21 @@ def get_available_slots(
     # of the series' own occurrences that were cancelled/rescheduled.
     inf_rules = {t.id: [] for t in db_tutors}
     today = datetime.now(business_tz).date()
-    for series in db.query(BookingSeries).filter(
+    series_q = db.query(BookingSeries).filter(
         BookingSeries.tutor_id.in_(tutor_ids),
         active_series_filter(today),
         BookingSeries.until == None,
-    ).all():
+    )
+    if exclude_series_id is not None:
+        series_q = series_q.filter(BookingSeries.id != exclude_series_id)
+    for series in series_q.all():
         dev_starts = set()
         for booked in series.bookings:
             if booked.status in ("cancelled", "rescheduled"):
                 dev_start_utc = booked.start if booked.start.tzinfo else booked.start.replace(tzinfo=UTC)
                 dev_starts.add(dev_start_utc.astimezone(business_tz).date())
+        if exclude_hole is not None and exclude_hole[0] == series.id:
+            dev_starts.add(exclude_hole[1])
 
         rule_start = WeekdayTime(series.dtstart.weekday(), series.dtstart.time())
         rule_end = WeekdayTime(series.dtend.weekday(), series.dtend.time())
@@ -715,6 +768,15 @@ def get_available_slots(
 
         all_slots.extend(tutor_slots)
 
+    # withhold the excluded thing's own slot — rescheduling to an identical time is a no-op
+    if exclude_span is not None:
+        ex_s, ex_e = exclude_span
+        all_slots = [(t, s, e) for (t, s, e) in all_slots if not (s == ex_s and e == ex_e)]
+    if exclude_series_pattern is not None:
+        ex_wd, ex_st, ex_et = exclude_series_pattern  # a series' identity is its weekly pattern
+        all_slots = [(t, s, e) for (t, s, e) in all_slots
+                     if not (s.weekday() == ex_wd and s.time() == ex_st and e.time() == ex_et)]
+
     return [AvailableSlotResponse(tutor_id=t, start=s, end=e) for (t, s, e) in all_slots]
 
 
@@ -724,6 +786,8 @@ def available_slots_endpoint(
     event_type_id: int = Query(),
     time_min: datetime = Query(),
     time_max: datetime = Query(),
+    exclude_ref: str | None = Query(default=None),         # booking being rescheduled
+    exclude_series_ref: str | None = Query(default=None),  # series being rescheduled
     db: Session = Depends(get_db),
 ):
     db_tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all()
@@ -741,7 +805,8 @@ def available_slots_endpoint(
     except Exception:
         calendar_service = None
     try:
-        return get_available_slots(tutor_ids, event_type_id, time_min, time_max, db, calendar_service)
+        return get_available_slots(tutor_ids, event_type_id, time_min, time_max, db, calendar_service,
+                                   exclude_ref=exclude_ref, exclude_series_ref=exclude_series_ref)
     except Exception as e:
         logging.error(f"available_slots failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to compute available slots")

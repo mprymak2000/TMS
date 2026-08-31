@@ -1903,3 +1903,153 @@ def test_wide_window_does_not_trigger_unbounded_walk(client):
     body = response.json()
     assert len(body["items"]) <= 5
     assert elapsed < 2.0
+
+
+# ── RESCHEDULE SELF-EXCLUSION ─────────────────────────────────────────────────
+# A booking must not block itself out of its own reschedule slot picker. Overlapping its own
+# current time is legitimate (a 15-min nudge); only the *identical* slot is rejected.
+
+_MONDAY = "2099-06-08"  # the test schedule is day_of_week=0, 09:00-17:00, business tz is UTC
+
+
+def _slots_on_monday(client, tutor_id, event_type_id, **extra):
+    params = {
+        "tutor_ids": [tutor_id],
+        "event_type_id": event_type_id,
+        "time_min": f"{_MONDAY}T00:00:00Z",
+        "time_max": f"{_MONDAY}T23:59:59Z",
+        **extra,
+    }
+    return client.get("/available-slots/", params=params).json()
+
+
+def test_available_slots_excludes_booking_being_rescheduled(client):
+    """Overlapping the booking's own time becomes offerable; the identical slot stays withheld.
+
+    interval_minutes=30 with a 90-min duration puts slots on a 30-min grid (09:00, 09:30, 10:00...)
+    so "overlaps but isn't identical" is actually expressible — on the default grid, where interval
+    equals duration, the only overlapping slot IS the identical one.
+    """
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={
+        **event_type_standalone, "interval_minutes": 30, "availability": availability,
+    }).json()
+    # timezone=UTC so the payload's wall-clock time is also the stored UTC time
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "start": f"{_MONDAY}T10:30:00", "end": f"{_MONDAY}T12:00:00", "timezone": "UTC"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    blocked = [s["start"] for s in _slots_on_monday(client, tutor["id"], event_type["id"])]
+    assert f"{_MONDAY}T09:00:00Z" in blocked, "sanity: unrelated slots still offered"
+    assert f"{_MONDAY}T10:00:00Z" not in blocked, "overlapping slot blocked while not excluded"
+    assert f"{_MONDAY}T10:30:00Z" not in blocked
+
+    freed = [s["start"] for s in _slots_on_monday(client, tutor["id"], event_type["id"], exclude_ref=created["id"])]
+    assert f"{_MONDAY}T10:00:00Z" in freed, "excluded booking must not block an overlapping slot"
+    assert f"{_MONDAY}T11:00:00Z" in freed, "overlap on the other side too"
+    assert f"{_MONDAY}T10:30:00Z" not in freed, "its own exact slot stays withheld — a no-op reschedule"
+
+
+def test_available_slots_unknown_exclude_ref_is_ignored(client):
+    """A virtual (not-yet-materialized) occurrence has no row to exclude — don't 404, just no-op."""
+    tutor, event_type = setup_standalone(client)
+    response = client.get("/available-slots/", params={
+        "tutor_ids": [tutor["id"]], "event_type_id": event_type["id"],
+        "time_min": f"{_MONDAY}T00:00:00Z", "time_max": f"{_MONDAY}T23:59:59Z",
+        "exclude_ref": "does-not-exist",
+    })
+    assert response.status_code == 200
+
+
+def test_reschedule_to_identical_slot_rejected(client):
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(f"/bookings/{created['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": booking_payload["start"],
+            "end": booking_payload["end"],
+            "timezone": booking_payload["timezone"],
+        })
+    assert response.status_code == 400
+
+
+def test_reschedule_overlapping_own_slot_allowed(client):
+    """15-min nudge overlaps the original time — legitimate, must not be blocked."""
+    tutor, event_type = setup_standalone(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(f"/bookings/{created['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-06-10T16:15:00",
+            "end": "2099-06-10T17:45:00",
+            "timezone": booking_payload["timezone"],
+        })
+    assert response.status_code == 200
+
+
+def test_reschedule_series_to_identical_pattern_rejected(client):
+    """Series identity is weekday + time-of-day + tutor, not an absolute instant."""
+    tutor, event_type = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        # a different date, but same weekday and same time-of-day — still the same pattern
+        response = client.put(f"/bookings/booking-series/{created['series_id']}", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-06-17T16:00:00",
+            "end": "2099-06-17T17:30:00",
+            "timezone": booking_payload["timezone"],
+        })
+    assert response.status_code == 400
+
+
+def test_available_slots_opens_band_for_single_occurrence_of_infinite_series(client):
+    """Rescheduling ONE occurrence of an infinite series: the block comes from the series' whole
+    (weekday, time) band, not that occurrence's row — so excluding the row alone does nothing.
+    exclude_ref must punch a one-day hole in the band, on that occurrence's date only."""
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={
+        **event_type_recurring, "interval_minutes": 30, "availability": availability,
+    }).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "start": f"{_MONDAY}T10:30:00", "end": f"{_MONDAY}T12:00:00", "timezone": "UTC"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    blocked = [s["start"] for s in _slots_on_monday(client, tutor["id"], event_type["id"])]
+    assert f"{_MONDAY}T10:00:00Z" not in blocked, "series band blocks its whole window"
+
+    freed = [s["start"] for s in _slots_on_monday(client, tutor["id"], event_type["id"], exclude_ref=created["id"])]
+    assert f"{_MONDAY}T10:00:00Z" in freed, "band must open on this occurrence's date"
+    assert f"{_MONDAY}T10:30:00Z" not in freed, "the occurrence's own exact slot stays withheld"
+
+    # the band must still be closed on every OTHER date — only this one occurrence moved
+    next_monday = "2099-06-15"
+    later = client.get("/available-slots/", params={
+        "tutor_ids": [tutor["id"]], "event_type_id": event_type["id"],
+        "time_min": f"{next_monday}T00:00:00Z", "time_max": f"{next_monday}T23:59:59Z",
+        "exclude_ref": created["id"],
+    }).json()
+    assert f"{next_monday}T10:00:00Z" not in [s["start"] for s in later], "other dates stay blocked"
+
+
+def test_available_slots_withholds_series_own_pattern(client):
+    """Rescheduling a whole series frees its band, but not the pattern it already occupies —
+    that'd be a no-op, and the endpoint would 400 it on submit."""
+    tutor, availability = make_tutor_with_schedule(client)
+    event_type = client.post("/event_types/", json={
+        **event_type_recurring, "interval_minutes": 30, "availability": availability,
+    }).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "event_type_id": event_type["id"],
+               "start": f"{_MONDAY}T10:30:00", "end": f"{_MONDAY}T12:00:00", "timezone": "UTC"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    freed = [s["start"] for s in _slots_on_monday(
+        client, tutor["id"], event_type["id"], exclude_series_ref=created["series_id"])]
+    assert f"{_MONDAY}T10:00:00Z" in freed, "series band freed for overlapping moves"
+    assert f"{_MONDAY}T10:30:00Z" not in freed, "its own pattern stays withheld"
