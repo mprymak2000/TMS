@@ -179,12 +179,12 @@ def test_delete_schedule_not_found(client):
     response = client.delete("/schedules/9999")
     assert response.status_code == 404
 
-def test_delete_schedule_blocked_when_linked_to_event_type(client):
+def test_delete_schedule_blocked_when_linked_to_booking_link(client):
     tutor = create_tutor(client)
     client.post("/schedules/", json={**schedule_regular, "tutor_id": tutor["id"]})
     non_default = client.post("/schedules/", json={**schedule_summer, "tutor_id": tutor["id"]}).json()
-    event_type = client.post("/event_types/", json={
-        "name": "Tutoring",
+    booking_link = client.post("/booking_links/", json={
+        "slug": "tutoring",
         "duration_minutes": 60,
         "recurring": False,
         "availability": [{"tutor_id": tutor["id"], "schedule_id": non_default["id"]}],

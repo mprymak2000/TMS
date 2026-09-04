@@ -60,16 +60,20 @@ export interface LessonEdit {
   notes: string | null
 }
 
-export interface EventTypeAvailability {
+export interface BookingLinkAvailability {
   id: number
-  event_type_id: number
+  booking_link_id: number
   tutor_id: number
   schedule_id: number
 }
 
-export interface EventType {
+export type BookingLinkStatus = 'active' | 'paused' | 'archived'
+
+export interface BookingLink {
   id: number
-  name: string
+  slug: string
+  status: BookingLinkStatus
+  archived_at: string | null
   description: string | null
   recurring: boolean
   duration_minutes: number
@@ -92,7 +96,7 @@ export interface EventType {
   limit_per_booker: number | null
   limit_future_bookings_days: number | null
   only_show_first_slot: boolean | null
-  availability: EventTypeAvailability[]
+  availability: BookingLinkAvailability[]
 }
 
 export interface AvailableSlot {
@@ -105,7 +109,7 @@ export interface Booking {
   id: string
   series_id: string | null
   tutor_id: number
-  event_type_id: number
+  booking_link_id: number
   student_id: number | null
   start: string
   end: string
@@ -129,7 +133,7 @@ export interface Booking {
 export interface BookingSeries {
   id: string
   tutor_id: number
-  event_type_id: number
+  booking_link_id: number
   student_id: number | null
   created: string
   last_modified: string
@@ -158,9 +162,9 @@ export interface TutorFacetOption {
   last_name: string
 }
 
-export interface EventTypeFacetOption {
+export interface BookingLinkFacetOption {
   id: number
-  name: string
+  slug: string
 }
 
 // todo: this will be a guestID identifier in the future
@@ -171,7 +175,7 @@ export interface StudentFacetOption {
 
 export interface BookingFacets {
   tutors: TutorFacetOption[]
-  event_types: EventTypeFacetOption[]
+  booking_links: BookingLinkFacetOption[]
   students: StudentFacetOption[]
 }
 

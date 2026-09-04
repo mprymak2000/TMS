@@ -1,18 +1,18 @@
 import { useEffect, useState } from 'react'
 import outlookIcon from './assets/outlook-icon.svg'
 import { TextInput, Select, Button } from '@mantine/core'
-import type { Tutor, EventType, EventTypeAvailability, AvailableSlot } from './types'
+import type { Tutor, BookingLink, BookingLinkAvailability, AvailableSlot } from './types'
 import { useLocation, useParams } from 'react-router'
 import { extractError, formatUTCTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
 
 /*
   BookingPage — Custom duration
-  - If eventType.allow_custom_duration, show a duration slider/NumberInput on the contact step (between min and max)
+  - If bookingLink.allow_custom_duration, show a duration slider/NumberInput on the contact step (between min and max)
   - selectedDuration state, defaults to min_duration_minutes
   - buildPayload computes end = new Date(selectedSlot.start + selectedDuration * 60000)
   */
 interface LoadErrors {
-    eventType?: string
+    bookingLink?: string
     tutors?: string
     unknown?: string
 }
@@ -87,7 +87,7 @@ const localLongDateOf = (utcIso: string, tz: string) =>
     new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long', month: 'long', day: 'numeric' }).format(new Date(utcIso))
 
 const BookingPage = () => {
-    const { eventTypeId } = useParams<{ eventTypeId: string }>()
+    const { slug } = useParams<{ slug: string }>()
     const location = useLocation()
     const [rescheduleFromId, setRescheduleFromId] = useState<string | null>(location.state?.rescheduleFromId ?? null)
     const [rescheduleSeriesId, setRescheduleSeriesId] = useState<string | null>(location.state?.rescheduleSeriesId ?? null)
@@ -97,7 +97,10 @@ const BookingPage = () => {
     const originalDayOfWeek: number | null = location.state?.originalDayOfWeek ?? null
     const originalStartTime: string | null = location.state?.originalStartTime ?? null
 
-    const [eventType, setEventType] = useState<EventType | null>(null)
+    const [bookingLink, setBookingLink] = useState<BookingLink | null>(null)
+    // 'gone' = archived or never existed; 'paused' = temporarily closed to new bookings.
+    // Takes over the whole page rather than sitting alongside a picker that can't work.
+    const [unavailable, setUnavailable] = useState<'gone' | 'paused' | null>(null)
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [slots, setSlots] = useState<AvailableSlot[]>([])
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
@@ -127,13 +130,13 @@ const BookingPage = () => {
     const loadData = async () => {
         try {
             //todo: once GET /tutors supports ?ids=... query param, fetch only linked tutors instead of all
-            const [eventTypeRes, tutorsRes] = await Promise.all([
-                fetch(`${import.meta.env.VITE_API_URL}/event_types/${eventTypeId}`),
+            const [bookingLinkRes, tutorsRes] = await Promise.all([
+                fetch(`${import.meta.env.VITE_API_URL}/booking_links/slug/${slug}`),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
             ])
-            if (!eventTypeRes.ok) {
-                const err = await eventTypeRes.json()
-                setLoadErrors(prev => ({ ...prev, eventType: extractError(err, 'Failed to load event type') }))
+            // 404 = archived or never existed. Paused resolves, and is handled below with its own copy.
+            if (!bookingLinkRes.ok) {
+                setUnavailable('gone')
                 return
             }
             if (!tutorsRes.ok) {
@@ -141,10 +144,17 @@ const BookingPage = () => {
                 setLoadErrors(prev => ({ ...prev, tutors: extractError(err, 'Failed to load tutors') }))
                 return
             }
-            const eventTypeData = await eventTypeRes.json()
+            const bookingLinkData = await bookingLinkRes.json()
             const tutorsData = await tutorsRes.json()
-            const linkedIds = new Set(eventTypeData.availability.map((a: EventTypeAvailability) => a.tutor_id))
-            setEventType(eventTypeData)
+            // Paused blocks new bookings only — its rules are still live, so reschedules of
+            // existing bookings must keep working. Mirrors the backend's two guards.
+            const isReschedule = !!(rescheduleFromId || rescheduleSeriesId || requestRescheduleRef)
+            if (bookingLinkData.status === 'paused' && !isReschedule) {
+                setUnavailable('paused')
+                return
+            }
+            const linkedIds = new Set(bookingLinkData.availability.map((a: BookingLinkAvailability) => a.tutor_id))
+            setBookingLink(bookingLinkData)
             setTutors(tutorsData.filter((t: Tutor) => linkedIds.has(t.id)))
         } catch (error) {
             console.error('Error loading data:', error)
@@ -152,11 +162,11 @@ const BookingPage = () => {
         }
     }
 
-    useEffect(() => { loadData() }, [eventTypeId])
+    useEffect(() => { loadData() }, [slug])
 
     // autoselect tutor if there is only one choice
     useEffect(() => {
-        if (tutors.length === 0 && eventType !== null) setLoadErrors(prev => ({ ...prev, tutors: 'No tutors available for this event type' }))
+        if (tutors.length === 0 && bookingLink !== null) setLoadErrors(prev => ({ ...prev, tutors: 'No tutors available for this booking link' }))
         else if (tutors.length === 1) setSelectedTutorId(String(tutors[0].id))
         else if ((rescheduleFromId || rescheduleSeriesId) && location.state?.tutorId) { setSelectedTutorId(String(location.state.tutorId)) }
         // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -177,12 +187,12 @@ const BookingPage = () => {
     }, [])
 
     const loadSlots = async () => {
-        if (!eventType || !selectedTutorId) return
+        if (!bookingLink || !selectedTutorId) return
         const dateFrom = view === 'month' ? startOfMonth(currentDate) : startOfWeek(currentDate)
         const dateTo = view === 'month' ? endOfMonth(currentDate) : addDays(startOfWeek(currentDate), 6)
         const timeMin = new Date(Date.UTC(dateFrom.getFullYear(), dateFrom.getMonth(), dateFrom.getDate())).toISOString()
         const timeMax = new Date(Date.UTC(dateTo.getFullYear(), dateTo.getMonth(), dateTo.getDate(), 23, 59, 59)).toISOString()
-        const params = new URLSearchParams({ event_type_id: String(eventType.id), time_min: timeMin, time_max: timeMax })
+        const params = new URLSearchParams({ booking_link_id: String(bookingLink.id), time_min: timeMin, time_max: timeMax })
         params.append('tutor_ids', selectedTutorId)
         // When rescheduling, the row being moved must not count as busy against itself — otherwise
         // it can't be nudged into a slot overlapping its own current time. Rescheduling to the
@@ -210,7 +220,7 @@ const BookingPage = () => {
 
     useEffect(() => { loadSlots() }, 
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [eventType, currentDate, view, selectedTutorId])
+        [bookingLink, currentDate, view, selectedTutorId])
 
     const now = new Date()
     const slotsByDate = slots.reduce((acc, slot) => {
@@ -225,7 +235,7 @@ const BookingPage = () => {
 
     const buildSubmitPayload = () => ({
         tutor_id: selectedSlot!.tutor_id,
-        event_type_id: eventType!.id,
+        booking_link_id: bookingLink!.id,
         start: selectedSlot!.start,
         end: selectedSlot!.end,
         timezone: timezone,
@@ -264,7 +274,7 @@ const BookingPage = () => {
     }
 
     const handleReschedule = async () => {
-        if (!selectedSlot || !eventType) return
+        if (!selectedSlot || !bookingLink) return
         setSubmitting(true)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${rescheduleFromId}/reschedule`, {
@@ -289,7 +299,7 @@ const BookingPage = () => {
     }
 
     const handleSeriesReschedule = async () => {
-        if (!selectedSlot || !eventType) return
+        if (!selectedSlot || !bookingLink) return
         setSubmitting(true)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${rescheduleSeriesId}`, {
@@ -312,7 +322,7 @@ const BookingPage = () => {
     }
 
     const handleRefReschedule = async () => {
-        if (!selectedSlot || !eventType) return
+        if (!selectedSlot || !bookingLink) return
         setSubmitting(true)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/manage-occurrence/${requestRescheduleRef}/reschedule`, {
@@ -336,7 +346,7 @@ const BookingPage = () => {
     }
 
     const handleSubmit = async () => {
-        if (!selectedSlot || !eventType) return
+        if (!selectedSlot || !bookingLink) return
         const errors = validate(contact)
         if (Object.keys(errors).length > 0) { setContactErrors(errors); touchAll(); return }
         setSubmitting(true)
@@ -407,7 +417,7 @@ const BookingPage = () => {
                         </svg>
                     </div>
                     <h1 className="text-3xl font-bold text-gray-900 mb-1">{rescheduleSeriesId ? 'Series updated!' : requestSubmitted ? 'Request submitted!' : rescheduleFromId ? 'Rescheduled!' : "You're booked!"}</h1>
-                    {eventType && <p className="text-indigo-600 font-medium mb-4">{eventType.name}</p>}
+                    {bookingLink && <p className="text-indigo-600 font-medium mb-4">{bookingLink.slug}</p>}
                     {requestSubmitted && <p className="text-sm text-gray-500 mb-4">Your reschedule request has been submitted and an admin will review it shortly.</p>}
                     {selectedSlot && (
                         <div className="bg-gray-50 rounded-2xl px-6 py-4 mb-8 text-left">
@@ -418,11 +428,11 @@ const BookingPage = () => {
                         </div>
                     )}
                     <div className="flex flex-col items-center gap-3 w-full">
-                        {selectedSlot && eventType && !rescheduleSeriesId && !requestSubmitted && (
+                        {selectedSlot && bookingLink && !rescheduleSeriesId && !requestSubmitted && (
                             <div className="flex flex-col items-center gap-2 w-full">
                                 <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">Add to calendar</p>
                                 <div className="flex gap-3">
-                                    <a href={buildGoogleCalUrl(selectedSlot.start, selectedSlot.end, eventType.name, eventType.description)} target="_blank" rel="noopener noreferrer" title="Google Calendar"
+                                    <a href={buildGoogleCalUrl(selectedSlot.start, selectedSlot.end, bookingLink.slug, bookingLink.description)} target="_blank" rel="noopener noreferrer" title="Google Calendar"
                                         className="w-11 h-11 flex items-center justify-center bg-white border-2 border-gray-200 rounded-xl hover:border-indigo-300 transition-all shadow-sm">
                                         <svg viewBox="0 0 24 24" className="w-5 h-5">
                                             <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
@@ -431,11 +441,11 @@ const BookingPage = () => {
                                             <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
                                         </svg>
                                     </a>
-                                    <a href={buildOutlookUrl('https://outlook.live.com', selectedSlot.start, selectedSlot.end, eventType.name, eventType.description)} target="_blank" rel="noopener noreferrer" title="Outlook.com"
+                                    <a href={buildOutlookUrl('https://outlook.live.com', selectedSlot.start, selectedSlot.end, bookingLink.slug, bookingLink.description)} target="_blank" rel="noopener noreferrer" title="Outlook.com"
                                         className="w-11 h-11 flex items-center justify-center bg-white border-2 border-gray-200 rounded-xl hover:border-indigo-300 transition-all shadow-sm">
                                         <img src={outlookIcon} className="w-5 h-5" alt="Outlook" />
                                     </a>
-                                    <a href={buildOutlookUrl('https://outlook.office.com', selectedSlot.start, selectedSlot.end, eventType.name, eventType.description)} target="_blank" rel="noopener noreferrer" title="Office 365"
+                                    <a href={buildOutlookUrl('https://outlook.office.com', selectedSlot.start, selectedSlot.end, bookingLink.slug, bookingLink.description)} target="_blank" rel="noopener noreferrer" title="Office 365"
                                         className="w-11 h-11 flex items-center justify-center bg-white border-2 border-gray-200 rounded-xl hover:border-indigo-300 transition-all shadow-sm">
                                         <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none">
                                             <rect x="1" y="1" width="10.5" height="10.5" fill="#F25022"/>
@@ -444,7 +454,7 @@ const BookingPage = () => {
                                             <rect x="12.5" y="12.5" width="10.5" height="10.5" fill="#FFB900"/>
                                         </svg>
                                     </a>
-                                    <a href={buildIcsBlobUrl(selectedSlot.start, selectedSlot.end, eventType.name, eventType.description, bookingId)} download="booking.ics" title="Other"
+                                    <a href={buildIcsBlobUrl(selectedSlot.start, selectedSlot.end, bookingLink.slug, bookingLink.description, bookingId)} download="booking.ics" title="Other"
                                         className="w-11 h-11 flex items-center justify-center bg-white border-2 border-gray-200 rounded-xl hover:border-indigo-300 transition-all shadow-sm text-gray-500">
                                         <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
                                             <rect x="3" y="4" width="18" height="18" rx="2"/>
@@ -467,6 +477,33 @@ const BookingPage = () => {
     }
 
     // ---- PICK + CONTACT ----
+    if (unavailable) {
+        const copy = unavailable === 'paused'
+            ? {
+                title: 'Not booking right now',
+                body: "This link isn't accepting new bookings at the moment. It should be back soon — try again later.",
+            }
+            : {
+                title: 'This link is no longer available',
+                body: 'It may have been retired, or the address may be mistyped. If someone sent you this link, ask them for an up-to-date one.',
+            }
+        return (
+            <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 flex items-center justify-center p-4 md:p-8">
+                <div className="w-full max-w-md bg-white rounded-3xl shadow-xl border border-gray-100 p-10 text-center">
+                    <div className={`w-12 h-12 rounded-full mx-auto mb-5 flex items-center justify-center ${unavailable === 'paused' ? 'bg-amber-50' : 'bg-gray-100'}`}>
+                        <svg className={`w-6 h-6 ${unavailable === 'paused' ? 'text-amber-500' : 'text-gray-400'}`} fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                            {unavailable === 'paused'
+                                ? <path strokeLinecap="round" strokeLinejoin="round" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                : <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />}
+                        </svg>
+                    </div>
+                    <h1 className="text-lg font-semibold text-gray-800 mb-2">{copy.title}</h1>
+                    <p className="text-sm text-gray-500 leading-relaxed">{copy.body}</p>
+                </div>
+            </div>
+        )
+    }
+
     return (
         <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-indigo-50/30 flex items-center justify-center p-4 md:p-8">
             <div className="w-full max-w-5xl bg-white rounded-3xl shadow-xl border border-gray-100 overflow-hidden md:flex min-h-[640px]">
@@ -474,22 +511,22 @@ const BookingPage = () => {
                 {/* ---- LEFT PANEL ---- */}
                 <div className="md:w-72 bg-gray-950 text-white p-10 flex flex-col shrink-0">
 
-                    {(loadErrors.eventType || loadErrors.tutors || loadErrors.unknown) && (
-                        <p className="text-sm text-red-400 mb-4">{loadErrors.eventType || loadErrors.tutors || loadErrors.unknown}</p>
+                    {(loadErrors.bookingLink || loadErrors.tutors || loadErrors.unknown) && (
+                        <p className="text-sm text-red-400 mb-4">{loadErrors.bookingLink || loadErrors.tutors || loadErrors.unknown}</p>
                     )}
 
-                    {eventType ? (
+                    {bookingLink ? (
                         <>
                             <p className="text-xs font-semibold text-indigo-400 uppercase tracking-widest mb-3">Schedule a session</p>
-                            <h1 className="text-2xl font-bold text-white leading-tight mb-4">{eventType.name}</h1>
+                            <h1 className="text-2xl font-bold text-white leading-tight mb-4">{bookingLink.slug}</h1>
                             <div className="flex items-center gap-2 text-gray-400 text-sm mb-4">
                                 <svg className="w-4 h-4 shrink-0 text-indigo-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                                 </svg>
-                                {eventType.duration_minutes} minutes
+                                {bookingLink.duration_minutes} minutes
                             </div>
-                            {eventType.description && (
-                                <p className="text-sm text-gray-400 leading-relaxed">{eventType.description}</p>
+                            {bookingLink.description && (
+                                <p className="text-sm text-gray-400 leading-relaxed">{bookingLink.description}</p>
                             )}
                             {(rescheduleFromId || rescheduleSeriesId) && (originalStart || originalDayOfWeek !== null) && (
                                 <div className="mt-5 p-3 rounded-xl border border-gray-800">
@@ -880,7 +917,7 @@ const BookingPage = () => {
                                     />
                                 </div>
 
-                                {eventType?.booker_can_set_recur_until && (
+                                {bookingLink?.booker_can_set_recur_until && (
                                     <div className="flex flex-col gap-1">
                                         <label className="text-sm font-medium text-gray-700">
                                             Series end date <span className="text-gray-400 font-normal">(optional)</span>

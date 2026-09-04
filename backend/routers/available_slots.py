@@ -134,7 +134,7 @@ from sqlalchemy.orm import Session
 from booking_utils import active_series_filter
 from database import get_db
 from gcal import SCOPES, get_calendar_service
-from models import Booking, BookingSeries, EventType, EventTypeAvailability, Settings, Tutor
+from models import Booking, BookingSeries, BookingLink, BookingLinkAvailability, Settings, Tutor
 from schemas import AvailableSlotResponse
 
 router = APIRouter(prefix="/available-slots", tags=["available-slots"])
@@ -570,7 +570,7 @@ def run_infinite(free_blocks: list, tutor_id: int, time_min: datetime, time_max:
 
 def get_available_slots(
     tutor_ids: list,
-    event_type_id: int,
+    booking_link_id: int,
     time_min: datetime,  # UTC
     time_max: datetime,  # UTC
     db,
@@ -580,13 +580,13 @@ def get_available_slots(
 ) -> list:
 
     db_tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids), Tutor.is_active == True).all()
-    db_event_type = db.query(EventType).filter(EventType.id == event_type_id).first()
+    db_booking_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
 
     availability_by_tutor = {
         a.tutor_id: a.schedule
-        for a in db.query(EventTypeAvailability).filter(
-            EventTypeAvailability.event_type_id == event_type_id,
-            EventTypeAvailability.tutor_id.in_(tutor_ids),
+        for a in db.query(BookingLinkAvailability).filter(
+            BookingLinkAvailability.booking_link_id == booking_link_id,
+            BookingLinkAvailability.tutor_id.in_(tutor_ids),
         ).all()
     }
     _settings = db.query(Settings).filter(Settings.id == 1).first()
@@ -625,12 +625,12 @@ def get_available_slots(
             exclude_series_id = s.id
             exclude_series_pattern = (s.dtstart.weekday(), s.dtstart.time(), s.dtend.time())
 
-    duration = timedelta(minutes=db_event_type.duration_minutes)
-    interval = timedelta(minutes=db_event_type.interval_minutes or db_event_type.duration_minutes)
-    expires_on = db_event_type.expires_on
-    recur_weeks = db_event_type.recur_weeks
+    duration = timedelta(minutes=db_booking_link.duration_minutes)
+    interval = timedelta(minutes=db_booking_link.interval_minutes or db_booking_link.duration_minutes)
+    expires_on = db_booking_link.expires_on
+    recur_weeks = db_booking_link.recur_weeks
 
-    if not db_event_type.recurring or exclude_ref is not None:
+    if not db_booking_link.recurring or exclude_ref is not None:
         # exclude_ref means one occurrence is moving — one date, not a recurring claim
         mode = "standalone"
     elif expires_on is not None or recur_weeks is not None:
@@ -783,7 +783,7 @@ def get_available_slots(
 @router.get("/", response_model=list[AvailableSlotResponse])
 def available_slots_endpoint(
     tutor_ids: list[int] = Query(),
-    event_type_id: int = Query(),
+    booking_link_id: int = Query(),
     time_min: datetime = Query(),
     time_max: datetime = Query(),
     exclude_ref: str | None = Query(default=None),         # booking being rescheduled
@@ -794,8 +794,13 @@ def available_slots_endpoint(
     missing = set(tutor_ids) - {t.id for t in db_tutors}
     if missing:
         raise HTTPException(status_code=404, detail=f"Tutors not found: {missing}")
-    if not db.query(EventType).filter(EventType.id == event_type_id).first():
-        raise HTTPException(status_code=404, detail="Event type not found")
+    # Checked here, not inside get_available_slots — that stays a pure slot algorithm.
+    # Archived only: a paused link still serves reschedules, and its new-booking attempt is
+    # blocked authoritatively by create_booking.
+    if not db.query(BookingLink).filter(
+        BookingLink.id == booking_link_id, BookingLink.status != "archived"
+    ).first():
+        raise HTTPException(status_code=404, detail="Booking link not found")
     if time_min.tzinfo is None:
         time_min = time_min.replace(tzinfo=UTC)
     if time_max.tzinfo is None:
@@ -805,7 +810,7 @@ def available_slots_endpoint(
     except Exception:
         calendar_service = None
     try:
-        return get_available_slots(tutor_ids, event_type_id, time_min, time_max, db, calendar_service,
+        return get_available_slots(tutor_ids, booking_link_id, time_min, time_max, db, calendar_service,
                                    exclude_ref=exclude_ref, exclude_series_ref=exclude_series_ref)
     except Exception as e:
         logging.error(f"available_slots failed: {e}", exc_info=True)

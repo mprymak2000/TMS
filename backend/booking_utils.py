@@ -5,8 +5,8 @@ import json
 from zoneinfo import ZoneInfo
 from sqlalchemy import and_, func, or_, tuple_
 from sqlalchemy.orm import Session
-from models import Booking, BookingSeries, EventType, Tutor
-from schemas import BookingFacets, BookingResponse, EventTypeFacetOption, StudentFacetOption, TutorFacetOption
+from models import Booking, BookingSeries, BookingLink, Tutor
+from schemas import BookingFacets, BookingResponse, BookingLinkFacetOption, StudentFacetOption, TutorFacetOption
 from policy import get_cancel_action, get_reschedule_action
 from fastapi import HTTPException
      
@@ -48,7 +48,7 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         public_id=f"{series.public_id}:{int(start_utc.timestamp())}",
         series_id=series.id,
         tutor_id=series.tutor_id,
-        event_type_id=series.event_type_id,
+        booking_link_id=series.booking_link_id,
         student_id=series.student_id,
         student_first=series.student_first,
         student_last=series.student_last,
@@ -69,10 +69,37 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
     return new_booking
 
 
+## -------------- BookingLink status guards -------------- ##
+# Two distinct questions, not one "is it active" check. A paused link still has live calendar rules,
+# so it can still serve a reschedule — it just can't take new bookings. Only archived kills both.
+
+def require_link_bookable(link) -> None:
+    """New bookings only. Blocks paused and archived, with a reason the caller can show verbatim."""
+    if link.status == "paused":
+        raise HTTPException(status_code=400, detail="This booking link is paused and isn't accepting new bookings right now.")
+    if link.status == "archived":
+        raise HTTPException(status_code=400, detail="This booking link is no longer offered.")
+
+
+def require_link_not_archived(link) -> None:
+    """Anything needing the link's calendar rules to still resolve — reschedules, edits.
+
+    Paused passes: its rules are live. Archived doesn't: its rules are inert, and the fix is to
+    reassign the booking to a live link rather than to revive the link."""
+    if link.status == "archived":
+        raise HTTPException(
+            status_code=400,
+            detail="This booking link is archived, so its scheduling rules no longer apply. Reassign this booking to an active link first.",
+        )
+
+
 def active_series_filter(today: date):
     """SQL filter expression - a series is active unless explicitly cancelled/rescheduled, or its
     until has passed. Full (customer-facing) definition - admin routes use a narrower status-only
-    check instead, see routers/bookings.py."""
+    check instead, see routers/bookings.py.
+
+    Deliberately says nothing about the series' BookingLink: a series is its own booking template
+    and keeps running whatever its link's status is."""
     return and_(
         # NULL NOT IN (...) evaluates to NULL in SQL, not True - a fresh series (status IS NULL)
         # would otherwise get silently filtered out. Handle NULL explicitly instead of relying on notin_.
@@ -207,15 +234,15 @@ def _virtual_occurrences(
         if not already_materialized and not at_or_before_cursor:
             end_utc = _occurrence_end(series, current_date, tz)
             minutes_until = (start_utc - datetime.now(UTC)).total_seconds() / 60
-            cancel_action = get_cancel_action(series.event_type, minutes_until)
-            reschedule_action = get_reschedule_action(series.event_type, minutes_until)
+            cancel_action = get_cancel_action(series.booking_link, minutes_until)
+            reschedule_action = get_reschedule_action(series.booking_link, minutes_until)
             occurrences.append(
                 BookingResponse(
                     public_id=public_id,
                     series_public_id=series.public_id,
                     rescheduled_to_public_id=None,
                     tutor_id=series.tutor_id,
-                    event_type_id=series.event_type_id,
+                    booking_link_id=series.booking_link_id,
                     student_id=series.student_id,
                     start=start_utc,
                     end=end_utc,
@@ -310,91 +337,94 @@ def apply_series_time_scope(query, time_min: datetime | None, time_max: datetime
     return query
 
 
-def apply_scope_filters(query, model, tutor_ids, event_type_ids, student_pairs, email=None, exclude=None):
+def apply_scope_filters(query, model, tutor_ids, booking_link_ids, student_pairs, email=None, exclude=None):
     """Take in a query and attach filters to it based on the provided scope parameters. Return the modified query."""
     if email:
         query = query.filter((model.student_email == email) | (model.parent_email == email))
     if tutor_ids and exclude != "tutor":
         query = query.filter(model.tutor_id.in_(tutor_ids))
-    if event_type_ids and exclude != "event_type":
-        query = query.filter(model.event_type_id.in_(event_type_ids))
+    if booking_link_ids and exclude != "booking_link":
+        query = query.filter(model.booking_link_id.in_(booking_link_ids))
     if student_pairs and exclude != "student":
         query = query.filter(tuple_(model.student_first, model.student_last).in_(student_pairs))
     return query
 
 
-def _build_facets(tutor_ids, event_type_ids, student_pairs, db):
-    """Given a set of scope parameters, return the corresponding filter/facet options for the respective fields."""    
+def _build_facets(tutor_ids, booking_link_ids, student_pairs, db):
+    """Given a set of scope parameters, return the corresponding filter/facet options for the respective fields.
+
+    Links are looked up by id without a status filter — an archived link's bookings still group under
+    it, so its facet option has to keep resolving."""
     tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all() if tutor_ids else []
-    event_types = db.query(EventType).filter(EventType.id.in_(event_type_ids)).all() if event_type_ids else []
+    booking_links = db.query(BookingLink).filter(BookingLink.id.in_(booking_link_ids)).all() if booking_link_ids else []
 
     tutor_options = [TutorFacetOption(id=t.id, first_name=t.first_name, last_name=t.last_name) for t in tutors]
     tutor_options.sort(key=lambda t: (t.first_name.lower(), t.last_name.lower()))
 
-    event_type_options = [EventTypeFacetOption(id=e.id, name=e.name) for e in event_types]
-    event_type_options.sort(key=lambda e: e.name.lower())
+    booking_link_options = [BookingLinkFacetOption(id=l.id, slug=l.slug) for l in booking_links]
+    booking_link_options.sort(key=lambda l: l.slug.lower())
 
     student_options = [StudentFacetOption(first_name=first, last_name=last) for first, last in student_pairs]
     student_options.sort(key=lambda s: (s.first_name.lower(), s.last_name.lower()))
 
-    return BookingFacets(tutors=tutor_options, event_types=event_type_options, students=student_options)
+    return BookingFacets(tutors=tutor_options, booking_links=booking_link_options, students=student_options)
 
 
-def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db):
+def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, settings, db):
     """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. materialized_base_query must already be time/status-scoped, and series_base_query already time-scoped (apply_series_time_scope, a cheap pre-filter), by the caller. Return the unique set of facet options for each facet type. """
 
     # get tutor options filtered by the other filters (self-exclude tutor), then query to get their ids
-    tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
+    tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, student_pairs, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(Booking.tutor_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
-    # get event_type options filtered by the other filters (self-exclude event_type), then query to get their ids
-    event_type_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="event_type")
-    event_type_id_set = {row[0] for row in event_type_query.with_entities(Booking.event_type_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
+    # get booking_link options filtered by the other filters (self-exclude booking_link), then query to get their ids
+    booking_link_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, student_pairs, exclude="booking_link")
+    booking_link_id_set = {row[0] for row in booking_link_query.with_entities(Booking.booking_link_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
     # get student options filtered by the other filters (self-exclude student), then query to get their first/last names (from denormalized column names on bookimg, to be changed to student identity)
-    student_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, event_type_ids, student_pairs, exclude="student")
+    student_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, student_pairs, exclude="student")
     student_pair_set = set(student_query.with_entities(Booking.student_first, Booking.student_last).distinct().all()) # [('John', 'Doe'), ('Jane', 'Smith'), ...] -> {('John', 'Doe'), ('Jane', 'Smith'), ...}
 
     # apply_series_time_scope already dropped series that can't possibly overlap; here we confirm
     # each survivor actually has an occurrence in [time_min, time_max] (count=1 - existence only,
-    # not the full list, since every occurrence of a series shares the same tutor/event_type/student)
+    # not the full list, since every occurrence of a series shares the same tutor/booking_link/student)
     if series_base_query is not None:
         for series in series_base_query.all():
             if not _virtual_occurrences(series, time_min, time_max, 1, settings):
                 continue
-            if (not event_type_ids or series.event_type_id in event_type_ids) and (not student_pairs or (series.student_first, series.student_last) in student_pairs):
+            if (not booking_link_ids or series.booking_link_id in booking_link_ids) and (not student_pairs or (series.student_first, series.student_last) in student_pairs):
                 tutor_id_set.add(series.tutor_id)
             if (not tutor_ids or series.tutor_id in tutor_ids) and (not student_pairs or (series.student_first, series.student_last) in student_pairs):
-                event_type_id_set.add(series.event_type_id)
-            if (not tutor_ids or series.tutor_id in tutor_ids) and (not event_type_ids or series.event_type_id in event_type_ids):
+                booking_link_id_set.add(series.booking_link_id)
+            if (not tutor_ids or series.tutor_id in tutor_ids) and (not booking_link_ids or series.booking_link_id in booking_link_ids):
                 student_pair_set.add((series.student_first, series.student_last))
 
     # keep a selected value visible in its own facet even if other filters/the time window narrowed it out
-    # ie tutor A selected but shifting dates yields no results. Tutor a selection still needs to be visible 
+    # ie tutor A selected but shifting dates yields no results. Tutor a selection still needs to be visible
     # so user can relax the filters and get new hits for new time range
     tutor_id_set |= set(tutor_ids)
-    event_type_id_set |= set(event_type_ids)
+    booking_link_id_set |= set(booking_link_ids)
     student_pair_set |= set(student_pairs)
 
-    return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
+    return _build_facets(tutor_id_set, booking_link_id_set, student_pair_set, db)
 
 
-def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, db):
+def compute_series_facets(base_query, tutor_ids, booking_link_ids, student_pairs, db):
     """ Given scope parameters, attach them to the base query for SERIES (not individual ocurrences) and ficlean upre it as many times as there are facets, while keeping one facet type unfiltered at a time. Return the unique set of facet options for each facet type. """
 
-    tutor_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="tutor")
+    tutor_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(BookingSeries.tutor_id).distinct().all()}
 
-    event_type_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="event_type")
-    event_type_id_set = {row[0] for row in event_type_query.with_entities(BookingSeries.event_type_id).distinct().all()}
+    booking_link_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs, exclude="booking_link")
+    booking_link_id_set = {row[0] for row in booking_link_query.with_entities(BookingSeries.booking_link_id).distinct().all()}
 
-    student_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs, exclude="student")
+    student_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs, exclude="student")
     student_pair_set = set(student_query.with_entities(BookingSeries.student_first, BookingSeries.student_last).distinct().all())
 
     # keep a selected value visible in its own facet even if other filters narrowed it out
     tutor_id_set |= set(tutor_ids)
-    event_type_id_set |= set(event_type_ids)
+    booking_link_id_set |= set(booking_link_ids)
     student_pair_set |= set(student_pairs)
 
-    return _build_facets(tutor_id_set, event_type_id_set, student_pair_set, db)
+    return _build_facets(tutor_id_set, booking_link_id_set, student_pair_set, db)
 
 
 ## -------------- Cursor for Pagination -------------- ##
@@ -402,7 +432,7 @@ def compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, 
 
 def _filters_fingerprint(
     tutor_ids,
-    event_type_ids,
+    booking_link_ids,
     student_pairs,
     time_min,
     time_max,
@@ -421,7 +451,7 @@ def _filters_fingerprint(
     time_max_utc = (time_max if time_max.tzinfo else time_max.replace(tzinfo=UTC)) if time_max else None
     canonical = json.dumps({
         "tutor_ids": sorted(tutor_ids),
-        "event_type_ids": sorted(event_type_ids),
+        "booking_link_ids": sorted(booking_link_ids),
         "student_pairs": sorted(student_pairs),
         "time_min": int(time_min_utc.timestamp()) if time_min_utc else None,
         "time_max": int(time_max_utc.timestamp()) if time_max_utc else None,
@@ -437,7 +467,7 @@ def encode_cursor(
     start: datetime,
     public_id: str,
     tutor_ids: list[int],
-    event_type_ids: list[int],
+    booking_link_ids: list[int],
     student_pairs: list[tuple[int, int]],
     time_min: datetime | None,
     time_max: datetime | None,
@@ -449,7 +479,7 @@ def encode_cursor(
     """Encode a cursor for pagination. Opaque token wrapping containing start timestamp, public_id tiebreaker and filter fingerprint"""
     fingerprint = _filters_fingerprint(
         tutor_ids,
-        event_type_ids,
+        booking_link_ids,
         student_pairs,
         time_min,
         time_max,
@@ -468,7 +498,7 @@ def encode_cursor(
 def decode_cursor(
     cursor: str,
     tutor_ids,
-    event_type_ids,
+    booking_link_ids,
     student_pairs,
     time_min,
     time_max,
@@ -487,7 +517,7 @@ def decode_cursor(
         raise HTTPException(status_code=400, detail="Invalid cursor")
     expected_fingerprint = _filters_fingerprint(
         tutor_ids,
-        event_type_ids,
+        booking_link_ids,
         student_pairs,
         time_min,
         time_max,
@@ -503,5 +533,5 @@ def decode_cursor(
 
 
 # Once a guest/contact id exists on Booking/BookingSeries, student matching should switch from
-# (student_first, student_last) pairs to that id — same shape as tutor_id/event_type_id already
+# (student_first, student_last) pairs to that id — same shape as tutor_id/booking_link_id already
 # use, dropping the pair/tuple_ special-casing throughout this file.

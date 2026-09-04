@@ -1,13 +1,13 @@
 import { useState, useEffect } from 'react'
 import { Button, Loader } from '@mantine/core'
 import { IconPlus, IconPencil, IconTrash, IconExternalLink } from '@tabler/icons-react'
-import { useNavigate } from 'react-router-dom'
-import type { Tutor, Schedule, EventType } from './types'
+import { useNavigate, useLocation } from 'react-router-dom'
+import type { Tutor, Schedule, BookingLink } from './types'
 import { useToast } from './useToast'
 import { extractError } from './utils'
 import Toast from './Toast'
 
-/* TODO (backend) — wire EventType limit fields to available-slots logic (see CLAUDE.md Known TODOs):
+/* TODO (backend) — wire BookingLink limit fields to available-slots logic (see CLAUDE.md Known TODOs):
   - limit_future_bookings_days: cap time_max before slot generation
   - only_show_first_slot: keep earliest slot per (tutor_id, date) after generation
   - buffer_minutes: expand busy overlap check to [slot_start - buffer, slot_end + buffer]
@@ -26,35 +26,37 @@ const modeLabel = (mode: string | null) => {
 }
 
 interface LoadErrors {
-    eventTypes?: string
+    bookingLinks?: string
     tutors?: string
     schedules?: string
     unknown?: string
 }
 
-const EventTypes = () => {
+const Links = () => {
     const navigate = useNavigate()
 
-    const [eventTypes, setEventTypes] = useState<EventType[]>([])
+    const [bookingLinks, setLinks] = useState<BookingLink[]>([])
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [schedules, setSchedules] = useState<Schedule[]>([])
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
     const [loading, setLoading] = useState(false)
 
-    const [confirmingDeleteId, setConfirmingDeleteId] = useState<number | null>(null)
+    const location = useLocation()
+    const [confirmingArchiveId, setConfirmingArchiveId] = useState<number | null>(null)
+    const [impact, setImpact] = useState<{ upcoming_bookings: number; active_series: number } | null>(null)
     const { toast, showToast } = useToast()
 
     const loadData = async () => {
         setLoading(true)
         try {
-            const [eventTypesRes, tutorsRes, schedulesRes] = await Promise.all([
-                fetch(`${import.meta.env.VITE_API_URL}/event_types`),
+            const [bookingLinksRes, tutorsRes, schedulesRes] = await Promise.all([
+                fetch(`${import.meta.env.VITE_API_URL}/booking_links`),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                 fetch(`${import.meta.env.VITE_API_URL}/schedules`)
             ])
-            if (!eventTypesRes.ok) {
-                const err = await eventTypesRes.json()
-                setLoadErrors(prev => ({ ...prev, eventTypes: extractError(err, 'Failed to load event types') }))
+            if (!bookingLinksRes.ok) {
+                const err = await bookingLinksRes.json()
+                setLoadErrors(prev => ({ ...prev, bookingLinks: extractError(err, 'Failed to load booking links') }))
                 return
             }
             if (!tutorsRes.ok) {
@@ -67,7 +69,7 @@ const EventTypes = () => {
                 setLoadErrors(prev => ({ ...prev, schedules: extractError(err, 'Failed to load schedules') }))
                 return
             }
-            setEventTypes(await eventTypesRes.json())
+            setLinks(await bookingLinksRes.json())
             setTutors(await tutorsRes.json())
             setSchedules(await schedulesRes.json())
         } catch (error) {
@@ -80,21 +82,59 @@ const EventTypes = () => {
 
     useEffect(() => { loadData() }, [])
 
-    const handleDelete = async (id: number) => {
+    // LinkPage navigates here after creating one, handing its toast over in route state.
+    // Cleared immediately so a refresh doesn't replay it.
+    useEffect(() => {
+        const msg = location.state?.toast
+        if (!msg) return
+        showToast(msg)
+        navigate(location.pathname, { replace: true })
+    }, [location.state])
+
+    /* Archive is the only delete, and it's terminal — hence the impact fetch before confirming,
+       so the admin sees how many upcoming bookings lose self-reschedule. */
+    const handleArchive = async (id: number) => {
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/event_types/${id}`, { method: 'DELETE' })
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}`, { method: 'DELETE' })
             if (!res.ok) {
-                showToast(extractError(await res.json(), 'Failed to delete event type'), 'error')
-                setConfirmingDeleteId(null)
+                showToast(extractError(await res.json(), 'Failed to archive booking link'), 'error')
+                setConfirmingArchiveId(null)
                 return
             }
-            setConfirmingDeleteId(null)
+            setConfirmingArchiveId(null)
+            setImpact(null)
             loadData()
-            showToast('Event type deleted')
+            showToast('Booking link archived')
         } catch (error) {
             console.error(error)
-            showToast('An unknown error occurred while deleting, please try again', 'error')
-            setConfirmingDeleteId(null)
+            showToast('An unknown error occurred while archiving, please try again', 'error')
+            setConfirmingArchiveId(null)
+        }
+    }
+
+    const startArchive = async (id: number) => {
+        setConfirmingArchiveId(id)
+        setImpact(null)
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}/impact`)
+            if (res.ok) setImpact(await res.json())
+        } catch {
+            /* the count is advisory — the confirm still works without it */
+        }
+    }
+
+    const setStatus = async (id: number, action: 'pause' | 'resume') => {
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}/${action}`, { method: 'POST' })
+            if (!res.ok) {
+                showToast(extractError(await res.json(), `Failed to ${action} booking link`), 'error')
+                return
+            }
+            loadData()
+            showToast(action === 'pause' ? 'Booking link paused' : 'Booking link resumed')
+        } catch (error) {
+            console.error(error)
+            showToast('An unknown error occurred, please try again', 'error')
         }
     }
 
@@ -103,28 +143,31 @@ const EventTypes = () => {
             {loading && <div className="flex justify-center py-12"><Loader size="sm" /></div>}
 
             {/* load errors */}
-            {loadErrors.eventTypes && <p className="text-sm text-red-500 mb-2">{loadErrors.eventTypes}</p>}
+            {loadErrors.bookingLinks && <p className="text-sm text-red-500 mb-2">{loadErrors.bookingLinks}</p>}
             {loadErrors.tutors && <p className="text-sm text-red-500 mb-2">{loadErrors.tutors}</p>}
             {loadErrors.schedules && <p className="text-sm text-red-500 mb-2">{loadErrors.schedules}</p>}
             {loadErrors.unknown && <p className="text-sm text-red-500 mb-4">{loadErrors.unknown}</p>}
 
             {/* header */}
             <div className="flex items-center justify-between mb-6">
-                <h1 className="text-xl font-semibold text-gray-800">Event Types</h1>
-                <Button leftSection={<IconPlus size={16} />} size="sm" onClick={() => navigate('/event-types/new')}>
-                    New Event Type
+                <h1 className="text-xl font-semibold text-gray-800">Links</h1>
+                <Button leftSection={<IconPlus size={16} />} size="sm" onClick={() => navigate('/links/new')}>
+                    New link
                 </Button>
             </div>
 
             {/* cards list */}
             <div className="flex flex-col gap-4">
-                {eventTypes.map(e => (
+                {bookingLinks.map(e => (
                     <div key={e.id} className="bg-white border border-gray-200 rounded-xl p-5">
 
                         {/* card header: name, duration badge, recurring badge + edit/delete */}
                         <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-2">
-                                <span className="font-medium text-gray-800">{e.name}</span>
+                                <span className="font-medium text-gray-800">{e.slug}</span>
+                                {e.status === 'paused' && (
+                                    <span className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full font-medium">Paused</span>
+                                )}
                                 <span className="text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-medium">
                                     {e.min_duration_minutes !== null ? `${e.min_duration_minutes}–${e.max_duration_minutes} min` : `${e.duration_minutes} min`}
                                 </span>
@@ -135,34 +178,51 @@ const EventTypes = () => {
 
                             {/* edit / delete buttons */}
                             <div className="flex items-center gap-2">
-                                {confirmingDeleteId === e.id ? (
-                                    <div className="flex items-center gap-2">
-                                        <span className="text-sm text-gray-500">Delete?</span>
-                                        <Button variant="default" size="xs" onClick={() => setConfirmingDeleteId(null)}>Cancel</Button>
-                                        <Button color="red" size="xs" onClick={() => handleDelete(e.id)}>Delete</Button>
+                                {confirmingArchiveId === e.id ? (
+                                    <div className="flex items-center gap-3">
+                                        <div className="text-sm text-gray-600 text-right">
+                                            <div className="font-medium">Archive permanently?</div>
+                                            {impact && impact.upcoming_bookings > 0 && (
+                                                <div className="text-xs text-gray-500">
+                                                    {impact.upcoming_bookings} upcoming booking{impact.upcoming_bookings === 1 ? '' : 's'} can't be
+                                                    self-rescheduled until reassigned to another link
+                                                </div>
+                                            )}
+                                        </div>
+                                        <Button variant="default" size="xs" onClick={() => { setConfirmingArchiveId(null); setImpact(null) }}>Cancel</Button>
+                                        <Button color="red" size="xs" onClick={() => handleArchive(e.id)}>Archive</Button>
                                     </div>
                                 ) : (
                                     <>
                                         <Button
                                             component="a"
-                                            href={`/book/${e.id}`}
+                                            href={`/book/${e.slug}`}
                                             target="_blank"
                                             variant="light"
                                             color="indigo"
                                             size="xs"
                                             leftSection={<IconExternalLink size={13} />}
+                                            disabled={e.status !== 'active'}
                                         >
                                             Book
                                         </Button>
+                                        <Button
+                                            variant="subtle"
+                                            color="gray"
+                                            size="xs"
+                                            onClick={() => setStatus(e.id, e.status === 'paused' ? 'resume' : 'pause')}
+                                        >
+                                            {e.status === 'paused' ? 'Resume' : 'Pause'}
+                                        </Button>
                                         <button
                                             className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
-                                            onClick={() => navigate(`/event-types/${e.id}`)}
+                                            onClick={() => navigate(`/links/${e.id}`)}
                                         >
                                             <IconPencil size={16} />
                                         </button>
                                         <button
                                             className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
-                                            onClick={() => setConfirmingDeleteId(e.id)}
+                                            onClick={() => startArchive(e.id)}
                                         >
                                             <IconTrash size={16} />
                                         </button>
@@ -208,4 +268,4 @@ const EventTypes = () => {
         </div>
     )
 }
-export default EventTypes
+export default Links

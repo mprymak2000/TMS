@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Outlet, NavLink } from 'react-router-dom'
 import { IconRepeat } from '@tabler/icons-react'
-import type { Tutor, EventType } from './types'
+import type { Tutor, BookingLink } from './types'
 import { extractError } from './utils'
 import { useToast } from './useToast'
 import Toast from './Toast'
@@ -9,7 +9,7 @@ import Toast from './Toast'
 // SHAPE OF THE OUTLET CONTEXT — what every tab reads via useOutletContext().
 export interface BookingsOutletContext {
     tutors: Tutor[]
-    eventTypes: EventType[]
+    bookingLinks: BookingLink[]
     isLoadingRoster: boolean
     showToast: (msg: string, type?: 'success' | 'error') => void
 }
@@ -24,7 +24,7 @@ const TABS = [
 const BookingsLayout = () => {
     // STATE
     const [tutors, setTutors] = useState<Tutor[]>([])
-    const [eventTypes, setEventTypes] = useState<EventType[]>([])
+    const [bookingLinks, setLinks] = useState<BookingLink[]>([])
     const [isLoadingRoster, setIsLoadingRoster] = useState(false)
     const [rosterError, setRosterError] = useState<string | null>(null)
     const { toast, showToast } = useToast()
@@ -34,17 +34,19 @@ const BookingsLayout = () => {
         const loadRoster = async () => {
             setIsLoadingRoster(true)
             try {
-                const [tutorResponse, eventTypeResponse] = await Promise.all([
+                const [tutorResponse, bookingLinkResponse] = await Promise.all([
                     fetch(`${import.meta.env.VITE_API_URL}/tutors`),
-                    fetch(`${import.meta.env.VITE_API_URL}/event_types`),
+                    // include_archived — bookings keep pointing at their link forever, so the roster
+                    // has to resolve retired ones or every row that came from one renders blank.
+                    fetch(`${import.meta.env.VITE_API_URL}/booking_links?include_archived=true`),
                 ])
                 if (!tutorResponse.ok) { setRosterError(extractError(await tutorResponse.json(), 'Failed to load tutors.')); return }
-                if (!eventTypeResponse.ok) { setRosterError(extractError(await eventTypeResponse.json(), 'Failed to load event types.')); return }
+                if (!bookingLinkResponse.ok) { setRosterError(extractError(await bookingLinkResponse.json(), 'Failed to load booking links.')); return }
                 setTutors(await tutorResponse.json())
-                setEventTypes(await eventTypeResponse.json())
+                setLinks(await bookingLinkResponse.json())
             } catch (error) {
                 console.error(error)
-                setRosterError('An unknown error occurred while loading tutors/event types.')
+                setRosterError('An unknown error occurred while loading tutors/booking links.')
             } finally {
                 setIsLoadingRoster(false)
             }
@@ -83,7 +85,7 @@ const BookingsLayout = () => {
             </div>
             {/* OUTLET — whichever tab matched the URL renders here */}
             <div className="flex-1 min-h-0">
-                <Outlet context={{ tutors, eventTypes, isLoadingRoster, showToast } satisfies BookingsOutletContext} />
+                <Outlet context={{ tutors, bookingLinks, isLoadingRoster, showToast } satisfies BookingsOutletContext} />
             </div>
             {/* TOAST */}
             <Toast toast={toast} />

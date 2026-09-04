@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime, func
+from sqlalchemy import Column, Integer, String, Float, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime, Index, text, func
 from sqlalchemy.orm import relationship, backref
 from database import Base
 from datetime import datetime, timedelta, UTC
@@ -44,7 +44,7 @@ class Tutor(Base):
     lessons = relationship("Lesson", back_populates="tutor")
     schedules = relationship("Schedule", back_populates="tutor", passive_deletes=True)
     bookings = relationship("Booking", back_populates="tutor")
-    availability = relationship("EventTypeAvailability", back_populates="tutor", passive_deletes=True)
+    availability = relationship("BookingLinkAvailability", back_populates="tutor", passive_deletes=True)
     series = relationship("BookingSeries", back_populates="tutor")
 
 
@@ -96,7 +96,7 @@ class Schedule(Base):
     timezone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="schedules")
-    availability = relationship("EventTypeAvailability", back_populates="schedule", passive_deletes=True)
+    availability = relationship("BookingLinkAvailability", back_populates="schedule", passive_deletes=True)
     days = relationship("ScheduleDay", back_populates="schedule", cascade="all, delete-orphan", passive_deletes=True)
 
 
@@ -104,35 +104,63 @@ class Schedule(Base):
 
 _WINDOW_MODES_SQL = "('auto_window_block', 'auto_window_request', 'request_window')"
 _ALL_MODES_SQL = "('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')"
+# active   — bookable; calendar rules live and editable
+# paused   — not bookable; rules stay live and editable, existing bookings still reschedule. Reversible.
+# archived — not bookable; rules inert, row read-only. Terminal, no restore.
+#
+# None of these touch an existing BookingSeries: a series is its own booking template and generates
+# occurrences from its own row (see _ensure_occurrence), never from the link. The only thing a link's
+# status governs is whether customers can get *slots* from it — new bookings, and reschedules.
+_LINK_STATUSES_SQL = "('active', 'paused', 'archived')"
 
-class EventType(Base):
-    __tablename__ = "event_types"
+class BookingLink(Base):
+    """A factory bookings are generated from.
+
+    Calendar rules on it (duration, buffers, limits, interval, availability) are read LIVE on every
+    slot computation, including a customer rescheduling an existing booking — so the row must always
+    resolve, which is why archive is the only delete. Wiring it stamps onto a booking is frozen at
+    creation and never propagates. See CLAUDE.md's "BookingLink data model".
+    """
+    __tablename__ = "booking_links"
     __table_args__ = (
         CheckConstraint(
             f"cancel_mode IS NULL OR cancel_mode IN {_ALL_MODES_SQL}",
-            name="chk_event_type_cancel_mode"
+            name="chk_booking_link_cancel_mode"
         ),
         CheckConstraint(
             f"reschedule_mode IS NULL OR reschedule_mode IN {_ALL_MODES_SQL}",
-            name="chk_event_type_reschedule_mode"
+            name="chk_booking_link_reschedule_mode"
         ),
         CheckConstraint(
             f"cancel_mode NOT IN {_WINDOW_MODES_SQL} OR (cancel_notice_minutes IS NOT NULL AND cancel_notice_minutes > 0)",
-            name="chk_event_type_cancel_notice_required"
+            name="chk_booking_link_cancel_notice_required"
         ),
         CheckConstraint(
             f"reschedule_mode NOT IN {_WINDOW_MODES_SQL} OR (reschedule_notice_minutes IS NOT NULL AND reschedule_notice_minutes > 0)",
-            name="chk_event_type_reschedule_notice_required"
+            name="chk_booking_link_reschedule_notice_required"
+        ),
+        CheckConstraint(
+            f"status IN {_LINK_STATUSES_SQL}",
+            name="chk_booking_link_status"
+        ),
+        # Slug is unique among ACTIVE links only — archiving releases the name for reuse. Both
+        # Postgres and SQLite support partial indexes, so tests and prod agree.
+        Index(
+            "uq_booking_link_slug_active", "slug", unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
         ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    status = Column(String, nullable=False, default="active")
+    archived_at = Column(DateTime(timezone=True), nullable=True)  # audit metadata; nothing branches on it
     cancel_mode = Column(String, nullable=True)  # not_allowed, auto, auto_window_block, auto_window_request, request, request_window; null = auto
     cancel_notice_minutes = Column(Integer, nullable=True)
     reschedule_mode = Column(String, nullable=True)  # same options; null = auto
     reschedule_notice_minutes = Column(Integer, nullable=True)
     #basic info
-    name = Column(String, nullable=False, unique=True)
+    slug = Column(String, nullable=False)  # public URL only; uniqueness enforced by the partial index above
     description = Column(Text, nullable=True)
     duration_minutes = Column(Integer, nullable=False)
     min_duration_minutes = Column(Integer, nullable=True)  # null = fixed duration; 0+ = custom duration on
@@ -155,24 +183,24 @@ class EventType(Base):
     only_show_first_slot = Column(Boolean, nullable=True)
     interval_minutes = Column(Integer, nullable=True)  # step between slot start times; null = fall back to duration_minutes (slots don't overlap). e.g. 3hr window + 90min session + 30min interval = 3 possible start times
 
-    availability = relationship("EventTypeAvailability", back_populates="event_type", cascade="all, delete-orphan")
+    availability = relationship("BookingLinkAvailability", back_populates="booking_link", cascade="all, delete-orphan")
 
 
-class EventTypeAvailability(Base):
-    __tablename__ = "event_type_availability"
-    __table_args__ = (UniqueConstraint("event_type_id", "tutor_id", name="uq_event_type_tutor"),)
+class BookingLinkAvailability(Base):
+    __tablename__ = "booking_link_availability"
+    __table_args__ = (UniqueConstraint("booking_link_id", "tutor_id", name="uq_booking_link_tutor"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    event_type_id = Column(Integer, ForeignKey("event_types.id", ondelete="CASCADE"), nullable=False)
+    booking_link_id = Column(Integer, ForeignKey("booking_links.id", ondelete="CASCADE"), nullable=False)
     tutor_id = Column(Integer, ForeignKey("tutors.id", ondelete="CASCADE"), nullable=False)
     schedule_id = Column(Integer, ForeignKey("schedules.id", ondelete="CASCADE"), nullable=False)
 
-    event_type = relationship("EventType", back_populates="availability")
+    booking_link = relationship("BookingLink", back_populates="availability")
     tutor = relationship("Tutor", back_populates="availability")
     schedule = relationship("Schedule", back_populates="availability")
 
 
-# class CancellationPolicy(Base):  # policy fields moved directly onto EventType
+# class CancellationPolicy(Base):  # policy fields moved directly onto BookingLink
 #     __tablename__ = "cancellation_policies"
 #   __table_args__ = (
 #     CheckConstraint(
@@ -191,7 +219,7 @@ class EventTypeAvailability(Base):
 #     cancel_notice_minutes = Column(Integer, nullable=True)
 #     reschedule_mode = Column(String, nullable=False)
 #     reschedule_notice_minutes = Column(Integer, nullable=True)
-#     event_types = relationship("EventType", back_populates="cancellation_policy", passive_deletes=True)
+#     booking_links = relationship("BookingLink", back_populates="cancellation_policy", passive_deletes=True)
 
 
 class BookingSeries(Base):
@@ -202,7 +230,7 @@ class BookingSeries(Base):
     created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
-    event_type_id = Column(Integer, ForeignKey("event_types.id"), nullable=False)
+    booking_link_id = Column(Integer, ForeignKey("booking_links.id"), nullable=False)
     dtstart = Column(DateTime, nullable=False)  # naive local time, not UTC — see ScheduleDay.start_time
     dtend = Column(DateTime, nullable=False)
     status = Column(String, nullable=True)  # 'cancelled' | 'rescheduled' | null (active/finished derived, see is_active)
@@ -219,7 +247,7 @@ class BookingSeries(Base):
     parent_phone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="series")
-    event_type = relationship("EventType")
+    booking_link = relationship("BookingLink")
     student_record = relationship("Student")
     bookings = relationship("Booking", back_populates="series")
     request = relationship("BookingRequest", back_populates="series", uselist=False)
@@ -254,11 +282,11 @@ class BookingSeries(Base):
 
     @property
     def cancel_action(self) -> str:
-        return get_cancel_action(self.event_type, self._next_upcoming_minutes_until)
+        return get_cancel_action(self.booking_link,self._next_upcoming_minutes_until)
 
     @property
     def reschedule_action(self) -> str:
-        return get_reschedule_action(self.event_type, self._next_upcoming_minutes_until)
+        return get_reschedule_action(self.booking_link,self._next_upcoming_minutes_until)
 
 
 class Booking(Base):
@@ -280,7 +308,7 @@ class Booking(Base):
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
     series_id = Column(Integer, ForeignKey("booking_series.id"), nullable=True) # for recurrent bookings (series means every wed at 5pm for 5 months)
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
-    event_type_id = Column(Integer, ForeignKey("event_types.id"), nullable=False)
+    booking_link_id = Column(Integer, ForeignKey("booking_links.id"), nullable=False)
     start = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
     timezone = Column(String, nullable=False, default="America/New_York")  # booker's timezone — display/email only, all scheduling logic uses UTC
@@ -304,7 +332,7 @@ class Booking(Base):
     parent_phone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="bookings")
-    event_type = relationship("EventType")
+    booking_link = relationship("BookingLink")
     series = relationship("BookingSeries", back_populates="bookings")
     student_record = relationship("Student")
     lesson = relationship("Lesson", back_populates="booking", uselist=False)
@@ -335,11 +363,11 @@ class Booking(Base):
 
     @property
     def cancel_action(self) -> str:
-        return get_cancel_action(self.event_type, _minutes_until(self.start))
+        return get_cancel_action(self.booking_link,_minutes_until(self.start))
 
     @property
     def reschedule_action(self) -> str:
-        return get_reschedule_action(self.event_type, _minutes_until(self.start))
+        return get_reschedule_action(self.booking_link,_minutes_until(self.start))
 
 
 class Settings(Base):

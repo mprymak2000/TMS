@@ -1,18 +1,18 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import type { Booking, EventType } from './types'
+import type { Booking, BookingLink } from './types'
 import { formatDate, formatTime, extractError } from './utils'
 
 interface LoadErrors {
     booking?: string
-    eventType?: string
+    bookingLink?: string
 }
 
 const ManageOccurrence = () => {
     const { ref } = useParams<{ ref: string }>()
     const navigate = useNavigate()
     const [booking, setBooking] = useState<Booking | null>(null)
-    const [eventType, setEventType] = useState<EventType | null>(null)
+    const [bookingLink, setBookingLink] = useState<BookingLink | null>(null)
     const [isLoading, setIsLoading] = useState(true)
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
@@ -32,13 +32,15 @@ const ManageOccurrence = () => {
             const bookingData: Booking = await res.json()
             setBooking(bookingData)
 
-            const eventTypeRes = await fetch(`${import.meta.env.VITE_API_URL}/event_types/${bookingData.event_type_id}`)
-            if (!eventTypeRes.ok) {
-                const err = await eventTypeRes.json()
-                setLoadErrors(prev => ({ ...prev, eventType: extractError(err, 'Failed to load event type from the booking') }))
+            // include_archived: this page must keep working for a booking whose link was retired —
+            // cancel doesn't need the link at all, and reschedule needs it only to explain itself.
+            const bookingLinkRes = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${bookingData.booking_link_id}?include_archived=true`)
+            if (!bookingLinkRes.ok) {
+                const err = await bookingLinkRes.json()
+                setLoadErrors(prev => ({ ...prev, bookingLink: extractError(err, 'Failed to load the booking link') }))
                 return
             }
-            setEventType(await eventTypeRes.json())
+            setBookingLink(await bookingLinkRes.json())
         } catch (err) {
             console.error('Error loading booking:', err)
             setError('An unknown error occurred while loading the booking')
@@ -60,8 +62,8 @@ const ManageOccurrence = () => {
     // a duplicate — collapse into one shared line then, fall back to per-action wording
     // otherwise.
     const sameAction = cancelAction === rescheduleAction
-    const cancelNoticeHours = Math.round((eventType?.cancel_notice_minutes ?? 0) / 60)
-    const rescheduleNoticeHours = Math.round((eventType?.reschedule_notice_minutes ?? 0) / 60)
+    const cancelNoticeHours = Math.round((bookingLink?.cancel_notice_minutes ?? 0) / 60)
+    const rescheduleNoticeHours = Math.round((bookingLink?.reschedule_notice_minutes ?? 0) / 60)
 
     const handleCancel = () => setConfirming('cancel')
 
@@ -93,14 +95,14 @@ const ManageOccurrence = () => {
         )
     }
 
-    if (loadErrors.booking || loadErrors.eventType) {
+    if (loadErrors.booking || loadErrors.bookingLink) {
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
                 <div className="bg-white rounded-2xl shadow border border-gray-100 p-8 max-w-md w-full text-center">
                     <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 mb-4 inline-flex items-center gap-1 transition-colors">
                         ← My bookings
                     </button>
-                    <p className="text-gray-500">{loadErrors.booking ?? loadErrors.eventType}</p>
+                    <p className="text-gray-500">{loadErrors.booking ?? loadErrors.bookingLink}</p>
                 </div>
             </div>
         )
@@ -132,7 +134,7 @@ const ManageOccurrence = () => {
         )
     }
 
-    if (!booking || !eventType) return null
+    if (!booking || !bookingLink) return null
 
     return (
         <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
@@ -143,7 +145,7 @@ const ManageOccurrence = () => {
                 </button>
 
                 <h1 className="text-xl font-bold text-gray-900 mb-1">Manage your booking</h1>
-                <p className="text-sm text-indigo-600 font-medium mb-6">{eventType.name}</p>
+                <p className="text-sm text-indigo-600 font-medium mb-6">{bookingLink.slug}</p>
 
                 {/* booking details */}
                 <div className="bg-gray-50 rounded-xl px-5 py-4 mb-6">
@@ -235,7 +237,7 @@ const ManageOccurrence = () => {
                             rescheduleAction === 'auto' ? (
                                 <div className="mb-4">
                                     <button
-                                        onClick={() => navigate(`/book/${booking.event_type_id}`, { state: {
+                                        onClick={() => navigate(`/book/${bookingLink.slug}`, { state: {
                                             rescheduleFromId: booking.id,
                                             originalStart: booking.start,
                                             originalEnd: booking.end,
@@ -259,7 +261,7 @@ const ManageOccurrence = () => {
                                         </p>
                                     )}
                                     <button
-                                        onClick={() => navigate(`/book/${booking.event_type_id}`, { state: {
+                                        onClick={() => navigate(`/book/${bookingLink.slug}`, { state: {
                                             requestRescheduleRef: ref,
                                             originalStart: booking.start,
                                             originalEnd: booking.end,

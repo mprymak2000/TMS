@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { TextInput, Loader, Button, Modal } from '@mantine/core'
 import { IconSearch } from '@tabler/icons-react'
-import type { Tutor, EventType, BookingSeries, TutorFacetOption, EventTypeFacetOption, StudentFacetOption } from './types'
+import type { Tutor, BookingLink, BookingSeries, TutorFacetOption, BookingLinkFacetOption, StudentFacetOption } from './types'
 import { extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
 import SeriesRow from './SeriesRow'
 import type { BookingsOutletContext } from './BookingsLayout'
@@ -16,17 +16,18 @@ import type { BookingFilters, LoadErrors } from './BookingToolbar'
 const RecurringList = ({
     seriesByDay,
     tutors,
-    eventTypes,
+    bookingLinks,
     isCustomer,
     includeCancelled,
     onRefresh,
     onError,
     onCancelSeries,
+    onPermanentDeleteSeries,
     emptyState,
 }: {
     seriesByDay: { day: number; name: string; series: BookingSeries[] }[]
     tutors: Tutor[]
-    eventTypes: EventType[]
+    bookingLinks: BookingLink[]
     isCustomer: boolean
     includeCancelled: boolean
     onRefresh: (msg: string) => void
@@ -52,7 +53,8 @@ const RecurringList = ({
                                 series={s}
                                 tutor={tutors.find(t => t.id === s.tutor_id)!}
                                 tutors={tutors}
-                                eventType={eventTypes.find(e => e.id === s.event_type_id)!}
+                                bookingLink={bookingLinks.find(e => e.id === s.booking_link_id)!}
+                                bookingLinks={bookingLinks}
                                 onRefresh={onRefresh}
                                 onError={onError}
                                 onCancelSeries={onCancelSeries}
@@ -71,17 +73,17 @@ const RecurringList = ({
 }
 
 const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
-    const { tutors, eventTypes, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
+    const { tutors, bookingLinks, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
 
     const [email] = useState('')
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
     const [isLoadingSeries, setIsLoadingSeries] = useState(false)
     const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
-    const [eventTypeFacetOptions, setEventTypeFacetOptions] = useState<EventTypeFacetOption[]>([])
+    const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
     const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>({
-        tutorIds: [], eventTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], bookingLinkIds: [], students: [], searchQuery: '', includeCancelled: true,
         dateFrom: null, dateTo: null,
     })
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
@@ -93,22 +95,22 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
     const getSeriesSearchString = (s: BookingSeries) => {
         const tutor = tutors.find(t => t.id === s.tutor_id)
-        const eventType = eventTypes.find(e => e.id === s.event_type_id)
+        const bookingLink = bookingLinks.find(e => e.id === s.booking_link_id)
         return [
             s.student_first, s.student_last,
             tutor?.first_name, tutor?.last_name,
-            eventType?.name,
+            bookingLink?.slug,
         ].filter(Boolean).join(' ').toLowerCase()
     }
 
     const loadBookingSeries = async ({
         tutorIds = filters.tutorIds,
-        eventTypeIds = filters.eventTypeIds,
+        bookingLinkIds = filters.bookingLinkIds,
         students = filters.students,
         emailFilter,
     }: {
         tutorIds?: string[]
-        eventTypeIds?: string[]
+        bookingLinkIds?: string[]
         students?: string[]
         emailFilter?: string
     } = {}) => {
@@ -117,10 +119,10 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const base = `${import.meta.env.VITE_API_URL}/bookings/booking-series`
             const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
             const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
-            const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
+            const bookingLinkParams = bookingLinkIds.map(id => `&booking_link_ids=${id}`).join('')
             const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
 
-            const response = await fetch(`${base}?${emailParam}${tutorParams}${eventTypeParams}${studentParams}`)
+            const response = await fetch(`${base}?${emailParam}${tutorParams}${bookingLinkParams}${studentParams}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load series.') }))
@@ -129,7 +131,7 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const body = await response.json()
             setSeriesList(body.items)
             setTutorFacetOptions(body.facets.tutors)
-            setEventTypeFacetOptions(body.facets.event_types)
+            setBookingLinkFacetOptions(body.facets.booking_links)
             setStudentFacetOptions(body.facets.students)
             setLoadErrors({})
         } catch (error) {
@@ -166,10 +168,10 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         loadBookingSeries({ emailFilter: isCustomer ? email : undefined, tutorIds: next })
     }
 
-    const handleEventTypeFilterToggle = (id: string) => {
-        const next = filters.eventTypeIds.includes(id) ? filters.eventTypeIds.filter(x => x !== id) : [...filters.eventTypeIds, id]
-        setFilters(f => ({ ...f, eventTypeIds: next }))
-        loadBookingSeries({ emailFilter: isCustomer ? email : undefined, eventTypeIds: next })
+    const handleBookingLinkFilterToggle = (id: string) => {
+        const next = filters.bookingLinkIds.includes(id) ? filters.bookingLinkIds.filter(x => x !== id) : [...filters.bookingLinkIds, id]
+        setFilters(f => ({ ...f, bookingLinkIds: next }))
+        loadBookingSeries({ emailFilter: isCustomer ? email : undefined, bookingLinkIds: next })
     }
 
     // BookingSeries rows carry no status of their own; SeriesRow reads includeCancelled directly
@@ -274,13 +276,13 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                 tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                                 tutorSelected={filters.tutorIds}
                                 onTutorToggle={handleTutorFilterToggle}
-                                // No manual eventTypes.filter(e => e.recurring) special-case needed —
-                                // eventTypeFacetOptions comes from get_booking_series's facets, which
+                                // No manual bookingLinks.filter(e => e.recurring) special-case needed —
+                                // bookingLinkFacetOptions comes from get_booking_series's facets, which
                                 // are already recurring-only by construction (a BookingSeries only
-                                // ever exists for a recurring=true event type).
-                                eventTypeOptions={eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name }))}
-                                eventTypeSelected={filters.eventTypeIds}
-                                onEventTypeToggle={handleEventTypeFilterToggle}
+                                // ever exists for a recurring=true booking link).
+                                bookingLinkOptions={bookingLinkFacetOptions.map(e => ({ value: String(e.id), label: e.slug }))}
+                                bookingLinkSelected={filters.bookingLinkIds}
+                                onBookingLinkToggle={handleBookingLinkFilterToggle}
                                 studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
                                 studentSelected={filters.students}
                                 onStudentToggle={handleStudentFilterToggle}
@@ -293,13 +295,13 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
                         <ActiveFilterChips
                             tutorIds={filters.tutorIds}
-                            eventTypeIds={filters.eventTypeIds}
+                            bookingLinkIds={filters.bookingLinkIds}
                             students={filters.students}
                             tutors={tutors}
-                            eventTypes={eventTypes}
+                            bookingLinks={bookingLinks}
                             includeCancelled={filters.includeCancelled}
                             onTutorRemove={handleTutorFilterToggle}
-                            onEventTypeRemove={handleEventTypeFilterToggle}
+                            onBookingLinkRemove={handleBookingLinkFilterToggle}
                             onStudentRemove={handleStudentFilterToggle}
                             onIncludeCancelledRemove={handleIncludeCancelledToggle}
                         />
@@ -314,7 +316,7 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     <RecurringList
                         seriesByDay={orderedSeriesByDay}
                         tutors={tutors}
-                        eventTypes={eventTypes}
+                        bookingLinks={bookingLinks}
                         isCustomer={isCustomer}
                         includeCancelled={filters.includeCancelled}
                         onRefresh={msg => { refresh(); showToast(msg) }}

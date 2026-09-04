@@ -13,11 +13,11 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import tuple_
 
-from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, is_series_active, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason
+from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, is_series_active, require_link_bookable, require_link_not_archived, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
-from models import Booking, BookingRequest, BookingSeries, EventType, Tutor
+from models import Booking, BookingRequest, BookingSeries, BookingLink, Tutor
 from policy import (
     get_cancel_action,
     get_reschedule_action,
@@ -55,7 +55,7 @@ def _series_response(series: BookingSeries, today: date) -> BookingSeriesRespons
 def get_booking_series(
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
-    event_type_ids: list[int] = Query(default=[]),
+    booking_link_ids: list[int] = Query(default=[]),
     student: list[str] = Query(default=[]),
     settings=Depends(get_settings),
     db: Session = Depends(get_db),
@@ -69,10 +69,10 @@ def get_booking_series(
     if email:
         base_query = base_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
-    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, event_type_ids, student_pairs).all()
+    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs).all()
     results = [BookingSeriesResponse.model_validate(series) for series in scoped_series_rows]
 
-    facets = compute_series_facets(base_query, tutor_ids, event_type_ids, student_pairs, db)
+    facets = compute_series_facets(base_query, tutor_ids, booking_link_ids, student_pairs, db)
     return BookingSeriesListResponse(items=results, facets=facets)
 
 @router.get("/booking-series/{id}/occurrences", response_model=BookingSeriesOccurrencesResponse)
@@ -88,7 +88,7 @@ def get_booking_series_occurrences(
     settings=Depends(get_settings),
 ):
     """Cursor-paginated occurrences for one series. Separate endpoint, not a series_id filter
-    on GET /bookings/: a series already pins tutor/event_type/student, so facets would be
+    on GET /bookings/: a series already pins tutor/booking_link/student, so facets would be
     meaningless here, and this is a sub-resource of one specific series, not a filterable
     collection - REST nested-resource shape."""
     if order not in ("asc", "desc"):
@@ -127,7 +127,7 @@ def get_booking_series_occurrences(
 def get_bookings(
     email: str | None = Query(default=None), # main scope
     tutor_ids: list[int] = Query(default=[]), # facet scope
-    event_type_ids: list[int] = Query(default=[]), # facet scope
+    booking_link_ids: list[int] = Query(default=[]), # facet scope
     student: list[str] = Query(default=[]), # facet scope
     time_min: datetime | None = Query(default=None), # main scope - time
     time_max: datetime | None = Query(default=None), # main scope - time
@@ -140,7 +140,7 @@ def get_bookings(
     settings=Depends(get_settings),
 ):
     """Cursor-paginated, flat list of all bookings (materialized and virtual occurrences),
-    filtered by tutor_ids/event_type_ids/student/email/pending_only, scoped by time_min/time_max.
+    filtered by tutor_ids/booking_link_ids/student/email/pending_only, scoped by time_min/time_max.
     Facets returned alongside items. See GET /bookings/pages for the total/page-based equivalent,
     kept for API completeness only, not called by the frontend."""
     if order not in ("asc", "desc"):
@@ -150,7 +150,7 @@ def get_bookings(
 
     decoded_cursor = None
     if cursor is not None:
-        decoded_cursor = decode_cursor(cursor, tutor_ids, event_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled)
+        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled)
 
     # email scope is shared by both branches below - apply it once, up front (though series gets ignored for pending-only branch)
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
@@ -163,7 +163,7 @@ def get_bookings(
     ## branch on pending-only: if true, only materialized bookings with a pending request are returned. else main branch runs
     if pending_only:
         base_query = materialized_query.filter(Booking.request.has(BookingRequest.status == 'pending'))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, event_type_ids, student_pairs)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, student_pairs)
         # seek direction and sort order must flip together based on `order` - "next page" means
         # "after" when ascending but "before" when descending
         booking_key = tuple_(Booking.start, Booking.public_id)
@@ -174,20 +174,20 @@ def get_bookings(
             scoped_query = scoped_query.filter(past_cursor)
         sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
         booking_rows = scoped_query.order_by(*sort_cols).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
         items = [BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]]
-        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, event_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
+        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
         return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
 
     ## main branch
     # scope materialized bookings by time, series by time overlap, then calculate facets
     materialized_query = apply_booking_time_scope(materialized_query, time_min, time_max, include_cancelled)
     series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
-    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, settings, db)
     
-    # scope Bookings and BookingSeries by tutor_ids, event_type_ids, student_pairs, using cursor as a start point
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs)
+    # scope Bookings and BookingSeries by tutor_ids, booking_link_ids, student_pairs, using cursor as a start point
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, student_pairs)
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs)
     # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
     if decoded_cursor is not None:
         cursor_start, cursor_public_id = decoded_cursor
@@ -210,7 +210,7 @@ def get_bookings(
         items[-1].start,
         items[-1].id,
         tutor_ids,
-        event_type_ids,
+        booking_link_ids,
         student_pairs,
         time_min,
         time_max,
@@ -226,7 +226,7 @@ def get_bookings(
 def list_bookings(
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
-    event_type_ids: list[int] = Query(default=[]),
+    booking_link_ids: list[int] = Query(default=[]),
     student: list[str] = Query(default=[]),
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
@@ -239,7 +239,7 @@ def list_bookings(
     settings=Depends(get_settings),
 ):
     """Paginated, flat list of all bookings (materialized + virtual occurrences), optionally
-    filtered by email/tutor_ids/event_type_ids/pending_only, bounded by time_min/time_max."""
+    filtered by email/tutor_ids/booking_link_ids/pending_only, bounded by time_min/time_max."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
@@ -252,9 +252,9 @@ def list_bookings(
         base_query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
         if email:
             base_query = base_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, event_type_ids, student_pairs)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, student_pairs)
         booking_rows = scoped_query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, event_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
         return BookingPagedListResponse(
             items=[BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]],
             total=None, # not meaningful for pending-only request
@@ -278,14 +278,14 @@ def list_bookings(
     series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
 
     # get facets: self-excluding (narrows down filter types and which tutors/event types/students are available for further filtering)
-    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, event_type_ids, student_pairs, time_min, time_max, settings, db)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, settings, db)
 
     # get actual bookings (items): full scope (no exclusion) on top of the same main-scoped queries, then generate+merge virtual with materialized
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, event_type_ids, student_pairs)
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, student_pairs)
     scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
 
     ## time/status-scope (series only) - different mechanism than bookings materialized in db
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, event_type_ids, student_pairs) # first scope series
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs) # first scope series
     scoped_series = scoped_series_query.all() # execute query to get series rows.
 
     # generate occurrence from scoped series rows
@@ -327,29 +327,31 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
         raise HTTPException(status_code=400, detail="Tutor must have a calendar ID")
     if not db_tutor.is_active:
         raise HTTPException(status_code=400, detail="Tutor is not active")
-    db_event_type = db.query(EventType).filter(EventType.id == booking_in.event_type_id).first()
-    if not db_event_type:
-        raise HTTPException(status_code=404, detail="Event type not found")
+    db_booking_link = db.query(BookingLink).filter(BookingLink.id == booking_in.booking_link_id).first()
+    if not db_booking_link:
+        raise HTTPException(status_code=404, detail="Booking link not found")
+    # Authoritative — the slug lookup and slots endpoint only fail earlier and more legibly.
+    require_link_bookable(db_booking_link)
     BUSINESS_TZ = ZoneInfo(settings.business_timezone)
     # Conflict check — must run before touching Google Calendar so a rejection is cheap.
     # The loop walks every occurrence that would be created and queries the DB for any
     # confirmed booking that overlaps it. One hit → reject the whole request.
     _duration = booking_in.end - booking_in.start
 
-    if db_event_type.expires_on is not None and booking_in.start.date() > db_event_type.expires_on:
+    if db_booking_link.expires_on is not None and booking_in.start.date() > db_booking_link.expires_on:
         raise HTTPException(status_code=400, detail="Booking start is after this event type's expiry date")
 
     # _gen_through: last occurrence date to conflict-check before accepting the booking.
-    if db_event_type.recurring:
-        if db_event_type.expires_on is not None:
+    if db_booking_link.recurring:
+        if db_booking_link.expires_on is not None:
             # Mode A: all series of this event type end on a fixed calendar date
-            _gen_through = db_event_type.expires_on
-        elif db_event_type.booker_can_set_recur_until and booking_in.recur_until is not None:
+            _gen_through = db_booking_link.expires_on
+        elif db_booking_link.booker_can_set_recur_until and booking_in.recur_until is not None:
             # Mode B/C variant: booker explicitly chose an end date for the series on the booking form
             _gen_through = booking_in.recur_until
-        elif db_event_type.recur_weeks is not None:
+        elif db_booking_link.recur_weeks is not None:
             # Mode B: recur_weeks = total number of occurrences; last is at start + (N-1) weeks
-            _gen_through = booking_in.start.date() + timedelta(weeks=db_event_type.recur_weeks - 1)
+            _gen_through = booking_in.start.date() + timedelta(weeks=db_booking_link.recur_weeks - 1)
         else:
             # Mode C (indefinite): only check occurrence 1 — slot picker handles future conflict detection
             _gen_through = booking_in.start.date()
@@ -371,25 +373,25 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
 
     # Compute recur_until_date before building the calendar event so we can include UNTIL in the RRULE
     recur_until_date = None
-    if db_event_type.recurring:
-        if db_event_type.expires_on is not None:
-            recur_until_date = db_event_type.expires_on
-        elif db_event_type.booker_can_set_recur_until and booking_in.recur_until is not None:
+    if db_booking_link.recurring:
+        if db_booking_link.expires_on is not None:
+            recur_until_date = db_booking_link.expires_on
+        elif db_booking_link.booker_can_set_recur_until and booking_in.recur_until is not None:
             recur_until_date = booking_in.recur_until
-        elif db_event_type.recur_weeks is not None:
-            recur_until_date = booking_in.start.date() + timedelta(weeks=db_event_type.recur_weeks - 1)
+        elif db_booking_link.recur_weeks is not None:
+            recur_until_date = booking_in.start.date() + timedelta(weeks=db_booking_link.recur_weeks - 1)
 
     new_public_id = str(uuid4())
-    manage_path = "manage-series" if db_event_type.recurring else "manage-occurrence"
+    manage_path = "manage-series" if db_booking_link.recurring else "manage-occurrence"
     manage_url = f"{FRONTEND_URL}/{manage_path}/{new_public_id}"
-    description_parts = [p for p in [db_event_type.description, f"Manage your booking: {manage_url}"] if p]
+    description_parts = [p for p in [db_booking_link.description, f"Manage your booking: {manage_url}"] if p]
     new_event = {
-            "summary": f"{db_event_type.name}: {booking_in.student_first} and {db_tutor.first_name}",
+            "summary": f"{db_booking_link.slug}: {booking_in.student_first} and {db_tutor.first_name}",
             "description": "\n\n".join(description_parts),
             "start": {"dateTime": booking_in.start.isoformat(), "timeZone": settings.business_timezone},
             "end": {"dateTime": booking_in.end.isoformat(), "timeZone": settings.business_timezone},
         }
-    if db_event_type.recurring:
+    if db_booking_link.recurring:
         rrule = "RRULE:FREQ=WEEKLY"
         if recur_until_date is not None:
             rrule += f";UNTIL={recur_until_date.strftime('%Y%m%d')}"
@@ -403,7 +405,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
         raise HTTPException(status_code=500, detail="Failed to create calendar event") from e
 
     try:
-        if db_event_type.recurring:
+        if db_booking_link.recurring:
             local_start = booking_in.start.astimezone(BUSINESS_TZ)
             local_end = booking_in.end.astimezone(BUSINESS_TZ)
             series = BookingSeries(
@@ -460,6 +462,9 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     """Reschedule saga — calendar patch/replace + new Booking row + soft-delete original + compensation.
     Caller is responsible for all policy checks (status, notice window, is-rescheduling-allowed)
     before calling this. Helper assumes the booking is valid to reschedule."""
+    # Guarded here rather than per-route, so all callers are covered (admin, manage-occurrence, request approval).
+    require_link_not_archived(db_booking.booking_link)
+
     db_tutor = db.query(Tutor).filter(Tutor.id == booking_in.tutor_id).first()
     if not db_tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
@@ -485,8 +490,8 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     old_google_event_id = db_booking.google_event_id
     old_series_google_event_id = db_booking.series.google_event_id if is_series else None
     series_public_id = db_booking.series.public_id if is_series else None
-    event_type_name = db_booking.event_type.name
-    event_type_description = db_booking.event_type.description
+    booking_link_slug = db_booking.booking_link.slug
+    booking_link_description = db_booking.booking_link.description
 
     # --- Step 1: Calendar operation ---
     # Series: patch the specific RRULE instance (creates a Google Calendar exception, no new event)
@@ -519,11 +524,11 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to reschedule calendar event") from e
     else:
-        #todo: allow custom event name templates per event type using dynamic tags e.g. "{student_first} {student_last} - {event_type}"
+        #todo: allow custom event name templates per booking link using dynamic tags e.g. "{student_first} {student_last} - {link_slug}"
         manage_url = f"{FRONTEND_URL}/manage-occurrence/{new_public_id}"
-        description_parts = [p for p in [event_type_description, f"Manage your booking: {manage_url}"] if p]
+        description_parts = [p for p in [booking_link_description, f"Manage your booking: {manage_url}"] if p]
         new_event = {
-            "summary": f"{event_type_name}: {db_booking.student_first} and {db_tutor.first_name}",
+            "summary": f"{booking_link_slug}: {db_booking.student_first} and {db_tutor.first_name}",
             "description": "\n\n".join(description_parts),
             "start": {"dateTime": booking_in.start.isoformat(), "timeZone": "UTC"},
             "end": {"dateTime": booking_in.end.isoformat(), "timeZone": "UTC"},
@@ -544,7 +549,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         "google_event_id": new_google_event_id,
         "status": "confirmed",
         "student_id": db_booking.student_id,
-        "event_type_id": db_booking.event_type_id,
+        "booking_link_id": db_booking.booking_link_id,
         "student_first": db_booking.student_first,
         "student_last": db_booking.student_last,
         "student_email": db_booking.student_email,
@@ -654,6 +659,41 @@ def update_booking(ref: str, booking_in: BookingUpdate, db: Session = Depends(ge
         raise HTTPException(status_code=500, detail="Failed to update booking") from e
     db.refresh(db_booking)
     return db_booking
+
+
+@router.post("/{ref}/reassign", response_model=BookingResponse)
+def reassign_booking(ref: str, booking_link_id: int, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Repoint a booking at a different link — the repair path for a booking stranded on an archived one.
+
+    Nothing automatic ever moves this FK; only this route does. It changes which link's calendar
+    rules govern the booking's future reschedules, and nothing else about the booking."""
+    db_booking = resolve_ref(ref, db, settings)
+    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
+    if not db_link:
+        raise HTTPException(status_code=404, detail="Booking link not found")
+    require_link_not_archived(db_link)
+
+    db_booking.booking_link_id = db_link.id
+    db.commit()
+    db.refresh(db_booking)
+    return db_booking
+
+
+@router.post("/booking-series/{id}/reassign", response_model=BookingSeriesResponse)
+def reassign_booking_series(id: str, booking_link_id: int, db: Session = Depends(get_db)):
+    """Series equivalent of reassign_booking. Occurrences resolve their link through the series."""
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
+    if not db_series:
+        raise HTTPException(status_code=404, detail="Booking series not found")
+    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
+    if not db_link:
+        raise HTTPException(status_code=404, detail="Booking link not found")
+    require_link_not_archived(db_link)
+
+    db_series.booking_link_id = db_link.id
+    db.commit()
+    db.refresh(db_series)
+    return db_series
 
 
 @router.delete("/{ref}/permanent", status_code=204)
@@ -817,9 +857,10 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         raise HTTPException(status_code=400, detail="Tutor must have a calendar ID")
     if not db_tutor.is_active:
         raise HTTPException(status_code=400, detail="Tutor is not active")
-    db_event_type = db.query(EventType).filter(EventType.id == db_series.event_type_id).first()
-    if not db_event_type:
-        raise HTTPException(status_code=404, detail="Event type not found")
+    db_booking_link = db.query(BookingLink).filter(BookingLink.id == db_series.booking_link_id).first()
+    if not db_booking_link:
+        raise HTTPException(status_code=404, detail="Booking link not found")
+    require_link_not_archived(db_booking_link)
     BUSINESS_TZ = ZoneInfo(settings.business_timezone)
     today = datetime.now(BUSINESS_TZ).date()
 
@@ -873,9 +914,9 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     if db_series.until:
         rrule += f";UNTIL={db_series.until.strftime('%Y%m%d')}"
     series_manage_url = f"{FRONTEND_URL}/manage-series/{db_series.public_id}"
-    series_description_parts = [p for p in [db_event_type.description, f"Manage your booking: {series_manage_url}"] if p]
+    series_description_parts = [p for p in [db_booking_link.description, f"Manage your booking: {series_manage_url}"] if p]
     new_event = {
-        "summary": f"{db_event_type.name}: {db_series.student_first} and {db_tutor.first_name}",
+        "summary": f"{db_booking_link.slug}: {db_series.student_first} and {db_tutor.first_name}",
         "description": "\n\n".join(series_description_parts),
         "start": {"dateTime": booking_in.start.isoformat(), "timeZone": settings.business_timezone},
         "end": {"dateTime": booking_in.end.isoformat(), "timeZone": settings.business_timezone},
@@ -912,7 +953,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     new_series = BookingSeries(
         public_id=str(uuid4()),
         tutor_id=booking_in.tutor_id,
-        event_type_id=db_series.event_type_id,
+        booking_link_id=db_series.booking_link_id,
         dtstart=local_start.replace(tzinfo=None),
         dtend=local_end.replace(tzinfo=None),
         until=db_series.until,  # carried forward unchanged - precise recompute needs `count` (not added yet)
@@ -936,7 +977,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         public_id=f"{new_series.public_id}:{int(booking_in.start.timestamp())}",
         series_id=new_series.id,
         tutor_id=booking_in.tutor_id,
-        event_type_id=db_series.event_type_id,
+        booking_link_id=db_series.booking_link_id,
         timezone=booking_in.timezone,
         status="confirmed",
         student_id=db_series.student_id,
@@ -1122,7 +1163,7 @@ def cancel_booking_by_ref(ref: str, db: Session = Depends(get_db), settings=Depe
         raise HTTPException(status_code=400, detail="Only confirmed bookings can be cancelled")
     booking_start_tz = db_booking.start if db_booking.start.tzinfo else db_booking.start.replace(tzinfo=UTC)
     minutes_until = (booking_start_tz - datetime.now(UTC)).total_seconds() / 60
-    action = get_cancel_action(db_booking.event_type, minutes_until)
+    action = get_cancel_action(db_booking.booking_link, minutes_until)
     if action == 'blocked':
         raise HTTPException(status_code=400, detail="Cancellation is not currently available for this booking")
     if action == 'request':
@@ -1143,7 +1184,7 @@ def reschedule_booking_by_ref(ref: str, booking_in: BookingReschedule, db: Sessi
         raise HTTPException(status_code=400, detail="Only confirmed bookings can be rescheduled")
     booking_start_tz = db_booking.start if db_booking.start.tzinfo else db_booking.start.replace(tzinfo=UTC)
     minutes_until = (booking_start_tz - datetime.now(UTC)).total_seconds() / 60
-    action = get_reschedule_action(db_booking.event_type, minutes_until)
+    action = get_reschedule_action(db_booking.booking_link, minutes_until)
     if action == 'blocked':
         raise HTTPException(status_code=400, detail="Rescheduling is not currently available for this booking")
     if action == 'request':
@@ -1191,7 +1232,7 @@ def cancel_series_by_ref(ref: str, db: Session = Depends(get_db), settings=Depen
     minutes_until = (
         (next_booking.start if next_booking.start.tzinfo else next_booking.start.replace(tzinfo=UTC)) - datetime.now(UTC)
     ).total_seconds() / 60 if next_booking else float('inf')
-    action = get_cancel_action(db_series.event_type, minutes_until)
+    action = get_cancel_action(db_series.booking_link, minutes_until)
     if action == 'blocked':
         raise HTTPException(status_code=400, detail="Cancellation is not currently available for this series")
     if action == 'request':
@@ -1224,7 +1265,7 @@ def reschedule_series_by_ref(ref: str, booking_in: BookingReschedule, db: Sessio
     minutes_until = (
         (next_booking.start if next_booking.start.tzinfo else next_booking.start.replace(tzinfo=UTC)) - datetime.now(UTC)
     ).total_seconds() / 60 if next_booking else float('inf')
-    action = get_reschedule_action(db_series.event_type, minutes_until)
+    action = get_reschedule_action(db_series.booking_link, minutes_until)
     if action == 'blocked':
         raise HTTPException(status_code=400, detail="Rescheduling is not currently available for this series")
     if action == 'request':

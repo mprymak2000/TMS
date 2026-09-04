@@ -7,18 +7,18 @@ here. If this file depended on models.py, models.py importing back from it would
 """
 
 
-def get_cancel_action(event_type, minutes_until: float) -> str:
-    """Returns 'auto', 'request', or 'blocked' based on event type cancel policy and minutes until booking."""
+def get_cancel_action(booking_link, minutes_until: float) -> str:
+    """Returns 'auto', 'request', or 'blocked' based on the booking link's cancel policy and minutes until booking."""
     if minutes_until <= 0:
         return 'blocked'
-    mode = event_type.cancel_mode if event_type else None
+    mode = booking_link.cancel_mode if booking_link else None
     if mode is None or mode == 'auto':
         return 'auto'
     if mode == 'not_allowed':
         return 'blocked'
     if mode == 'request':
         return 'request'
-    notice = event_type.cancel_notice_minutes or 0
+    notice = booking_link.cancel_notice_minutes or 0
     outside_window = minutes_until >= notice
     if mode == 'auto_window_block':
         return 'auto' if outside_window else 'blocked'
@@ -29,18 +29,18 @@ def get_cancel_action(event_type, minutes_until: float) -> str:
     return 'blocked'
 
 
-def get_reschedule_action(event_type, minutes_until: float) -> str:
-    """Returns 'auto', 'request', or 'blocked' based on event type reschedule policy and minutes until booking."""
+def get_reschedule_action(booking_link, minutes_until: float) -> str:
+    """Returns 'auto', 'request', or 'blocked' based on the booking link's reschedule policy and minutes until booking."""
     if minutes_until <= 0:
         return 'blocked'
-    mode = event_type.reschedule_mode if event_type else None
+    mode = booking_link.reschedule_mode if booking_link else None
     if mode is None or mode == 'auto':
         return 'auto'
     if mode == 'not_allowed':
         return 'blocked'
     if mode == 'request':
         return 'request'
-    notice = event_type.reschedule_notice_minutes or 0
+    notice = booking_link.reschedule_notice_minutes or 0
     outside_window = minutes_until >= notice
     if mode == 'auto_window_block':
         return 'auto' if outside_window else 'blocked'

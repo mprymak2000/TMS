@@ -1,18 +1,18 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import type { BookingSeries, EventType } from './types'
+import type { BookingSeries, BookingLink } from './types'
 import { formatDate, formatUTCTime, extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
 
 interface LoadErrors {
     series?: string
-    eventType?: string
+    bookingLink?: string
 }
 
 const ManageSeries = () => {
     const { ref } = useParams<{ ref: string }>()
     const navigate = useNavigate()
     const [series, setSeries] = useState<BookingSeries | null>(null)
-    const [eventType, setEventType] = useState<EventType | null>(null)
+    const [bookingLink, setBookingLink] = useState<BookingLink | null>(null)
     const [isLoading, setIsLoading] = useState(true)
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
@@ -32,13 +32,14 @@ const ManageSeries = () => {
             const seriesData: BookingSeries = await res.json()
             setSeries(seriesData)
 
-            const eventTypeRes = await fetch(`${import.meta.env.VITE_API_URL}/event_types/${seriesData.event_type_id}`)
-            if (!eventTypeRes.ok) {
-                const err = await eventTypeRes.json()
-                setLoadErrors(prev => ({ ...prev, eventType: extractError(err, 'Failed to load event type') }))
+            // include_archived — same reason as ManageOccurrence: cancel must survive a retired link.
+            const bookingLinkRes = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${seriesData.booking_link_id}?include_archived=true`)
+            if (!bookingLinkRes.ok) {
+                const err = await bookingLinkRes.json()
+                setLoadErrors(prev => ({ ...prev, bookingLink: extractError(err, 'Failed to load booking link') }))
                 return
             }
-            setEventType(await eventTypeRes.json())
+            setBookingLink(await bookingLinkRes.json())
         } catch (err) {
             console.error('Error loading series:', err)
             setError('An unknown error occurred while loading the series')
@@ -58,8 +59,8 @@ const ManageSeries = () => {
     // Same fix as ManageOccurrence.tsx — collapse the two near-identical "within window,
     // submit for review" sentences into one shared line when both land on the same verdict.
     const sameAction = cancelAction === rescheduleAction
-    const cancelNoticeHours = Math.round((eventType?.cancel_notice_minutes ?? 0) / 60)
-    const rescheduleNoticeHours = Math.round((eventType?.reschedule_notice_minutes ?? 0) / 60)
+    const cancelNoticeHours = Math.round((bookingLink?.cancel_notice_minutes ?? 0) / 60)
+    const rescheduleNoticeHours = Math.round((bookingLink?.reschedule_notice_minutes ?? 0) / 60)
 
     const handleCancel = () => setConfirming('cancel')
 
@@ -91,14 +92,14 @@ const ManageSeries = () => {
         )
     }
 
-    if (loadErrors.series || loadErrors.eventType) {
+    if (loadErrors.series || loadErrors.bookingLink) {
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
                 <div className="bg-white rounded-2xl shadow border border-gray-100 p-8 max-w-md w-full text-center">
                     <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 mb-4 inline-flex items-center gap-1 transition-colors">
                         ← My bookings
                     </button>
-                    <p className="text-gray-500">{loadErrors.series ?? loadErrors.eventType}</p>
+                    <p className="text-gray-500">{loadErrors.series ?? loadErrors.bookingLink}</p>
                 </div>
             </div>
         )
@@ -128,7 +129,7 @@ const ManageSeries = () => {
         )
     }
 
-    if (!series || !eventType) return null
+    if (!series || !bookingLink) return null
 
     return (
         <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
@@ -139,7 +140,7 @@ const ManageSeries = () => {
                 </button>
 
                 <h1 className="text-xl font-bold text-gray-900 mb-1">Manage your series</h1>
-                <p className="text-sm text-indigo-600 font-medium mb-6">{eventType.name}</p>
+                <p className="text-sm text-indigo-600 font-medium mb-6">{bookingLink.slug}</p>
 
                 {/* series details */}
                 <div className="bg-gray-50 rounded-xl px-5 py-4 mb-6">
@@ -172,7 +173,7 @@ const ManageSeries = () => {
                             rescheduleAction === 'auto' ? (
                                 <div className="mb-4">
                                     <button
-                                        onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
+                                        onClick={() => navigate(`/book/${bookingLink.slug}`, { state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
                                             originalDayOfWeek: weekdayOf(series.dtstart),
@@ -197,7 +198,7 @@ const ManageSeries = () => {
                                         </p>
                                     )}
                                     <button
-                                        onClick={() => navigate(`/book/${series.event_type_id}`, { state: {
+                                        onClick={() => navigate(`/book/${bookingLink.slug}`, { state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
                                             originalDayOfWeek: weekdayOf(series.dtstart),

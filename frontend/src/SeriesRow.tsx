@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { Loader, Menu } from '@mantine/core'
 import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconTrash, IconArrowBackUp, IconPlus, IconMinus } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
-import type { Booking, BookingSeries, Tutor, EventType } from './types'
+import type { Booking, BookingSeries, Tutor, BookingLink } from './types'
 import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf } from './utils'
 import { statusConfig } from './BookingRow'
 import { useBookingActions } from './useBookingActions'
@@ -17,7 +17,8 @@ const DEFAULT_PAGE_SIZE = 4
 // of the whole accumulated list is always the soonest one).
 const OccurrenceCard = ({
     booking,
-    eventType,
+    bookingLink,
+    bookingLinks,
     expectedTutor,
     tutors,
     isCustomer,
@@ -26,7 +27,8 @@ const OccurrenceCard = ({
     onError,
 }: {
     booking: Booking
-    eventType: EventType
+    bookingLink: BookingLink
+    bookingLinks: BookingLink[]
     expectedTutor: Tutor
     tutors: Tutor[]
     isCustomer: boolean
@@ -35,7 +37,7 @@ const OccurrenceCard = ({
     onError: (msg: string) => void
 }) => {
     const navigate = useNavigate()
-    const { isPast, menuItems, modals } = useBookingActions(booking, eventType, onRefresh, onError)
+    const { isPast, menuItems, modals } = useBookingActions(booking, bookingLink, bookingLinks, onRefresh, onError)
     const cfg = statusConfig(booking, isPast)
     // Series-bound booking public_ids always encode their own start time as a trailing unix
     // timestamp (`{series_public_id}:{unix_timestamp}`, real or virtual — see CLAUDE.md) — so the
@@ -173,7 +175,8 @@ interface SeriesRowProps {
     series: BookingSeries
     tutor: Tutor
     tutors: Tutor[]
-    eventType: EventType
+    bookingLink: BookingLink
+    bookingLinks: BookingLink[]
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onCancelSeries: (seriesId: string) => void
@@ -187,7 +190,7 @@ interface SeriesRowProps {
     includeCancelled?: boolean
 }
 
-const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
+const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
     const navigate = useNavigate()
     const [loaded, setLoaded] = useState(false)
     const [occurrences, setOccurrences] = useState<Booking[]>([])
@@ -284,7 +287,7 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                     {tutor.first_name} {tutor.last_name} · {series.student_first} {series.student_last}
                 </span>
                 <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
-                    {eventType.name}{series.until ? ` · until ${formatDate(series.until)}` : ''}
+                    {bookingLink.slug}{series.until ? ` · until ${formatDate(series.until)}` : ''}
                 </span>
                 <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} onClick={e => e.stopPropagation()}>
                     {isCustomer ? (
@@ -304,7 +307,7 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                             <Menu.Dropdown>
                                 <Menu.Item
                                     leftSection={<IconCalendarStats size={14} />}
-                                    onClick={() => navigate(`/book/${eventType.id}`, {
+                                    onClick={() => navigate(`/book/${bookingLink.slug}`, {
                                         state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,
@@ -364,7 +367,8 @@ const SeriesRow = ({ series, tutor, tutors, eventType, onRefresh, onError, onCan
                                 <OccurrenceCard
                                     key={b.id}
                                     booking={b}
-                                    eventType={eventType}
+                                    bookingLink={bookingLink}
+                                    bookingLinks={bookingLinks}
                                     expectedTutor={tutor}
                                     tutors={tutors}
                                     isCustomer={isCustomer}

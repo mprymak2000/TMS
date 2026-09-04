@@ -1,14 +1,15 @@
 import { Menu } from '@mantine/core'
 import { IconChevronDown, IconChevronUp, IconDotsVertical } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
-import type { Booking, Tutor, EventType } from './types'
+import type { Booking, Tutor, BookingLink } from './types'
 import { formatTime, tutorBubbleClass } from './utils'
 import { useBookingActions } from './useBookingActions'
 
 interface BookingRowProps {
     booking: Booking
     tutor: Tutor
-    eventType: EventType
+    bookingLink: BookingLink
+    bookingLinks: BookingLink[]
     expanded: boolean
     onExpand: () => void
     onRefresh: (msg: string) => void
@@ -32,9 +33,9 @@ export const statusConfig = (b: Booking, isPast: boolean) => {
     return { dot: 'bg-emerald-400', text: 'text-emerald-600', name: 'text-gray-800', label: null, chip: '' }
 }
 
-const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, onError, onReviewRequest, isCustomer = false, compact = false }: BookingRowProps) => {
+const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, isCustomer = false, compact = false }: BookingRowProps) => {
     const navigate = useNavigate()
-    const { isPast, menuItems, modals } = useBookingActions(booking, eventType, onRefresh, onError, onReviewRequest)
+    const { isPast, menuItems, modals } = useBookingActions(booking, bookingLink, bookingLinks, onRefresh, onError, onReviewRequest)
     const status = statusConfig(booking, isPast)
     const startDate = new Date(booking.start)
     const dayName = startDate.toLocaleDateString('en-US', { weekday: 'short' })
@@ -96,7 +97,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                         )}
                     </span>
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
-                        {eventType.name}
+                        {bookingLink.slug}
                     </span>
                     <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                         {actions}
@@ -129,7 +130,7 @@ const BookingRow = ({ booking, tutor, eventType, expanded, onExpand, onRefresh, 
                             )}
                         </div>
                         <div className="text-xs text-gray-400 mt-0.5">
-                            {eventType.name}
+                            {bookingLink.slug}
                         </div>
                     </div>
 

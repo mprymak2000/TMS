@@ -178,17 +178,17 @@ class ScheduleResponse(BaseModel):
     days: list[ScheduleDayResponse]
 
 
-class EventTypeAvailabilityCreate(BaseModel):
-    event_type_id: int
+class BookingLinkAvailabilityCreate(BaseModel):
+    booking_link_id: int
     tutor_id: int
     schedule_id: int
 
 
-class EventTypeAvailabilityResponse(BaseModel):
+class BookingLinkAvailabilityResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    event_type_id: int
+    booking_link_id: int
     tutor_id: int
     schedule_id: int
 
@@ -198,10 +198,14 @@ class TutorAvailability(BaseModel):
     schedule_id: int
 
 
+# Lowercase alphanumerics with single hyphens between — a slug goes straight into a URL, and the
+# frontend's slugify is a convenience, not a guarantee.
+_SLUG_PATTERN = r'^[a-z0-9]+(?:-[a-z0-9]+)*$'
+
 _VALID_MODES = ('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')
 _WINDOW_MODES = ('auto_window_block', 'auto_window_request', 'request_window')
 
-# policy fields moved directly onto EventType — CancellationPolicy schemas kept for reference
+# policy fields moved directly onto BookingLink — CancellationPolicy schemas kept for reference
 # class CancellationPolicyCreate(BaseModel):
 #     name: str
 #     description: str | None = None
@@ -256,8 +260,8 @@ def _validate_recurrence(recur_weeks, expires_on, booker_can_set_recur_until):
         raise ValueError("expires_on must be in the future")
 
 
-class EventTypeCreate(BaseModel):
-    name: str
+class BookingLinkCreate(BaseModel):
+    slug: str = Field(pattern=_SLUG_PATTERN, max_length=100)
     description: str | None = None
     recurring: bool = True
     duration_minutes: int
@@ -300,8 +304,8 @@ class EventTypeCreate(BaseModel):
 
 
 # same as Create — all fields are mutable
-class EventTypeUpdate(BaseModel):
-    name: str
+class BookingLinkUpdate(BaseModel):
+    slug: str = Field(pattern=_SLUG_PATTERN, max_length=100)
     description: str | None = None
     recurring: bool = True
     duration_minutes: int
@@ -343,11 +347,13 @@ class EventTypeUpdate(BaseModel):
         return self
 
 
-class EventTypeResponse(BaseModel):
+class BookingLinkResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    name: str
+    slug: str
+    status: str
+    archived_at: datetime | None = None
     description: str | None = None
     recurring: bool
 
@@ -374,7 +380,7 @@ class EventTypeResponse(BaseModel):
     limit_future_bookings_days: int | None = None
     only_show_first_slot: bool | None = None
 
-    availability: list[EventTypeAvailabilityResponse] = []
+    availability: list[BookingLinkAvailabilityResponse] = []
 
 
 _VALID_REQUEST_TYPES = ('cancel_occurrence', 'reschedule_occurrence', 'cancel_series', 'reschedule_series')
@@ -440,7 +446,7 @@ class BookingResponse(BaseModel):
     id: str = Field(validation_alias="public_id")
     series_id: str | None = Field(default=None, validation_alias="series_public_id")
     tutor_id: int
-    event_type_id: int
+    booking_link_id: int
     student_id: int | None = None
     start: datetime
     end: datetime
@@ -467,7 +473,7 @@ class BookingSeriesResponse(BaseModel):
 
     id: str = Field(validation_alias="public_id")
     tutor_id: int
-    event_type_id: int
+    booking_link_id: int
     student_id: int | None = None
     created: datetime
     last_modified: datetime
@@ -502,12 +508,12 @@ def _convert_to_utc(dt: datetime, tz_str: str) -> datetime:
 
 class BookingCreate(BaseModel):
     tutor_id: int
-    event_type_id: int
+    booking_link_id: int
     student_id: int | None = None
     start: datetime
     end: datetime
     timezone: str
-    recur_until: date | None = None  # only honoured when event_type.booker_can_set_recur_until=True
+    recur_until: date | None = None  # only honoured when booking_link.booker_can_set_recur_until=True
 
     student_first: str
     student_last: str
@@ -580,9 +586,9 @@ class TutorFacetOption(BaseModel):
     last_name: str
 
 
-class EventTypeFacetOption(BaseModel):
+class BookingLinkFacetOption(BaseModel):
     id: int
-    name: str
+    slug: str
 
 
 class StudentFacetOption(BaseModel):
@@ -592,7 +598,7 @@ class StudentFacetOption(BaseModel):
 
 class BookingFacets(BaseModel):
     tutors: list[TutorFacetOption]
-    event_types: list[EventTypeFacetOption]
+    booking_links: list[BookingLinkFacetOption]
     students: list[StudentFacetOption]
 
 

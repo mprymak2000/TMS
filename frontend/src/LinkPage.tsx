@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
-import { TextInput, Textarea, Switch, NumberInput, Select, Button, Loader } from '@mantine/core'
-import { IconChevronLeft, IconPlus, IconTrash, IconExternalLink, IconFileDescription, IconClock, IconRepeat, IconUsers, IconBan, IconAdjustmentsHorizontal, IconCreditCard } from '@tabler/icons-react'
-import type { Tutor, Schedule, EventType } from './types'
+import { Textarea, Switch, NumberInput, Select, Button, Loader, Input, Modal } from '@mantine/core'
+import { IconChevronLeft, IconPlus, IconTrash, IconExternalLink, IconFileDescription, IconClock, IconRepeat, IconUsers, IconBan, IconAdjustmentsHorizontal, IconCreditCard, IconCopy, IconCheck, IconLinkOff } from '@tabler/icons-react'
+import type { Tutor, Schedule, BookingLink } from './types'
 import { extractError } from './utils'
+import { useToast } from './useToast'
+import Toast from './Toast'
 
 type NoticeUnit = 'minutes' | 'hours' | 'days'
 const NOTICE_UNITS = [
@@ -12,6 +14,15 @@ const NOTICE_UNITS = [
     { value: 'days', label: 'days' },
 ]
 const unitToMinutes = (unit: NoticeUnit) => unit === 'minutes' ? 1 : unit === 'hours' ? 60 : 1440
+
+// Trailing hyphens survive typing ("my-" en route to "my-link") and are trimmed at save.
+const slugify = (v: string) => v.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-{2,}/g, '-').replace(/^-/, '')
+
+// Frozen prefix inside the URL field — only the slug after it is editable.
+const BOOK_URL_PREFIX = `${window.location.host}/book/`
+
+// An unrecognised ?tab= matches no panel and renders blank, so it falls back to details.
+const TABS = ['details', 'duration', 'recurrence', 'hosts', 'cancellation', 'limits', 'booking'] as const
 
 const WINDOW_MODES = ['auto_window_block', 'auto_window_request', 'request_window']
 const CANCEL_MODE_OPTIONS = [
@@ -24,7 +35,7 @@ const CANCEL_MODE_OPTIONS = [
 ]
 
 interface FormState {
-    name: string
+    slug: string
     description: string
     recurring: boolean
     recurWeeks: number | null
@@ -50,7 +61,7 @@ interface FormState {
 }
 
 interface FormErrors {
-    name?: string
+    slug?: string
     durationMinutes?: string
     minDurationMinutes?: string
     maxDurationMinutes?: string
@@ -61,7 +72,7 @@ interface FormErrors {
 }
 
 interface FormTouched {
-    name?: boolean
+    slug?: boolean
     durationMinutes?: boolean
     minDurationMinutes?: boolean
     maxDurationMinutes?: boolean
@@ -71,35 +82,35 @@ interface FormTouched {
     rescheduleNoticeMinutes?: boolean
 }
 
-const buildInitial = (et: EventType | null): FormState => ({
-    name: et?.name ?? '',
-    description: et?.description ?? '',
-    recurring: et?.recurring ?? false,
-    recurWeeks: et?.recur_weeks ?? null,
-    expiresOn: et?.expires_on ?? null,
-    bookerCanSetRecurUntil: et?.booker_can_set_recur_until ?? false,
-    durationMinutes: et?.duration_minutes ?? 90,
-    minDurationMinutes: et?.min_duration_minutes ?? null,
-    maxDurationMinutes: et?.max_duration_minutes ?? null,
-    bufferMinutes: et?.buffer_minutes ?? null,
-    intervalMinutes: et?.interval_minutes ?? null,
-    price: et?.price ?? null,
-    cancelMode: et?.cancel_mode ?? null,
-    cancelNoticeMinutes: et?.cancel_notice_minutes ?? null,
-    rescheduleMode: et?.reschedule_mode ?? null,
-    rescheduleNoticeMinutes: et?.reschedule_notice_minutes ?? null,
-    limitPerDay: et?.limit_per_day ?? null,
-    limitPerWeek: et?.limit_per_week ?? null,
-    limitPerMonth: et?.limit_per_month ?? null,
-    limitPerBooker: et?.limit_per_booker ?? null,
-    limitFutureBookingsDays: et?.limit_future_bookings_days ?? null,
-    onlyShowFirstSlot: et?.only_show_first_slot ?? false,
-    tutorRows: et?.availability.map(a => ({ tutorId: String(a.tutor_id), scheduleId: String(a.schedule_id) })) ?? [],
+const buildInitial = (link: BookingLink | null): FormState => ({
+    slug: link?.slug ?? '',
+    description: link?.description ?? '',
+    recurring: link?.recurring ?? false,
+    recurWeeks: link?.recur_weeks ?? null,
+    expiresOn: link?.expires_on ?? null,
+    bookerCanSetRecurUntil: link?.booker_can_set_recur_until ?? false,
+    durationMinutes: link?.duration_minutes ?? 90,
+    minDurationMinutes: link?.min_duration_minutes ?? null,
+    maxDurationMinutes: link?.max_duration_minutes ?? null,
+    bufferMinutes: link?.buffer_minutes ?? null,
+    intervalMinutes: link?.interval_minutes ?? null,
+    price: link?.price ?? null,
+    cancelMode: link?.cancel_mode ?? null,
+    cancelNoticeMinutes: link?.cancel_notice_minutes ?? null,
+    rescheduleMode: link?.reschedule_mode ?? null,
+    rescheduleNoticeMinutes: link?.reschedule_notice_minutes ?? null,
+    limitPerDay: link?.limit_per_day ?? null,
+    limitPerWeek: link?.limit_per_week ?? null,
+    limitPerMonth: link?.limit_per_month ?? null,
+    limitPerBooker: link?.limit_per_booker ?? null,
+    limitFutureBookingsDays: link?.limit_future_bookings_days ?? null,
+    onlyShowFirstSlot: link?.only_show_first_slot ?? false,
+    tutorRows: link?.availability.map(a => ({ tutorId: String(a.tutor_id), scheduleId: String(a.schedule_id) })) ?? [],
 })
 
 const validate = (f: FormState): FormErrors => {
     const errs: FormErrors = {}
-    if (!f.name.trim()) errs.name = 'Name is required'
+    if (!f.slug.trim()) errs.slug = 'URL is required'
     if (f.minDurationMinutes !== null) {
         if (f.minDurationMinutes <= 0) errs.minDurationMinutes = 'Must be positive'
         if (f.maxDurationMinutes === null || f.maxDurationMinutes <= 0) errs.maxDurationMinutes = 'Must be positive'
@@ -137,23 +148,28 @@ const Group = ({ title, children }: { title: string, children: React.ReactNode }
     </div>
 )
 
-const EventTypePage = () => {
+const LinkPage = () => {
     const { id } = useParams<{ id: string }>()
     const [searchParams, setSearchParams] = useSearchParams()
     const navigate = useNavigate()
     const isNew = id === 'new'
-    const activeTab = searchParams.get('tab') ?? 'details'
+    const tabParam = searchParams.get('tab')
+    const activeTab = TABS.includes(tabParam as typeof TABS[number]) ? tabParam! : 'details'
 
     const [form, setForm] = useState<FormState>(() => buildInitial(null))
+    // Snapshot of the form as loaded — same dirty-check approach as ScheduleForm.
+    const [initial, setInitial] = useState<FormState>(() => buildInitial(null))
+    const [confirmingLeave, setConfirmingLeave] = useState(false)
+    const isDirty = JSON.stringify(form) !== JSON.stringify(initial)
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [schedules, setSchedules] = useState<Schedule[]>([])
     const [loading, setLoading] = useState(true)
     const [loadError, setLoadError] = useState<string | null>(null)
     const [saving, setSaving] = useState(false)
-    const [saveError, setSaveError] = useState<string | null>(null)
-    const [savedMsg, setSavedMsg] = useState(false)
+    const { toast, showToast } = useToast()
     const [errors, setErrors] = useState<FormErrors>({})
     const [touched, setTouched] = useState<FormTouched>({})
+    const [copied, setCopied] = useState(false)
     const [cancelUnit, setCancelUnit] = useState<NoticeUnit>('hours')
     const [rescheduleUnit, setRescheduleUnit] = useState<NoticeUnit>('hours')
 
@@ -170,10 +186,11 @@ const EventTypePage = () => {
                 setTutors(tutorsData)
                 setSchedules(schedulesData)
                 if (!isNew) {
-                    const etRes = await fetch(`${import.meta.env.VITE_API_URL}/event_types/${id}`)
-                    if (!etRes.ok) { setLoadError('Event type not found'); return }
-                    const etData: EventType = await etRes.json()
-                    setForm(buildInitial(etData))
+                    const linkRes = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}`)
+                    if (!linkRes.ok) { setLoadError('Booking link not found'); return }
+                    const linkData: BookingLink = await linkRes.json()
+                    setForm(buildInitial(linkData))
+                    setInitial(buildInitial(linkData))
                 }
             } catch {
                 setLoadError('Failed to load data')
@@ -191,12 +208,12 @@ const EventTypePage = () => {
         setField(key as any, val === '' ? null : Number(val))
 
     const touchAll = () => setTouched({
-        name: true, durationMinutes: true, minDurationMinutes: true, maxDurationMinutes: true,
+        slug: true, durationMinutes: true, minDurationMinutes: true, maxDurationMinutes: true,
         recurWeeks: true, tutorRows: true, cancelNoticeMinutes: true, rescheduleNoticeMinutes: true,
     })
 
     const buildPayload = () => ({
-        name: form.name.trim(),
+        slug: form.slug.replace(/-+$/, ''),   // trailing hyphen survives typing, not saving
         description: form.description.trim() || null,
         recurring: form.recurring,
         recur_weeks: form.recurring ? form.recurWeeks : null,
@@ -223,28 +240,34 @@ const EventTypePage = () => {
 
     const handleSave = async () => {
         const errs = validate(form)
-        if (Object.keys(errs).length > 0) { setErrors(errs); touchAll(); return }
+        if (Object.keys(errs).length > 0) {
+            setErrors(errs)
+            touchAll()
+            // The per-tab dots only help if you're looking at the nav — say it out loud too, since
+            // the offending field is often on a tab you aren't on.
+            const count = Object.keys(errs).length
+            showToast(`Can't save — ${count} ${count === 1 ? 'field needs' : 'fields need'} attention`, 'error')
+            return
+        }
         setSaving(true)
-        setSaveError(null)
         try {
             const url = isNew
-                ? `${import.meta.env.VITE_API_URL}/event_types/`
-                : `${import.meta.env.VITE_API_URL}/event_types/${id}`
+                ? `${import.meta.env.VITE_API_URL}/booking_links/`
+                : `${import.meta.env.VITE_API_URL}/booking_links/${id}`
             const res = await fetch(url, {
                 method: isNew ? 'POST' : 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(buildPayload()),
             })
-            if (!res.ok) { setSaveError(extractError(await res.json(), 'Failed to save')); return }
+            if (!res.ok) { showToast(extractError(await res.json(), 'Failed to save'), 'error'); return }
             if (isNew) {
-                const created: EventType = await res.json()
-                navigate(`/event-types/${created.id}?tab=setup`, { replace: true })
+                navigate('/links', { state: { toast: 'Booking link created' } })
             } else {
-                setSavedMsg(true)
-                setTimeout(() => setSavedMsg(false), 2000)
+                setInitial(form)   // new baseline, so the page stops reading as dirty
+                showToast('Changes saved')
             }
         } catch {
-            setSaveError('An unknown error occurred')
+            showToast('An unknown error occurred', 'error')
         } finally {
             setSaving(false)
         }
@@ -264,7 +287,7 @@ const EventTypePage = () => {
     }
 
     const tabHasError = {
-        details: !!(errors.name),
+        details: !!(errors.slug),
         duration: !!(errors.durationMinutes || errors.minDurationMinutes || errors.maxDurationMinutes),
         recurrence: !!(errors.recurWeeks),
         hosts: !!errors.tutorRows,
@@ -290,8 +313,18 @@ const EventTypePage = () => {
     )
 
     if (loadError) return (
-        <div className="flex items-center justify-center h-64">
-            <p className="text-sm text-gray-400">{loadError}</p>
+        <div className="flex flex-col items-center justify-center h-96 text-center">
+            <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center mb-4">
+                <IconLinkOff size={22} className="text-gray-400" />
+            </div>
+            <h2 className="text-lg font-semibold text-gray-800 mb-1.5">{loadError}</h2>
+            <p className="text-sm text-gray-500 max-w-sm leading-relaxed mb-5">
+                It may have been archived, or the address may be wrong. Archived links stay out of this
+                list on purpose — their bookings still work, they just can't take new ones.
+            </p>
+            <Button variant="default" size="sm" onClick={() => navigate('/links')}>
+                Back to links
+            </Button>
         </div>
     )
 
@@ -302,26 +335,24 @@ const EventTypePage = () => {
             <div className="shrink-0 flex items-center justify-between px-6 py-3.5 bg-white border-b border-gray-200">
                 <div className="flex items-center gap-3">
                     <button
-                        onClick={() => navigate('/event-types')}
+                        onClick={() => isDirty ? setConfirmingLeave(true) : navigate('/links')}
                         className="flex items-center justify-center w-7 h-7 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
                     >
                         <IconChevronLeft size={16} />
                     </button>
                     <div className="h-4 w-px bg-gray-200" />
                     <div>
-                        <p className="text-xs text-gray-400 leading-none mb-0.5">Event Types</p>
+                        <p className="text-xs text-gray-400 leading-none mb-0.5">Links</p>
                         <h1 className="text-sm font-semibold text-gray-900 leading-none">
-                            {isNew ? 'New event type' : form.name || '...'}
+                            {isNew ? 'New booking link' : form.slug || '...'}
                         </h1>
                     </div>
                 </div>
                 <div className="flex items-center gap-3">
-                    {saveError && <p className="text-xs text-red-500">{saveError}</p>}
-                    {savedMsg && <p className="text-xs text-green-600 font-medium">Saved</p>}
                     {!isNew && (
                         <Button
                             component="a"
-                            href={`/book/${id}`}
+                            href={`/book/${form.slug}`}
                             target="_blank"
                             variant="default"
                             size="xs"
@@ -374,22 +405,45 @@ const EventTypePage = () => {
                         {activeTab === 'details' && (
                             <Group title="Basic info">
                                 <div className="p-4 space-y-4">
-                                    <TextInput
-                                        label="Name"
-                                        placeholder="e.g. Trial Lesson"
-                                        size="sm"
-                                        value={form.name}
-                                        onChange={e => {
-                                            const updated = { ...form, name: e.target.value }
-                                            setForm(updated)
-                                            if (touched.name) setErrors(validate(updated))
-                                        }}
-                                        onBlur={() => setTouched(prev => ({ ...prev, name: true }))}
-                                        error={touched.name ? errors.name : undefined}
-                                    />
+                                    <Input.Wrapper
+                                        label="URL"
+                                        description="Where clients book. Freed for reuse if this link is ever archived."
+                                        error={touched.slug ? errors.slug : undefined}
+                                    >
+                                        {/* select-none so a drag only grabs the editable slug. */}
+                                        <div className={`mt-1 flex items-center gap-0 rounded-md border px-3 py-1.5 bg-white text-sm leading-5 focus-within:border-indigo-400 ${touched.slug && errors.slug ? 'border-red-400' : 'border-gray-300'}`}>
+                                            <span className="text-gray-400 whitespace-nowrap select-none shrink-0">
+                                                {BOOK_URL_PREFIX}
+                                            </span>
+                                            <input
+                                                style={{ font: 'inherit' }}
+                                                className="flex-1 min-w-0 bg-transparent outline-none"
+                                                placeholder="trial-lesson"
+                                                value={form.slug}
+                                                onChange={e => {
+                                                    const updated = { ...form, slug: slugify(e.target.value) }
+                                                    setForm(updated)
+                                                    if (touched.slug) setErrors(validate(updated))
+                                                }}
+                                                onBlur={() => setTouched(prev => ({ ...prev, slug: true }))}
+                                            />
+                                            <button
+                                                type="button"
+                                                title="Copy link"
+                                                className="shrink-0 ml-2 text-gray-400 hover:text-gray-600 transition-colors"
+                                                onClick={() => {
+                                                    navigator.clipboard.writeText(`${BOOK_URL_PREFIX}${form.slug}`)
+                                                    setCopied(true)
+                                                    setTimeout(() => setCopied(false), 1500)
+                                                }}
+                                            >
+                                                {copied ? <IconCheck size={15} /> : <IconCopy size={15} />}
+                                            </button>
+                                        </div>
+                                    </Input.Wrapper>
                                     <Textarea
                                         label="Description"
-                                        placeholder="What is this event type for?"
+                                        placeholder="What is this booking link for?"
                                         size="sm"
                                         autosize
                                         minRows={2}
@@ -536,7 +590,7 @@ const EventTypePage = () => {
                                 {form.tutorRows.length === 0 ? (
                                     <div className="flex flex-col items-center justify-center py-10 text-center">
                                         <p className="text-sm font-medium text-gray-500">No hosts yet</p>
-                                        <p className="text-xs text-gray-400 mt-0.5">Add a tutor to enable bookings for this event type</p>
+                                        <p className="text-xs text-gray-400 mt-0.5">Add a tutor to enable bookings for this link</p>
                                     </div>
                                 ) : (
                                     form.tutorRows.map((row, i) => (
@@ -708,8 +762,26 @@ const EventTypePage = () => {
                     </div>
                 </div>
             </div>
+            <Modal
+                opened={confirmingLeave}
+                onClose={() => setConfirmingLeave(false)}
+                title="Discard unsaved changes?"
+                centered
+                size="sm"
+            >
+                <p className="text-sm text-gray-600 mb-4">
+                    {isNew
+                        ? "This link hasn't been created yet — leaving now discards it."
+                        : 'Your edits to this link will be lost.'}
+                </p>
+                <div className="flex justify-end gap-2">
+                    <Button variant="default" onClick={() => setConfirmingLeave(false)}>Keep editing</Button>
+                    <Button color="red" onClick={() => navigate('/links')}>Discard</Button>
+                </div>
+            </Modal>
+            <Toast toast={toast} />
         </div>
     )
 }
 
-export default EventTypePage
+export default LinkPage

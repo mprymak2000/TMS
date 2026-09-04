@@ -4,7 +4,7 @@ import { TextInput, Loader, Button, Modal, Popover } from '@mantine/core'
 import { DatePicker } from '@mantine/dates'
 import { IconSearch, IconChevronLeft, IconChevronRight } from '@tabler/icons-react'
 import type { ReactNode } from 'react'
-import type { Booking, TutorFacetOption, EventTypeFacetOption, StudentFacetOption } from './types'
+import type { Booking, TutorFacetOption, BookingLinkFacetOption, StudentFacetOption } from './types'
 import { extractError, formatDate, formatTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, parseLocalDateStr } from './utils'
 import BookingRow from './BookingRow'
 import type { BookingsOutletContext } from './BookingsLayout'
@@ -325,7 +325,7 @@ const ScopeSwitcher = ({
 
 const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // shared context (from BookingsLayout)
-    const { tutors, eventTypes, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
+    const { tutors, bookingLinks, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
 
     // ---- STATE ----
     const [email] = useState('')
@@ -333,7 +333,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // fetched data + facet options
     const [bookings, setBookings] = useState<Booking[]>([])
     const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
-    const [eventTypeFacetOptions, setEventTypeFacetOptions] = useState<EventTypeFacetOption[]>([])
+    const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
     const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
     const [isLoading, setIsLoading] = useState(false)
@@ -348,7 +348,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // Client side display order, does not influence backend fetch order (load more still gets future dates, despite them now being on the bottom)
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>(() => ({
-        tutorIds: [], eventTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], bookingLinkIds: [], students: [], searchQuery: '', includeCancelled: true,
         ...periodBounds('week', new Date()),
     }))
 
@@ -366,7 +366,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // ---- DATA FETCH ----
     const loadBookings = async ({
         tutorIds = filters.tutorIds,
-        eventTypeIds = filters.eventTypeIds,
+        bookingLinkIds = filters.bookingLinkIds,
         students = filters.students,
         dateFrom = filters.dateFrom,
         dateTo = filters.dateTo,
@@ -377,7 +377,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         append = false,
     }: {
         tutorIds?: string[]
-        eventTypeIds?: string[]
+        bookingLinkIds?: string[]
         students?: string[]
         dateFrom?: string | null
         dateTo?: string | null
@@ -404,13 +404,13 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const timeMaxParam = timeMax ? `&time_max=${timeMax}` : ''
             const orderParam = `&order=${fetchOrder}`
             const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
-            const eventTypeParams = eventTypeIds.map(id => `&event_type_ids=${id}`).join('')
+            const bookingLinkParams = bookingLinkIds.map(id => `&booking_link_ids=${id}`).join('')
             const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
             const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
             const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
             const cursorParamStr = cursorParam ? `&cursor=${encodeURIComponent(cursorParam)}` : ''
 
-            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${eventTypeParams}${studentParams}${includeCancelledParam}${emailParam}`)
+            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${bookingLinkParams}${studentParams}${includeCancelledParam}${emailParam}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load bookings.') }))
@@ -421,7 +421,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             setBookings(prev => append ? [...prev, ...body.items] : body.items)
             // filter options
             setTutorFacetOptions(body.facets.tutors)
-            setEventTypeFacetOptions(body.facets.event_types)
+            setBookingLinkFacetOptions(body.facets.booking_links)
             setStudentFacetOptions(body.facets.students)
             // pagination
             setCursor(body.next_cursor)
@@ -524,10 +524,10 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         loadBookings({ emailFilter: isCustomer ? email : undefined, tutorIds: next })
     }
 
-    const handleEventTypeFilterToggle = (id: string) => {
-        const next = filters.eventTypeIds.includes(id) ? filters.eventTypeIds.filter(x => x !== id) : [...filters.eventTypeIds, id]
-        setFilters(f => ({ ...f, eventTypeIds: next }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, eventTypeIds: next })
+    const handleBookingLinkFilterToggle = (id: string) => {
+        const next = filters.bookingLinkIds.includes(id) ? filters.bookingLinkIds.filter(x => x !== id) : [...filters.bookingLinkIds, id]
+        setFilters(f => ({ ...f, bookingLinkIds: next }))
+        loadBookings({ emailFilter: isCustomer ? email : undefined, bookingLinkIds: next })
     }
 
     const handleStudentFilterToggle = (value: string) => {
@@ -581,14 +581,14 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // ---- DERIVED DATA ----
     const getSearchString = (b: Booking) => {
         const tutor = tutors.find(t => t.id === b.tutor_id)
-        const eventType = eventTypes.find(e => e.id === b.event_type_id)
+        const bookingLink = bookingLinks.find(e => e.id === b.booking_link_id)
         return [
             b.student_first, b.student_last,
             b.student_email, b.student_phone,
             b.parent_email, b.parent_phone,
             b.start.slice(0, 10),
             tutor?.first_name, tutor?.last_name,
-            eventType?.name,
+            bookingLink?.slug,
         ].filter(Boolean).join(' ').toLowerCase()
     }
 
@@ -632,9 +632,9 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                                     tutorSelected={filters.tutorIds}
                                     onTutorToggle={handleTutorFilterToggle}
-                                    eventTypeOptions={eventTypeFacetOptions.map(e => ({ value: String(e.id), label: e.name }))}
-                                    eventTypeSelected={filters.eventTypeIds}
-                                    onEventTypeToggle={handleEventTypeFilterToggle}
+                                    bookingLinkOptions={bookingLinkFacetOptions.map(e => ({ value: String(e.id), label: e.slug }))}
+                                    bookingLinkSelected={filters.bookingLinkIds}
+                                    onBookingLinkToggle={handleBookingLinkFilterToggle}
                                     studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
                                     studentSelected={filters.students}
                                     onStudentToggle={handleStudentFilterToggle}
@@ -649,13 +649,13 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
                     <ActiveFilterChips
                         tutorIds={filters.tutorIds}
-                        eventTypeIds={filters.eventTypeIds}
+                        bookingLinkIds={filters.bookingLinkIds}
                         students={filters.students}
                         tutors={tutors}
-                        eventTypes={eventTypes}
+                        bookingLinks={bookingLinks}
                         includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
-                        onEventTypeRemove={handleEventTypeFilterToggle}
+                        onBookingLinkRemove={handleBookingLinkFilterToggle}
                         onStudentRemove={handleStudentFilterToggle}
                         onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
@@ -700,7 +700,8 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                             <BookingRow
                                                 booking={b}
                                                 tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                                eventType={eventTypes.find(e => e.id === b.event_type_id)!}
+                                                bookingLink={bookingLinks.find(e => e.id === b.booking_link_id)!}
+                                                bookingLinks={bookingLinks}
                                                 expanded={expandedId === b.id}
                                                 onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}
                                                 onRefresh={msg => { refresh(); showToast(msg) }}

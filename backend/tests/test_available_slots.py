@@ -5,7 +5,7 @@ Covers all three modes (standalone, finite, infinite) and key edge cases:
 midnight-crossing rules, Sunday→Monday wrap via split_if_wrapping, multi-tutor
 independence, deviation holes, and finite-vs-infinite series distinction.
 
-Setup strategy: tutors/schedules/event_types are created via the HTTP client
+Setup strategy: tutors/schedules/booking_links are created via the HTTP client
 (same as other test files). BookingSeries and Booking rows that need precise
 schema control (e.g. exact dtstart/dtend, including midnight-crossing cases)
 are inserted directly via a db session that shares the same SQLite file as the client.
@@ -42,11 +42,11 @@ def _at(d: date, h: int, m: int = 0) -> str:
     return f"{d}T{h:02d}:{m:02d}:"
 
 
-def _params(tutor_ids, event_type_id: int, d_min: date, d_max: date) -> dict:
+def _params(tutor_ids, booking_link_id: int, d_min: date, d_max: date) -> dict:
     ids = [tutor_ids] if isinstance(tutor_ids, int) else list(tutor_ids)
     return {
         "tutor_ids": ids,
-        "event_type_id": event_type_id,
+        "booking_link_id": booking_link_id,
         "time_min": f"{d_min}T00:00:00Z",
         "time_max": f"{d_max}T23:59:00Z",
     }
@@ -83,9 +83,9 @@ def _schedule(client, tutor_id: int, days: list, timezone: str = "UTC") -> dict:
     }).json()
 
 
-def _event_type(client, availability: list, **kwargs) -> dict:
-    return client.post("/event_types/", json={
-        "name": f"ET-{uuid4().hex[:6]}",
+def _booking_link(client, availability: list, **kwargs) -> dict:
+    return client.post("/booking_links/", json={
+        "slug": f"link-{uuid4().hex[:6]}",
         "duration_minutes": 90,
         "recurring": False,
         **kwargs,
@@ -102,14 +102,14 @@ def _mon_9_17(client, tutor_id: int) -> dict:
     return _schedule(client, tutor_id, [{"day_of_week": 0, "start_time": "09:00:00", "end_time": "17:00:00"}])
 
 
-def _insert_series(db, tutor_id: int, event_type_id: int, *,
+def _insert_series(db, tutor_id: int, booking_link_id: int, *,
                    start_dow: int, start_t: time,
                    end_dow: int, end_t: time,
                    until: date | None = None) -> BookingSeries:
     start_date = MON + timedelta(days=start_dow)  # value doesn't matter to available_slots
     end_date = start_date + timedelta(days=(end_dow - start_dow) % 7)  # wraps forward for midnight-crossing cases
     s = BookingSeries(
-        tutor_id=tutor_id, event_type_id=event_type_id,
+        tutor_id=tutor_id, booking_link_id=booking_link_id,
         dtstart=datetime.combine(start_date, start_t),
         dtend=datetime.combine(end_date, end_t),
         until=until,
@@ -122,13 +122,13 @@ def _insert_series(db, tutor_id: int, event_type_id: int, *,
     return s
 
 
-def _insert_booking(db, tutor_id: int, event_type_id: int,
+def _insert_booking(db, tutor_id: int, booking_link_id: int,
                     start: datetime, end: datetime, *,
                     series: BookingSeries | None = None,
                     status: str = "confirmed") -> Booking:
     b = Booking(
         series_id=series.id if series else None,
-        tutor_id=tutor_id, event_type_id=event_type_id,
+        tutor_id=tutor_id, booking_link_id=booking_link_id,
         start=start, end=end,
         google_event_id=str(uuid4()), status=status,
         timezone="UTC",
@@ -145,12 +145,12 @@ def _insert_booking(db, tutor_id: int, event_type_id: int,
 def test_unknown_tutor_returns_404(client):
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
     r = client.get("/available-slots/", params=_params(9999, et["id"], MON, MON))
     assert r.status_code == 404
 
 
-def test_unknown_event_type_returns_404(client):
+def test_unknown_booking_link_returns_404(client):
     tutor = _tutor(client)
     _mon_9_17(client, tutor["id"])
     r = client.get("/available-slots/", params=_params(tutor["id"], 9999, MON, MON))
@@ -164,7 +164,7 @@ def test_standalone_slot_count_and_boundaries(client):
     Last valid start is 15:00 (15:00+90=16:30 ≤ 17:00); 16:30+90=18:00 is outside."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
 
@@ -179,7 +179,7 @@ def test_standalone_empty_when_window_misses_schedule_day(client):
     """Schedule is Mon-only; querying Wednesday returns nothing."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], WED, WED)).json()
     assert slots == []
@@ -189,7 +189,7 @@ def test_standalone_confirmed_booking_blocks_overlapping_slot(client, db):
     """Existing confirmed booking at 10:30–12:00 removes that slot; others survive."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
     _insert_booking(db, tutor["id"], et["id"], _dt(MON, 10, 30), _dt(MON, 12))
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
@@ -204,7 +204,7 @@ def test_standalone_cancelled_booking_does_not_block(client, db):
     """Cancelled bookings are excluded from busy_dict — slot stays available."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
     _insert_booking(db, tutor["id"], et["id"], _dt(MON, 10, 30), _dt(MON, 12), status="cancelled")
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
@@ -218,7 +218,7 @@ def test_standalone_multi_day_schedule(client):
         {"day_of_week": 0, "start_time": "09:00:00", "end_time": "12:00:00"},
         {"day_of_week": 2, "start_time": "09:00:00", "end_time": "12:00:00"},
     ])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, WED)).json()
 
@@ -233,7 +233,7 @@ def test_finite_slot_clear_across_all_recur_weeks(client):
     """recur_weeks=3, no conflicts → slots returned for the starting day."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
     assert len(slots) > 0
@@ -245,7 +245,7 @@ def test_finite_slot_blocked_by_conflict_in_week_2(client, db):
     The 09:00 slot is gone; 10:30 (which is free in all 3 weeks) survives."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
     _insert_booking(db, tutor["id"], et["id"],
                     _dt(MON + timedelta(weeks=1), 9),
                     _dt(MON + timedelta(weeks=1), 10, 30))
@@ -260,7 +260,7 @@ def test_finite_slot_blocked_by_conflict_in_week_3(client, db):
     """Conflict only in week 3 (the last checked week) still eliminates the slot."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
     _insert_booking(db, tutor["id"], et["id"],
                     _dt(MON + timedelta(weeks=2), 9),
                     _dt(MON + timedelta(weeks=2), 10, 30))
@@ -277,7 +277,7 @@ def test_infinite_returns_slots_with_no_competing_series(client):
     """No existing infinite series → standard schedule slots available."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True)
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
     assert len(slots) > 0
@@ -289,7 +289,7 @@ def test_infinite_existing_series_thins_schedule_at_its_span(client, db):
     10:30 onward is untouched."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True)
 
     series = _insert_series(db, tutor["id"], et["id"],
                             start_dow=0, start_t=time(9, 0),
@@ -307,7 +307,7 @@ def test_infinite_finite_series_does_not_thin_schedule(client, db):
     the schedule, so those time ranges remain bookable for a new infinite series."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True)
 
     # finite series (until in the past — completely done)
     series = _insert_series(db, tutor["id"], et["id"],
@@ -330,7 +330,7 @@ def test_infinite_cancelled_occurrence_is_a_deviation_but_rule_still_thins(clien
     (prevents a one-off busy block that week), not in whether new infinite series can go there."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True)
 
     series = _insert_series(db, tutor["id"], et["id"],
                             start_dow=0, start_t=time(9, 0),
@@ -359,7 +359,7 @@ def test_infinite_midnight_crossing_rule_split_correctly(client, db):
         {"day_of_week": 6, "start_time": "22:00:00", "end_time": "23:59:00"},  # Sun evening
         {"day_of_week": 0, "start_time": "00:00:00", "end_time": "02:00:00"},  # Mon early AM
     ])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]),
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]),
                      duration_minutes=60, recurring=True)
 
     # Midnight-crossing infinite series: Sun 23:00 → Mon 01:00
@@ -391,7 +391,7 @@ def test_multiple_tutors_busy_blocks_are_independent(client, db):
     sched_b = _schedule(client, tutor_b["id"],
                         [{"day_of_week": 0, "start_time": "09:00:00", "end_time": "17:00:00"}])
 
-    et = _event_type(client, [
+    et = _booking_link(client, [
         {"tutor_id": tutor_a["id"], "schedule_id": sched_a["id"]},
         {"tutor_id": tutor_b["id"], "schedule_id": sched_b["id"]},
     ])
@@ -425,7 +425,7 @@ def test_standalone_free_block_spanning_midnight_produces_slot(client):
     The single slot (23:30→00:30) must appear in a Sun–Mon query window."""
     tutor = _tutor(client)
     sched = _sun_night_sched(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), duration_minutes=60)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), duration_minutes=60)
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], SUN, MON)).json()
 
@@ -441,7 +441,7 @@ def test_midnight_crossing_busy_block_blocks_slot_on_far_side(client, db):
         {"day_of_week": 6, "start_time": "22:00:00", "end_time": "23:59:00"},
         {"day_of_week": 0, "start_time": "00:00:00", "end_time": "02:00:00"},
     ])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), duration_minutes=60)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), duration_minutes=60)
     _insert_booking(db, tutor["id"], et["id"], _dt(SUN, 23), _dt(MON, 0, 30))
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], SUN, MON)).json()
@@ -460,7 +460,7 @@ def test_standalone_busy_before_time_min_spills_into_window(client, db):
         {"day_of_week": 6, "start_time": "22:00:00", "end_time": "23:59:00"},
         {"day_of_week": 0, "start_time": "00:00:00", "end_time": "02:00:00"},
     ])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), duration_minutes=60)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), duration_minutes=60)
     _insert_booking(db, tutor["id"], et["id"], _dt(SUN, 23), _dt(MON, 0, 30))
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
@@ -474,7 +474,7 @@ def test_infinite_free_block_spanning_midnight_produces_slot(client):
     resolve_to_first_occurrence resolves the dateless piece to (SUN 23:30, MON 00:30)."""
     tutor = _tutor(client)
     sched = _sun_night_sched(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), duration_minutes=60, recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), duration_minutes=60, recurring=True)
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], SUN, MON)).json()
 
@@ -493,7 +493,7 @@ def test_infinite_free_block_spanning_midnight_time_min_on_monday(client):
         {"day_of_week": 6, "start_time": "23:00:00", "end_time": "23:59:00"},
         {"day_of_week": 0, "start_time": "00:00:00", "end_time": "02:00:00"},
     ])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), duration_minutes=60, recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), duration_minutes=60, recurring=True)
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
 
@@ -537,12 +537,12 @@ def _ny(d: date, h: int, m: int = 0) -> datetime:
     return local.astimezone(UTC)
 
 
-def _dst_params(tutor_ids, event_type_id: int, d_min: date, d_max: date) -> dict:
+def _dst_params(tutor_ids, booking_link_id: int, d_min: date, d_max: date) -> dict:
     """Like _params but anchors at 6am NY time so time_min is safely on the right local day."""
     ids = [tutor_ids] if isinstance(tutor_ids, int) else list(tutor_ids)
     return {
         "tutor_ids": ids,
-        "event_type_id": event_type_id,
+        "booking_link_id": booking_link_id,
         "time_min": _ny(d_min, 6).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "time_max": _ny(d_max, 20).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -562,7 +562,7 @@ def test_dst_canonical_busy_block_stable_across_spring_forward(client, db):
     _set_business_tz(db)
     tutor = _tutor(client)
     sched = _mon_9_12_ny(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
 
     # 9am EST = 14:00 UTC; 9am EDT = 13:00 UTC — different UTC, same canonical NY time
     _insert_booking(db, tutor["id"], et["id"],
@@ -599,7 +599,7 @@ def test_dst_adjacent_infinite_series_no_gap_across_spring_forward(client, db):
     _set_business_tz(db)
     tutor = _tutor(client)
     sched = _mon_9_12_ny(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]), recurring=True)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True)
 
     # Series A: SF student booked Mon 09:00–10:30 NY (stored in canonical NY)
     series_a = _insert_series(db, tutor["id"], et["id"],
@@ -641,7 +641,7 @@ def test_dst_fall_back_adjacent_bookings_do_not_overlap(client, db):
     _set_business_tz(db)
     tutor = _tutor(client)
     sched = _mon_9_12_ny(client, tutor["id"])
-    et = _event_type(client, _avail(tutor["id"], sched["id"]))
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]))
 
     # --- before fall back (EDT) ---
     # Insert ONLY the 10:30am EDT booking first
@@ -713,7 +713,7 @@ def test_dst_series_occurrence_stays_at_canonical_time_across_transitions(client
     ], timezone="America/New_York")
     # 30-min interval so 10:30am is a generated candidate (default interval = duration = 60min
     # would only generate :00 slots, making the spring-forward gap undetectable)
-    et = _event_type(client, _avail(tutor["id"], sched["id"]),
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]),
                      duration_minutes=60, interval_minutes=30)
 
     # Insert correct-UTC bookings for every test date upfront.

@@ -21,8 +21,8 @@ cur = conn.cursor()
 cur.execute("""
     TRUNCATE TABLE
         booking_requests, bookings, booking_series,
-        lessons, event_type_availability, schedule_days,
-        schedules, event_types, students, tutors
+        lessons, booking_link_availability, schedule_days,
+        schedules, booking_links, students, tutors
     RESTART IDENTITY CASCADE;
 """)
 conn.commit()
@@ -73,8 +73,8 @@ for t in tutors_response:
 
 print("\nAll schedules created\n")
 
-event_type_recurring = requests.post(f"{API}/event_types", json={
-    "name": "Tutoring Session",
+booking_link_recurring = requests.post(f"{API}/booking_links", json={
+    "slug": "tutoring-session",
     "description": "Recurring — books a weekly repeating slot (same tutor, day, and time every week) rather than a single date. Cancellations and reschedules are approved automatically if requested at least 24 hours before the session; requests inside that 24-hour window are held for manual approval instead.",
     "duration_minutes": 90,
     "recurring": True,
@@ -84,10 +84,10 @@ event_type_recurring = requests.post(f"{API}/event_types", json={
     "reschedule_notice_minutes": 1440,
     "availability": [{"tutor_id": t["id"], "schedule_id": schedule_ids[t["id"]]} for t in tutors_response],
 }).json()
-print(f"Event type created: {event_type_recurring['name']} (id={event_type_recurring['id']})")
+print(f"Event type created: {booking_link_recurring['slug']} (id={booking_link_recurring['id']})")
 
-event_type_standalone = requests.post(f"{API}/event_types", json={
-    "name": "One-time Lesson",
+booking_link_standalone = requests.post(f"{API}/booking_links", json={
+    "slug": "one-time-lesson",
     "description": "Standalone — a single one-off session, not part of a recurring weekly series. Same 24-hour cancellation/reschedule policy as the recurring option: auto-approved outside the 24-hour window, held for manual approval if requested closer to the session.",
     "duration_minutes": 60,
     "recurring": False,
@@ -97,7 +97,7 @@ event_type_standalone = requests.post(f"{API}/event_types", json={
     "reschedule_notice_minutes": 1440,
     "availability": [{"tutor_id": t["id"], "schedule_id": schedule_ids[t["id"]]} for t in tutors_response],
 }).json()
-print(f"Event type created: {event_type_standalone['name']} (id={event_type_standalone['id']})\n")
+print(f"Event type created: {booking_link_standalone['slug']} (id={booking_link_standalone['id']})\n")
 
 # ~3 months of fake historical lessons, hardcoded (not read from a spreadsheet — this is
 # synthetic demo data either way, so generating it directly here skips a pointless
@@ -167,14 +167,14 @@ conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
 
-def insert_standalone_booking(event_date, start_time, end_time, event_type_id, student_id, first, last, email, phone, google_event_id):
+def insert_standalone_booking(event_date, start_time, end_time, booking_link_id, student_id, first, last, email, phone, google_event_id):
     cur.execute("""
         INSERT INTO bookings (
-            tutor_id, event_type_id, start, "end", timezone, google_event_id, status,
+            tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
             is_no_show, student_id, student_first, student_last, student_email, student_phone
         ) VALUES (%s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
     """, (
-        tutor_id, event_type_id,
+        tutor_id, booking_link_id,
         to_utc(event_date, start_time), to_utc(event_date, end_time), "America/New_York",
         google_event_id, student_id, first, last, email, phone,
     ))
@@ -183,22 +183,22 @@ def insert_standalone_booking(event_date, start_time, end_time, event_type_id, s
 # A few ordinary standalone bookings, spread across different days/times.
 insert_standalone_booking(
     next_weekday(1), "16:00", "17:00",  # next Tuesday
-    event_type_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
+    booking_link_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
     "demo-standalone-fake-event-id-1",
 )
 insert_standalone_booking(
     next_weekday(4), "11:00", "12:00",  # next Friday
-    event_type_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
+    booking_link_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
     "demo-standalone-fake-event-id-2",
 )
 insert_standalone_booking(
     next_weekday(4), "15:00", "16:00",  # next Friday
-    event_type_standalone["id"], john_id, "John", "Smith", "john.smith@example.com", "555-0101",
+    booking_link_standalone["id"], john_id, "John", "Smith", "john.smith@example.com", "555-0101",
     "demo-standalone-fake-event-id-3",
 )
 insert_standalone_booking(
     date.today() - timedelta(days=14), "13:00", "14:00",  # two weeks ago — exercises the "Past" view
-    event_type_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
+    booking_link_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
     "demo-standalone-fake-event-id-4",
 )
 
@@ -209,7 +209,7 @@ insert_standalone_booking(
 conflict_date = next_weekday(3)  # next Thursday
 insert_standalone_booking(
     conflict_date, "10:30", "22:00",
-    event_type_standalone["id"], john_id, "John", "Smith", "john.smith@example.com", "555-0101",
+    booking_link_standalone["id"], john_id, "John", "Smith", "john.smith@example.com", "555-0101",
     "demo-fully-booked-day-fake-event-id",
 )
 
@@ -220,12 +220,12 @@ series_dtend = datetime.combine(series_start, time(18, 30))
 series_until = series_start + timedelta(weeks=7)
 cur.execute("""
     INSERT INTO booking_series (
-        tutor_id, event_type_id, dtstart, dtend, until, google_event_id,
+        tutor_id, booking_link_id, dtstart, dtend, until, google_event_id,
         student_id, student_first, student_last, student_email, student_phone
     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     RETURNING id
 """, (
-    tutor_id, event_type_recurring["id"], series_dtstart, series_dtend, series_until,
+    tutor_id, booking_link_recurring["id"], series_dtstart, series_dtend, series_until,
     "demo-series-fake-event-id",
     john_id, "John", "Smith", "john.smith@example.com", "555-0101",
 ))
@@ -235,11 +235,11 @@ for week in range(8):
     occ_date = series_start + timedelta(weeks=week)
     cur.execute("""
         INSERT INTO bookings (
-            series_id, tutor_id, event_type_id, start, "end", timezone, google_event_id, status,
+            series_id, tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
             is_no_show, student_id, student_first, student_last, student_email, student_phone
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
     """, (
-        series_id, tutor_id, event_type_recurring["id"],
+        series_id, tutor_id, booking_link_recurring["id"],
         to_utc(occ_date, "17:00"), to_utc(occ_date, "18:30"), "America/New_York",
         "demo-series-fake-event-id",
         john_id, "John", "Smith", "john.smith@example.com", "555-0101",

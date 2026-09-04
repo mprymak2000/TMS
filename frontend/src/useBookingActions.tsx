@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
-import { Modal, Button, Menu, TextInput } from '@mantine/core'
-import { IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle } from '@tabler/icons-react'
+import { Modal, Button, Menu, TextInput, Select } from '@mantine/core'
+import { IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
-import type { Booking, EventType } from './types'
+import type { Booking, BookingLink } from './types'
 import { formatDate, extractError } from './utils'
 
 interface ContactForm {
@@ -17,7 +17,8 @@ interface ContactForm {
 // actions (reschedule/modify contact/no-show/cancel/delete) without duplicating any of this logic.
 export const useBookingActions = (
     booking: Booking,
-    eventType: EventType,
+    bookingLink: BookingLink,
+    bookingLinks: BookingLink[],   // the roster, for reassigning off an archived link
     onRefresh: (msg: string) => void,
     onError: (msg: string) => void,
     onReviewRequest?: (booking: Booking) => void,
@@ -36,6 +37,38 @@ export const useBookingActions = (
     const [contactError, setContactError]   = useState<string | null>(null)
     const [contactSaving, setContactSaving] = useState(false)
     const [isSubmitting, setIsSubmitting] = useState(false)
+    const [reassigning, setReassigning] = useState(false)
+    const [reassignTarget, setReassignTarget] = useState<string | null>(null)
+
+    // The roster includes archived links so existing rows can resolve their source — but an
+    // archived link is never a valid target to move a booking onto.
+    const reassignOptions = bookingLinks.filter(l => l.status !== 'archived')
+
+    const openReassign = () => {
+        setReassignTarget(null)
+        setReassigning(true)
+    }
+
+    const handleReassign = async () => {
+        if (!reassignTarget) return
+        setIsSubmitting(true)
+        try {
+            const res = await fetch(
+                `${import.meta.env.VITE_API_URL}/bookings/${booking.id}/reassign?booking_link_id=${reassignTarget}`,
+                { method: 'POST' },
+            )
+            if (!res.ok) {
+                onError(extractError(await res.json(), 'Failed to reassign booking link'))
+                return
+            }
+            setReassigning(false)
+            onRefresh('Booking link reassigned')
+        } catch {
+            onError('An unknown error occurred while reassigning')
+        } finally {
+            setIsSubmitting(false)
+        }
+    }
 
     const isPast = new Date(booking.start) < new Date()
 
@@ -183,7 +216,7 @@ export const useBookingActions = (
                     leftSection={<IconCalendarEvent size={14} />}
                     disabled={booking.status !== 'confirmed'}
                     onClick={() => {
-                        navigate(`/book/${eventType.id}`, {
+                        navigate(`/book/${bookingLink.slug}`, {
                             state: {
                                 rescheduleFromId: booking.id,
                                 originalStart: booking.start,
@@ -206,7 +239,7 @@ export const useBookingActions = (
                         leftSection={<IconCalendarEvent size={14} />}
                         disabled={booking.status !== 'confirmed'}
                         onClick={() => {
-                            navigate(`/book/${eventType.id}`, {
+                            navigate(`/book/${bookingLink.slug}`, {
                                 state: {
                                     rescheduleFromId: booking.id,
                                     tutorId: booking.tutor_id,
@@ -228,6 +261,11 @@ export const useBookingActions = (
                         Request reschedule
                     </Menu.Item>
                 </>
+            )}
+            {bookingLink.status === 'archived' && (
+                <Menu.Item leftSection={<IconLink size={14} />} onClick={openReassign}>
+                    Reassign booking link
+                </Menu.Item>
             )}
             <Menu.Item leftSection={<IconPencil size={14} />} disabled={booking.status !== 'confirmed'} onClick={() => setEditingContact(true)}>
                 Modify contact
@@ -252,6 +290,26 @@ export const useBookingActions = (
 
     const modals = (
         <>
+            <Modal opened={reassigning} onClose={() => setReassigning(false)}
+                title="Reassign booking link" centered size="sm">
+                <p className="text-sm text-gray-600 mb-4">
+                    This booking's link was archived, so its scheduling rules no longer apply and it can't be
+                    rescheduled. Pointing it at an active link restores that. Nothing else about the booking changes.
+                </p>
+                <Select
+                    label="Booking link"
+                    placeholder="Pick an active link"
+                    data={reassignOptions.map(l => ({ value: String(l.id), label: l.slug }))}
+                    value={reassignTarget}
+                    onChange={setReassignTarget}
+                    searchable
+                />
+                <div className="flex justify-end gap-2 mt-4">
+                    <Button variant="default" onClick={() => setReassigning(false)}>Cancel</Button>
+                    <Button loading={isSubmitting} disabled={!reassignTarget} onClick={handleReassign}>Reassign</Button>
+                </div>
+            </Modal>
+
             <Modal opened={confirmingDelete} onClose={() => setConfirmingDelete(false)}
                 title={`Cancel ${booking.student_first}'s booking on ${formatDate(booking.start)}?`} centered size="sm">
                 <div className="flex justify-end gap-2">

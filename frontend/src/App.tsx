@@ -2,8 +2,8 @@ import { MantineProvider, createTheme } from '@mantine/core'
 import { Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import LessonsTable from './LessonsTable'
 import Availability from './Availability'
-import EventTypes from './EventTypes'
-import EventTypePage from './EventTypePage'
+import Links from './Links'
+import LinkPage from './LinkPage'
 import BookingPage from './BookingPage'
 import BookingsLayout from './BookingsLayout'
 import ScheduleTab from './ScheduleTab'
@@ -24,7 +24,7 @@ const navItems = [
   { to: '/students', label: 'Students' },
   { to: '/tutors', label: 'Tutors' },
   { to: '/availability', label: 'Availability' },
-  { to: '/event-types', label: 'Event Types' },
+  { to: '/links', label: 'Links' },
   { to: '/bookings', label: 'Bookings' },
 ]
 
@@ -37,7 +37,7 @@ function App() {
   return (
     <MantineProvider theme={theme}>
       <Routes>
-        <Route path="/book/:eventTypeId" element={<BookingPage />} />
+        <Route path="/book/:slug" element={<BookingPage />} />
         <Route path="/manage-occurrence/:ref" element={<ManageOccurrence />} />
         <Route path="/manage-series/:ref" element={<ManageSeries />} />
         <Route path="/my-bookings" element={<BookingsLayout />}>
@@ -107,8 +107,8 @@ function App() {
                 <Route path="/students" element={<div className="text-gray-400">Students — coming soon</div>} />
                 <Route path="/tutors" element={<Tutors />} />
                 <Route path="/availability" element={<Availability />} />
-                <Route path="/event-types" element={<EventTypes />} />
-                <Route path="/event-types/:id" element={<EventTypePage />} />
+                <Route path="/links" element={<Links />} />
+                <Route path="/links/:id" element={<LinkPage />} />
                 <Route path="/bookings" element={<BookingsLayout />}>
                   <Route index element={<ScheduleTab />} />
                   <Route path="recurring" element={<RecurringTab />} />

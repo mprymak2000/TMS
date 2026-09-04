@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Loader, Button, Popover, Switch } from '@mantine/core'
 import { IconX, IconChevronDown, IconSortAscending, IconSortDescending } from '@tabler/icons-react'
-import type { Tutor, EventType } from './types'
+import type { Tutor, BookingLink } from './types'
 
 // Shared toolbar pieces used by every Bookings tab (Schedule/Recurring/Requests) - filters,
 // active-filter chips, sort toggle, and infinite-scroll trigger. Pulled out of any one tab's
@@ -9,7 +9,7 @@ import type { Tutor, EventType } from './types'
 
 export interface BookingFilters {
     tutorIds: string[]
-    eventTypeIds: string[]
+    bookingLinkIds: string[]
     students: string[]
     dateFrom: string | null
     dateTo: string | null
@@ -20,7 +20,7 @@ export interface BookingFilters {
 export interface LoadErrors {
     bookings?: string
     tutors?: string
-    eventTypes?: string
+    bookingLinks?: string
 }
 
 export const PAGE_SIZE = 10  // explicit override for Recurring/Requests; Day/Week/Month (ScheduleTab) omit page_size, backend default applies
@@ -81,28 +81,28 @@ const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }
 // there's nothing active, so callers don't need their own activeFilterCount check.
 export const ActiveFilterChips = ({
     tutorIds,
-    eventTypeIds,
+    bookingLinkIds,
     students,
     tutors,
-    eventTypes,
+    bookingLinks,
     includeCancelled,
     onTutorRemove,
-    onEventTypeRemove,
+    onBookingLinkRemove,
     onStudentRemove,
     onIncludeCancelledRemove,
 }: {
     tutorIds: string[]
-    eventTypeIds: string[]
+    bookingLinkIds: string[]
     students: string[]
     tutors: Tutor[]
-    eventTypes: EventType[]
+    bookingLinks: BookingLink[]
     includeCancelled: boolean
     onTutorRemove: (id: string) => void
-    onEventTypeRemove: (id: string) => void
+    onBookingLinkRemove: (id: string) => void
     onStudentRemove: (value: string) => void
     onIncludeCancelledRemove: () => void
 }) => {
-    if (tutorIds.length === 0 && eventTypeIds.length === 0 && students.length === 0 && includeCancelled) return null
+    if (tutorIds.length === 0 && bookingLinkIds.length === 0 && students.length === 0 && includeCancelled) return null
     return (
         <div className="flex flex-wrap gap-2 mt-3">
             {tutorIds.map(id => (
@@ -112,11 +112,11 @@ export const ActiveFilterChips = ({
                     onRemove={() => onTutorRemove(id)}
                 />
             ))}
-            {eventTypeIds.map(id => (
+            {bookingLinkIds.map(id => (
                 <FilterChip
                     key={`event-${id}`}
-                    label={`Event: ${eventTypes.find(e => String(e.id) === id)?.name ?? ''}`}
-                    onRemove={() => onEventTypeRemove(id)}
+                    label={`Link: ${bookingLinks.find(e => String(e.id) === id)?.slug ?? ''}`}
+                    onRemove={() => onBookingLinkRemove(id)}
                 />
             ))}
             {students.map(pair => (
@@ -185,14 +185,14 @@ const FilterAccordionSection = ({
 )
 
 // One context menu (Google-Calendar-"Schedule"-dropdown style): a single trigger, and Tutors /
-// Event types expand as accordion sections inside the same panel — never a second popover.
+// Links expand as accordion sections inside the same panel — never a second popover.
 export const FiltersMenu = ({
     tutorOptions,
     tutorSelected,
     onTutorToggle,
-    eventTypeOptions,
-    eventTypeSelected,
-    onEventTypeToggle,
+    bookingLinkOptions,
+    bookingLinkSelected,
+    onBookingLinkToggle,
     studentOptions,
     studentSelected,
     onStudentToggle,
@@ -202,9 +202,9 @@ export const FiltersMenu = ({
     tutorOptions: FilterOption[]
     tutorSelected: string[]
     onTutorToggle: (value: string) => void
-    eventTypeOptions: FilterOption[]
-    eventTypeSelected: string[]
-    onEventTypeToggle: (value: string) => void
+    bookingLinkOptions: FilterOption[]
+    bookingLinkSelected: string[]
+    onBookingLinkToggle: (value: string) => void
     studentOptions: FilterOption[]
     studentSelected: string[]
     onStudentToggle: (value: string) => void
@@ -214,8 +214,8 @@ export const FiltersMenu = ({
     const [opened, setOpened] = useState(false)
     // Independent toggles, not a single-open accordion — expanding Students shouldn't collapse
     // Tutors if it's already open.
-    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'eventTypes' | 'students'>>(new Set())
-    const toggleSection = (key: 'tutors' | 'eventTypes' | 'students') => {
+    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'bookingLinks' | 'students'>>(new Set())
+    const toggleSection = (key: 'tutors' | 'bookingLinks' | 'students') => {
         setExpandedSections(prev => {
             const next = new Set(prev)
             if (next.has(key)) next.delete(key)
@@ -223,7 +223,7 @@ export const FiltersMenu = ({
             return next
         })
     }
-    const activeCount = tutorSelected.length + eventTypeSelected.length + studentSelected.length + (includeCancelled ? 0 : 1)
+    const activeCount = tutorSelected.length + bookingLinkSelected.length + studentSelected.length + (includeCancelled ? 0 : 1)
 
     return (
         <Popover
@@ -255,12 +255,12 @@ export const FiltersMenu = ({
                 />
                 <div className="border-t border-gray-100" />
                 <FilterAccordionSection
-                    label="Event types"
-                    options={eventTypeOptions}
-                    selected={eventTypeSelected}
-                    expanded={expandedSections.has('eventTypes')}
-                    onToggleExpand={() => toggleSection('eventTypes')}
-                    onToggleOption={onEventTypeToggle}
+                    label="Links"
+                    options={bookingLinkOptions}
+                    selected={bookingLinkSelected}
+                    expanded={expandedSections.has('bookingLinks')}
+                    onToggleExpand={() => toggleSection('bookingLinks')}
+                    onToggleOption={onBookingLinkToggle}
                 />
                 <div className="border-t border-gray-100" />
                 <FilterAccordionSection
