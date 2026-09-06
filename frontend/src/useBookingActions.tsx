@@ -17,8 +17,8 @@ interface ContactForm {
 // actions (reschedule/modify contact/no-show/cancel/delete) without duplicating any of this logic.
 export const useBookingActions = (
     booking: Booking,
-    bookingLink: BookingLink,
-    bookingLinks: BookingLink[],   // the roster, for reassigning off an archived link
+    bookingLink: BookingLink | undefined,   // resolved from the roster, which can miss
+    bookingLinks: BookingLink[],            // the roster, for reassigning off an archived link
     onRefresh: (msg: string) => void,
     onError: (msg: string) => void,
     onReviewRequest?: (booking: Booking) => void,
@@ -42,7 +42,7 @@ export const useBookingActions = (
 
     // The roster includes archived links so existing rows can resolve their source — but an
     // archived link is never a valid target to move a booking onto.
-    const reassignOptions = bookingLinks.filter(l => l.status !== 'archived')
+    const reassignOptions = (bookingLinks ?? []).filter(l => l.status !== 'archived')
 
     const openReassign = () => {
         setReassignTarget(null)
@@ -216,7 +216,7 @@ export const useBookingActions = (
                     leftSection={<IconCalendarEvent size={14} />}
                     disabled={booking.status !== 'confirmed'}
                     onClick={() => {
-                        navigate(`/book/${bookingLink.slug}`, {
+                        navigate(`/book/${bookingLink?.slug}`, {
                             state: {
                                 rescheduleFromId: booking.id,
                                 originalStart: booking.start,
@@ -239,7 +239,7 @@ export const useBookingActions = (
                         leftSection={<IconCalendarEvent size={14} />}
                         disabled={booking.status !== 'confirmed'}
                         onClick={() => {
-                            navigate(`/book/${bookingLink.slug}`, {
+                            navigate(`/book/${bookingLink?.slug}`, {
                                 state: {
                                     rescheduleFromId: booking.id,
                                     tutorId: booking.tutor_id,
@@ -262,7 +262,7 @@ export const useBookingActions = (
                     </Menu.Item>
                 </>
             )}
-            {bookingLink.status === 'archived' && (
+            {bookingLink?.status === 'archived' && (
                 <Menu.Item leftSection={<IconLink size={14} />} onClick={openReassign}>
                     Reassign booking link
                 </Menu.Item>

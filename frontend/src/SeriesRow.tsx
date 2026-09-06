@@ -27,9 +27,9 @@ const OccurrenceCard = ({
     onError,
 }: {
     booking: Booking
-    bookingLink: BookingLink
+    bookingLink: BookingLink | undefined
     bookingLinks: BookingLink[]
-    expectedTutor: Tutor
+    expectedTutor: Tutor | undefined
     tutors: Tutor[]
     isCustomer: boolean
     isNext: boolean
@@ -62,7 +62,7 @@ const OccurrenceCard = ({
     // directly; weekday compares against the predecessor's real original instant (both rendered
     // the same way, viewer-local, so no business-timezone math needed).
     const actualTutor = tutors.find(t => t.id === booking.tutor_id)
-    const tutorChanged = !!booking.rescheduled_from && !!actualTutor && actualTutor.id !== expectedTutor.id
+    const tutorChanged = !!booking.rescheduled_from && !!actualTutor && !!expectedTutor && actualTutor.id !== expectedTutor.id
     const weekdayChanged = !!rescheduledFromDate && rescheduledFromDate.getDay() !== new Date(booking.start).getDay()
 
     // isNext wins over the rescheduled colors — "this is the one coming up" is the more useful
@@ -173,9 +173,10 @@ const OccurrenceCard = ({
 
 interface SeriesRowProps {
     series: BookingSeries
-    tutor: Tutor
+    // Resolved by `.find()` against the roster, which can miss — model that rather than asserting.
+    tutor: Tutor | undefined
     tutors: Tutor[]
-    bookingLink: BookingLink
+    bookingLink: BookingLink | undefined
     bookingLinks: BookingLink[]
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
@@ -284,10 +285,10 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingLinks, onRefresh
                     {timeStr}
                 </span>
                 <span className={`flex-1 min-w-0 truncate ml-6 text-gray-800 transition-all ${expanded ? 'text-base font-medium' : 'text-sm'}`}>
-                    {tutor.first_name} {tutor.last_name} · {series.student_first} {series.student_last}
+                    {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {series.student_first} {series.student_last}
                 </span>
                 <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
-                    {bookingLink.slug}{series.until ? ` · until ${formatDate(series.until)}` : ''}
+                    {bookingLink?.slug}{series.until ? ` · until ${formatDate(series.until)}` : ''}
                 </span>
                 <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} onClick={e => e.stopPropagation()}>
                     {isCustomer ? (
@@ -307,7 +308,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingLinks, onRefresh
                             <Menu.Dropdown>
                                 <Menu.Item
                                     leftSection={<IconCalendarStats size={14} />}
-                                    onClick={() => navigate(`/book/${bookingLink.slug}`, {
+                                    onClick={() => navigate(`/book/${bookingLink?.slug}`, {
                                         state: {
                                             rescheduleSeriesId: series.id,
                                             tutorId: series.tutor_id,

@@ -666,8 +666,9 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 {/* spinner */}
                 {(isLoading || isLoadingRoster) && <div className="flex justify-center py-12"><Loader size="sm" /></div>}
 
-                {/* booking list */}
-                {!isLoading && (
+                {/* booking list — also gated on the roster, since rows resolve their tutor and link
+                    out of it and would otherwise render against an empty array */}
+                {!isLoading && !isLoadingRoster && (
                     <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
                         {displayed.length > 0 ? (
                             <div>
@@ -699,8 +700,8 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                             )}
                                             <BookingRow
                                                 booking={b}
-                                                tutor={tutors.find(t => t.id === b.tutor_id)!}
-                                                bookingLink={bookingLinks.find(e => e.id === b.booking_link_id)!}
+                                                tutor={tutors.find(t => t.id === b.tutor_id)}
+                                                bookingLink={bookingLinks.find(e => e.id === b.booking_link_id)}
                                                 bookingLinks={bookingLinks}
                                                 expanded={expandedId === b.id}
                                                 onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}

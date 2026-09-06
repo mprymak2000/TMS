@@ -38,7 +38,7 @@ const BookingsLayout = () => {
                     fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                     // include_archived — bookings keep pointing at their link forever, so the roster
                     // has to resolve retired ones or every row that came from one renders blank.
-                    fetch(`${import.meta.env.VITE_API_URL}/booking_links?include_archived=true`),
+                    fetch(`${import.meta.env.VITE_API_URL}/booking_links/?include_archived=true`),
                 ])
                 if (!tutorResponse.ok) { setRosterError(extractError(await tutorResponse.json(), 'Failed to load tutors.')); return }
                 if (!bookingLinkResponse.ok) { setRosterError(extractError(await bookingLinkResponse.json(), 'Failed to load booking links.')); return }

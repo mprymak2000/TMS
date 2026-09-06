@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Button, Loader } from '@mantine/core'
-import { IconPlus, IconPencil, IconTrash, IconExternalLink } from '@tabler/icons-react'
+import { Button, Loader, Modal } from '@mantine/core'
+import { IconPlus, IconPencil, IconTrash, IconExternalLink, IconCopy, IconCheck } from '@tabler/icons-react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import type { Tutor, Schedule, BookingLink } from './types'
 import { useToast } from './useToast'
@@ -44,6 +44,8 @@ const Links = () => {
     const location = useLocation()
     const [confirmingArchiveId, setConfirmingArchiveId] = useState<number | null>(null)
     const [impact, setImpact] = useState<{ upcoming_bookings: number; active_series: number } | null>(null)
+    const [copiedId, setCopiedId] = useState<number | null>(null)
+    const [confirmingPause, setConfirmingPause] = useState<BookingLink | null>(null)
     const { toast, showToast } = useToast()
 
     const loadData = async () => {
@@ -112,8 +114,8 @@ const Links = () => {
         }
     }
 
-    const startArchive = async (id: number) => {
-        setConfirmingArchiveId(id)
+    // Both confirms want the same counts; only the consequences differ.
+    const loadImpact = async (id: number) => {
         setImpact(null)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}/impact`)
@@ -121,6 +123,16 @@ const Links = () => {
         } catch {
             /* the count is advisory — the confirm still works without it */
         }
+    }
+
+    const startArchive = async (id: number) => {
+        setConfirmingArchiveId(id)
+        await loadImpact(id)
+    }
+
+    const startPause = async (link: BookingLink) => {
+        setConfirmingPause(link)
+        await loadImpact(link.id)
     }
 
     const setStatus = async (id: number, action: 'pause' | 'resume') => {
@@ -164,7 +176,24 @@ const Links = () => {
                         {/* card header: name, duration badge, recurring badge + edit/delete */}
                         <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-2">
-                                <span className="font-medium text-gray-800">{e.slug}</span>
+                                <span className="group/slug inline-flex items-center gap-2.5 mr-5">
+                                    <span className="text-lg font-medium text-gray-800 tracking-tight">
+                                        <span className="font-medium text-gray-500 mr-px">/</span>{e.slug}
+                                    </span>
+                                    <button
+                                        title="Copy booking link"
+                                        className="flex items-center justify-center w-7 h-7 rounded-md bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-700 transition-colors"
+                                        onClick={() => {
+                                            const url = `${window.location.host}/book/${e.slug}`
+                                            navigator.clipboard.writeText(`${window.location.origin}/book/${e.slug}`)
+                                            setCopiedId(e.id)
+                                            setTimeout(() => setCopiedId(null), 1500)
+                                            showToast(`Copied ${url}`)
+                                        }}
+                                    >
+                                        {copiedId === e.id ? <IconCheck size={15} stroke={2.4} /> : <IconCopy size={15} stroke={2.4} />}
+                                    </button>
+                                </span>
                                 {e.status === 'paused' && (
                                     <span className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full font-medium">Paused</span>
                                 )}
@@ -210,7 +239,7 @@ const Links = () => {
                                             variant="subtle"
                                             color="gray"
                                             size="xs"
-                                            onClick={() => setStatus(e.id, e.status === 'paused' ? 'resume' : 'pause')}
+                                            onClick={() => e.status === 'paused' ? setStatus(e.id, 'resume') : startPause(e)}
                                         >
                                             {e.status === 'paused' ? 'Resume' : 'Pause'}
                                         </Button>
@@ -264,6 +293,40 @@ const Links = () => {
                 ))}
             </div>
 
+            <Modal
+                opened={confirmingPause !== null}
+                onClose={() => { setConfirmingPause(null); setImpact(null) }}
+                title="Pause this link?"
+                centered
+                size="sm"
+            >
+                <p className="text-sm text-gray-600 mb-3">
+                    Its booking page stops accepting new bookings. Nothing else changes, and you can
+                    resume it at any time.
+                </p>
+                <ul className="text-sm text-gray-600 space-y-1.5 mb-5 list-disc pl-4 marker:text-gray-300">
+                    <li>
+                        {impact?.upcoming_bookings ?? 0} upcoming booking{impact?.upcoming_bookings === 1 ? '' : 's'} stay
+                        put, and clients can still reschedule them
+                    </li>
+                    <li>
+                        {impact?.active_series ?? 0} recurring series keep running and keep generating sessions
+                    </li>
+                    <li>The <code className="font-mono text-xs">/{confirmingPause?.slug}</code> URL stays reserved</li>
+                </ul>
+                <div className="flex justify-end gap-2">
+                    <Button variant="default" onClick={() => { setConfirmingPause(null); setImpact(null) }}>Cancel</Button>
+                    <Button
+                        onClick={() => {
+                            if (confirmingPause) setStatus(confirmingPause.id, 'pause')
+                            setConfirmingPause(null)
+                            setImpact(null)
+                        }}
+                    >
+                        Pause link
+                    </Button>
+                </div>
+            </Modal>
             <Toast toast={toast} />
         </div>
     )

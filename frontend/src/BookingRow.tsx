@@ -2,13 +2,14 @@ import { Menu } from '@mantine/core'
 import { IconChevronDown, IconChevronUp, IconDotsVertical } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, Tutor, BookingLink } from './types'
-import { formatTime, tutorBubbleClass } from './utils'
+import { formatTime, tutorBubbleClass, tutorInitials } from './utils'
 import { useBookingActions } from './useBookingActions'
 
 interface BookingRowProps {
     booking: Booking
-    tutor: Tutor
-    bookingLink: BookingLink
+    // Resolved by `.find()` against the roster, which can miss — model that rather than asserting.
+    tutor: Tutor | undefined
+    bookingLink: BookingLink | undefined
     bookingLinks: BookingLink[]
     expanded: boolean
     onExpand: () => void
@@ -87,7 +88,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                         {formatTime(booking.start)} – {formatTime(booking.end)}
                     </span>
                     <span className={`flex-1 min-w-0 truncate ml-6 text-sm ${status.name}`}>
-                        {tutor.first_name} {tutor.last_name} · {booking.student_first} {booking.student_last}
+                        {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {booking.student_first} {booking.student_last}
                     </span>
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs">
                         {status.label && <span className="text-gray-400">{status.label}</span>}
@@ -97,7 +98,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                         )}
                     </span>
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
-                        {bookingLink.slug}
+                        {bookingLink?.slug}
                     </span>
                     <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                         {actions}
@@ -120,7 +121,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                     <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5 flex-wrap">
                             <span className="font-medium text-gray-800">
-                                {tutor.first_name} {tutor.last_name} · {booking.student_first} {booking.student_last}
+                                {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {booking.student_first} {booking.student_last}
                             </span>
                             {status.label && (
                                 <span className={`text-xs px-2 py-0.5 rounded-full ${status.chip}`}>{status.label}</span>
@@ -130,13 +131,13 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                             )}
                         </div>
                         <div className="text-xs text-gray-400 mt-0.5">
-                            {bookingLink.slug}
+                            {bookingLink?.slug}
                         </div>
                     </div>
 
                     {/* tutor bubble */}
-                    <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${tutorBubbleClass(tutor)}`}>
-                        {tutor.first_name[0]}{tutor.last_name[0]}
+                    <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${tutor ? tutorBubbleClass(tutor) : 'bg-gray-100 text-gray-400'}`}>
+                        {tutor ? tutorInitials(tutor) : '?'}
                     </div>
 
                     {/* expand + actions */}

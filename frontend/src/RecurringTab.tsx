@@ -51,9 +51,9 @@ const RecurringList = ({
                         <div key={s.id} className={j > 0 ? 'border-t border-gray-100' : ''}>
                             <SeriesRow
                                 series={s}
-                                tutor={tutors.find(t => t.id === s.tutor_id)!}
+                                tutor={tutors.find(t => t.id === s.tutor_id)}
                                 tutors={tutors}
-                                bookingLink={bookingLinks.find(e => e.id === s.booking_link_id)!}
+                                bookingLink={bookingLinks.find(e => e.id === s.booking_link_id)}
                                 bookingLinks={bookingLinks}
                                 onRefresh={onRefresh}
                                 onError={onError}
