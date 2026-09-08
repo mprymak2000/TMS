@@ -17,7 +17,7 @@ from booking_utils import active_series_filter, apply_booking_time_scope, apply_
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
-from models import Booking, BookingRequest, BookingSeries, BookingLink, Tutor
+from models import Booking, BookingRequest, BookingSeries, BookingLink, BookingType, Tutor
 from policy import (
     get_cancel_action,
     get_reschedule_action,
@@ -33,6 +33,7 @@ from schemas import (
     BookingSeriesOccurrencesResponse,
     BookingSeriesResponse,
     BookingUpdate,
+    BookingSeriesUpdate,
 )
 from sqlalchemy.orm import Session
 
@@ -56,6 +57,7 @@ def get_booking_series(
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
     booking_link_ids: list[int] = Query(default=[]),
+    booking_type_ids: list[int] = Query(default=[]),
     student: list[str] = Query(default=[]),
     settings=Depends(get_settings),
     db: Session = Depends(get_db),
@@ -69,10 +71,10 @@ def get_booking_series(
     if email:
         base_query = base_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
-    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs).all()
+    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs).all()
     results = [BookingSeriesResponse.model_validate(series) for series in scoped_series_rows]
 
-    facets = compute_series_facets(base_query, tutor_ids, booking_link_ids, student_pairs, db)
+    facets = compute_series_facets(base_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, db)
     return BookingSeriesListResponse(items=results, facets=facets)
 
 @router.get("/booking-series/{id}/occurrences", response_model=BookingSeriesOccurrencesResponse)
@@ -100,7 +102,15 @@ def get_booking_series_occurrences(
 
     decoded_cursor = None
     if cursor is not None:
-        decoded_cursor = decode_cursor(cursor, [], [], [], time_min, time_max, None, False, include_cancelled, series.public_id)
+        # No facet filters here — this endpoint is already scoped to one series, and series_id is
+        # what keeps the cursor from being replayed against a different one.
+        decoded_cursor = decode_cursor(
+            cursor,
+            tutor_ids=[], booking_link_ids=[], booking_type_ids=[], student_pairs=[],
+            time_min=time_min, time_max=time_max,
+            email=None, pending_only=False, include_cancelled=include_cancelled,
+            series_id=series.public_id,
+        )
 
     materialized_query = apply_booking_time_scope(
         db.query(Booking).filter(Booking.series_id == series.id), time_min, time_max, include_cancelled
@@ -120,7 +130,13 @@ def get_booking_series_occurrences(
     # merge into a sorted list, take first page_size's worth, encode a cursor as a bookmark and discard the tail
     merged = merge_occurrences(virtual, materialized, order)
     items = merged[:page_size]
-    next_cursor = encode_cursor(items[-1].start, items[-1].id, [], [], [], time_min, time_max, None, False, include_cancelled, series.public_id) if len(merged) > page_size else None
+    next_cursor = encode_cursor(
+        items[-1].start, items[-1].id,
+        tutor_ids=[], booking_link_ids=[], booking_type_ids=[], student_pairs=[],
+        time_min=time_min, time_max=time_max,
+        email=None, pending_only=False, include_cancelled=include_cancelled,
+        series_id=series.public_id,
+    ) if len(merged) > page_size else None
     return BookingSeriesOccurrencesResponse(items=items, next_cursor=next_cursor)
 
 @router.get("/", response_model=BookingListResponse)
@@ -128,6 +144,7 @@ def get_bookings(
     email: str | None = Query(default=None), # main scope
     tutor_ids: list[int] = Query(default=[]), # facet scope
     booking_link_ids: list[int] = Query(default=[]), # facet scope
+    booking_type_ids: list[int] = Query(default=[]), # facet scope
     student: list[str] = Query(default=[]), # facet scope
     time_min: datetime | None = Query(default=None), # main scope - time
     time_max: datetime | None = Query(default=None), # main scope - time
@@ -150,7 +167,7 @@ def get_bookings(
 
     decoded_cursor = None
     if cursor is not None:
-        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled)
+        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled)
 
     # email scope is shared by both branches below - apply it once, up front (though series gets ignored for pending-only branch)
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
@@ -163,7 +180,7 @@ def get_bookings(
     ## branch on pending-only: if true, only materialized bookings with a pending request are returned. else main branch runs
     if pending_only:
         base_query = materialized_query.filter(Booking.request.has(BookingRequest.status == 'pending'))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, student_pairs)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
         # seek direction and sort order must flip together based on `order` - "next page" means
         # "after" when ascending but "before" when descending
         booking_key = tuple_(Booking.start, Booking.public_id)
@@ -174,20 +191,20 @@ def get_bookings(
             scoped_query = scoped_query.filter(past_cursor)
         sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
         booking_rows = scoped_query.order_by(*sort_cols).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
         items = [BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]]
-        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
+        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
         return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
 
     ## main branch
     # scope materialized bookings by time, series by time overlap, then calculate facets
     materialized_query = apply_booking_time_scope(materialized_query, time_min, time_max, include_cancelled)
     series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
-    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, settings, db)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, settings, db)
     
-    # scope Bookings and BookingSeries by tutor_ids, booking_link_ids, student_pairs, using cursor as a start point
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, student_pairs)
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs)
+    # scope Bookings and BookingSeries by tutor_ids, booking_link_ids, booking_type_ids, student_pairs, using cursor as a start point
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
     # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
     if decoded_cursor is not None:
         cursor_start, cursor_public_id = decoded_cursor
@@ -211,6 +228,7 @@ def get_bookings(
         items[-1].id,
         tutor_ids,
         booking_link_ids,
+        booking_type_ids,
         student_pairs,
         time_min,
         time_max,
@@ -227,6 +245,7 @@ def list_bookings(
     email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
     booking_link_ids: list[int] = Query(default=[]),
+    booking_type_ids: list[int] = Query(default=[]),
     student: list[str] = Query(default=[]),
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
@@ -252,9 +271,9 @@ def list_bookings(
         base_query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
         if email:
             base_query = base_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, student_pairs)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
         booking_rows = scoped_query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
         return BookingPagedListResponse(
             items=[BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]],
             total=None, # not meaningful for pending-only request
@@ -278,14 +297,14 @@ def list_bookings(
     series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
 
     # get facets: self-excluding (narrows down filter types and which tutors/event types/students are available for further filtering)
-    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, student_pairs, time_min, time_max, settings, db)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, settings, db)
 
     # get actual bookings (items): full scope (no exclusion) on top of the same main-scoped queries, then generate+merge virtual with materialized
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, student_pairs)
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
     scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
 
     ## time/status-scope (series only) - different mechanism than bookings materialized in db
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, student_pairs) # first scope series
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs) # first scope series
     scoped_series = scoped_series_query.all() # execute query to get series rows.
 
     # generate occurrence from scoped series rows
@@ -414,6 +433,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                 dtstart=local_start.replace(tzinfo=None),
                 dtend=local_end.replace(tzinfo=None),
                 until=recur_until_date,
+                booking_type_id=db_booking_link.booking_type_id,
                 google_event_id=google_event["id"],
             )
             db.add(series)
@@ -427,6 +447,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                     public_id=f"{series.public_id}:{int(occ_start.timestamp())}",
                     **base_fields,
                     series_id=series.id,
+                    booking_type_id=series.booking_type_id,
                     google_event_id=google_event["id"],
                     start=occ_start,
                     end=occ_start + _duration,
@@ -443,6 +464,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
         new_booking = Booking(
             public_id=new_public_id,
             **booking_in.model_dump(exclude={"recur_until"}),
+            booking_type_id=db_booking_link.booking_type_id,
             google_event_id=google_event["id"],
             status="confirmed",
         )
@@ -550,6 +572,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         "status": "confirmed",
         "student_id": db_booking.student_id,
         "booking_link_id": db_booking.booking_link_id,
+        "booking_type_id": db_booking.booking_type_id,
         "student_first": db_booking.student_first,
         "student_last": db_booking.student_last,
         "student_email": db_booking.student_email,
@@ -631,8 +654,11 @@ def reschedule_booking(ref: str, booking_in: BookingReschedule, db: Session = De
     return _reschedule_booking(db_booking, booking_in, db, service)
 
 
-@router.put("/booking-series/{id}", response_model=BookingSeriesResponse)
-def update_booking_series(id: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+@router.post("/booking-series/{id}/reschedule", response_model=BookingSeriesResponse)
+def reschedule_booking_series(id: str, booking_in: BookingReschedule, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """POST, not PUT: this creates a *new* series row with a new public_id and closes the old one, so
+    a GET on this id afterwards returns the predecessor, not what you sent. The bare PUT on this
+    resource is the plain-column update below."""
     # Admin path: no notice-window/policy check, same reasoning as the occurrence-level admin
     # routes above. Only checks status, not until — status guards correctness (can't act on a
     # row whose identity is already dead); until is a business rule for clients, not admins.
@@ -647,10 +673,58 @@ def update_booking_series(id: str, booking_in: BookingReschedule, db: Session = 
     return _series_response(new_series, today)
 
 
-""" Change contact info for booking """
+def _validate_link_and_type(booking_link_id: int, booking_type_id: int | None, db: Session) -> None:
+    """Shared by the two plain-column PUTs. Checked here rather than left to the FK constraints so a
+    bad id answers 404 instead of an unhandled IntegrityError — the constraints are still the
+    guarantee, this only buys the better message.
+
+    An archived link is rejected as a *target* because repointing is the repair path for a booking
+    stranded on one: moving onto another archived link would leave its rules just as inert."""
+    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
+    if not db_link:
+        raise HTTPException(status_code=404, detail="Booking link not found")
+    require_link_not_archived(db_link)
+
+    if booking_type_id is not None:
+        exists = db.query(BookingType).filter(BookingType.id == booking_type_id).exists()
+        if not db.query(exists).scalar():
+            raise HTTPException(status_code=404, detail="Booking type not found")
+
+
+@router.put("/booking-series/{id}", response_model=BookingSeriesResponse)
+def update_booking_series(id: str, booking_in: BookingSeriesUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Plain-column update: contact info, kind label, governing link. Moving a series is
+    POST .../reschedule; nothing here touches Google Calendar.
+
+    Relabelling the series carries to **all** of its occurrences, past ones included. That's the
+    one place a booking's type changes without being edited directly, and it's deliberate: the
+    admin picked the series, so the whole series is the scope they meant. Occurrences not yet
+    generated pick it up on their own, since _ensure_occurrence copies off the series row.
+    """
+    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
+    if not db_series:
+        raise HTTPException(status_code=404, detail="Booking series not found")
+    _validate_link_and_type(booking_in.booking_link_id, booking_in.booking_type_id, db)
+
+    type_changed = db_series.booking_type_id != booking_in.booking_type_id
+    for key, value in booking_in.model_dump().items():
+        setattr(db_series, key, value)
+    if type_changed:
+        db.query(Booking).filter(Booking.series_id == db_series.id).update(
+            {"booking_type_id": booking_in.booking_type_id}, synchronize_session=False
+        )
+    db.commit()
+    db.refresh(db_series)
+    today = datetime.now(ZoneInfo(settings.business_timezone)).date()
+    return _series_response(db_series, today)
+
+
 @router.put("/{ref}", response_model=BookingResponse)
 def update_booking(ref: str, booking_in: BookingUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Plain-column update: contact info, no-show flag, kind label, governing link."""
     db_booking = resolve_ref(ref, db, settings)
+    _validate_link_and_type(booking_in.booking_link_id, booking_in.booking_type_id, db)
+
     for key, value in booking_in.model_dump().items():
         setattr(db_booking, key, value)
     try:
@@ -661,44 +735,30 @@ def update_booking(ref: str, booking_in: BookingUpdate, db: Session = Depends(ge
     return db_booking
 
 
-@router.post("/{ref}/reassign", response_model=BookingResponse)
-def reassign_booking(ref: str, booking_link_id: int, db: Session = Depends(get_db), settings=Depends(get_settings)):
-    """Repoint a booking at a different link — the repair path for a booking stranded on an archived one.
-
-    Nothing automatic ever moves this FK; only this route does. It changes which link's calendar
-    rules govern the booking's future reschedules, and nothing else about the booking."""
-    db_booking = resolve_ref(ref, db, settings)
-    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
-    if not db_link:
-        raise HTTPException(status_code=404, detail="Booking link not found")
-    require_link_not_archived(db_link)
-
-    db_booking.booking_link_id = db_link.id
-    db.commit()
-    db.refresh(db_booking)
-    return db_booking
-
-
-@router.post("/booking-series/{id}/reassign", response_model=BookingSeriesResponse)
-def reassign_booking_series(id: str, booking_link_id: int, db: Session = Depends(get_db)):
-    """Series equivalent of reassign_booking. Occurrences resolve their link through the series."""
-    db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
-    if not db_series:
-        raise HTTPException(status_code=404, detail="Booking series not found")
-    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
-    if not db_link:
-        raise HTTPException(status_code=404, detail="Booking link not found")
-    require_link_not_archived(db_link)
-
-    db_series.booking_link_id = db_link.id
-    db.commit()
-    db.refresh(db_series)
-    return db_series
-
-
 @router.delete("/{ref}/permanent", status_code=204)
 def permanently_delete_booking(ref: str, cascade: bool = False, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Standalone bookings only — a series occurrence can't be hard-deleted.
+
+    The cancelled row *is* the exclusion record: it's what stops _virtual_occurrences regenerating
+    that date. Delete it and the occurrence simply comes back, out of sync with the calendar instance
+    that was cancelled alongside it. Google works the same way — deleting one instance leaves a
+    cancelled exception object behind, and there's no harder delete. Cancel the occurrence, or
+    permanently delete the whole series.
+
+    Checked on the ref rather than the resolved row so a virtual occurrence isn't materialized just
+    to be refused: a series occurrence's public_id is always the composite "{series_id}:{timestamp}".
+    """
+    if ":" in ref:
+        raise HTTPException(
+            status_code=409,
+            detail="Occurrences of a series can't be permanently deleted — cancel it, or permanently delete the whole series.",
+        )
     db_booking = resolve_ref(ref, db, settings)
+    if db_booking.series_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Occurrences of a series can't be permanently deleted — cancel it, or permanently delete the whole series.",
+        )
 
     # A rescheduled booking has a predecessor chain pointing to it via rescheduled_to FK.
     # First call (cascade=False): return 409 so the frontend can show a confirmation modal.
@@ -954,6 +1014,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         public_id=str(uuid4()),
         tutor_id=booking_in.tutor_id,
         booking_link_id=db_series.booking_link_id,
+        booking_type_id=db_series.booking_type_id,
         dtstart=local_start.replace(tzinfo=None),
         dtend=local_end.replace(tzinfo=None),
         until=db_series.until,  # carried forward unchanged - precise recompute needs `count` (not added yet)
@@ -978,6 +1039,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         series_id=new_series.id,
         tutor_id=booking_in.tutor_id,
         booking_link_id=db_series.booking_link_id,
+        booking_type_id=new_series.booking_type_id,
         timezone=booking_in.timezone,
         status="confirmed",
         student_id=db_series.student_id,
@@ -1137,6 +1199,9 @@ def _cancel_booking(db_booking: Booking, db: Session, service) -> Booking:
 
 @router.delete("/{ref}", response_model=BookingResponse)
 def delete_booking(ref: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Soft: sets status='cancelled'. The row survives for cap counting and no-show history —
+    same shape as Stripe and Google Calendar, where DELETE means "remove this from my view" and
+    soft-vs-hard is the server's business. `.../permanent` is the escape hatch."""
     db_booking = resolve_ref(ref, db, settings)
     # Admin path: only the booking's own state is enforced (must still be confirmed) — event-type
     # policy (cancel_mode) and the past-time notice-window floor are booker-facing rules and

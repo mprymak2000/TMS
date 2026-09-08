@@ -1,21 +1,26 @@
 import { Menu } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical } from '@tabler/icons-react'
+import { IconChevronDown, IconChevronUp, IconDotsVertical, IconRepeat } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
-import type { Booking, Tutor, BookingLink } from './types'
+import type { Booking, Tutor, BookingLink, BookingType } from './types'
 import { formatTime, tutorBubbleClass, tutorInitials } from './utils'
 import { useBookingActions } from './useBookingActions'
+import BookingTypePicker from './BookingTypePicker'
 
 interface BookingRowProps {
     booking: Booking
     // Resolved by `.find()` against the roster, which can miss — model that rather than asserting.
     tutor: Tutor | undefined
     bookingLink: BookingLink | undefined
+    bookingType: BookingType | undefined
+    bookingTypes: BookingType[]          // roster, for the picker
+    reloadBookingTypes: () => void
     bookingLinks: BookingLink[]
     expanded: boolean
     onExpand: () => void
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onReviewRequest?: (booking: Booking) => void
+    onBookingPatched?: (booking: Booking) => void
     isCustomer?: boolean
     compact?: boolean
 }
@@ -34,9 +39,12 @@ export const statusConfig = (b: Booking, isPast: boolean) => {
     return { dot: 'bg-emerald-400', text: 'text-emerald-600', name: 'text-gray-800', label: null, chip: '' }
 }
 
-const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, isCustomer = false, compact = false }: BookingRowProps) => {
+const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, reloadBookingTypes, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, onBookingPatched, isCustomer = false, compact = false }: BookingRowProps) => {
     const navigate = useNavigate()
-    const { isPast, menuItems, modals } = useBookingActions(booking, bookingLink, bookingLinks, onRefresh, onError, onReviewRequest)
+    const { isPast, menuItems, modals, handleReclassify } = useBookingActions({
+        booking, bookingLink, bookingLinks, bookingTypes, reloadBookingTypes,
+        onRefresh, onError, onReviewRequest, onBookingPatched,
+    })
     const status = statusConfig(booking, isPast)
     const startDate = new Date(booking.start)
     const dayName = startDate.toLocaleDateString('en-US', { weekday: 'short' })
@@ -86,6 +94,9 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                     <div className={`w-2 h-2 rounded-full shrink-0 ${status.dot}`} />
                     <span className={`flex-1 min-w-0 truncate ml-6 text-sm tabular-nums ${status.text}`}>
                         {formatTime(booking.start)} – {formatTime(booking.end)}
+                        {booking.series_id && (
+                            <IconRepeat size={13} stroke={2.2} className="inline-block ml-1.5 -mt-0.5 text-gray-400" aria-label="Recurring" />
+                        )}
                     </span>
                     <span className={`flex-1 min-w-0 truncate ml-6 text-sm ${status.name}`}>
                         {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {booking.student_first} {booking.student_last}
@@ -95,6 +106,30 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                         {status.label && booking.request?.status === 'pending' && <span className="text-gray-300"> · </span>}
                         {booking.request?.status === 'pending' && (
                             <span className={`font-medium ${isPast ? 'text-red-300' : 'text-amber-500'}`}>Pending</span>
+                        )}
+                    </span>
+                    {/* Kind and source get their own columns. Kind is editable in place — bare
+                        until the row is hovered, so the list doesn't read as a row of inputs. */}
+                    <span className="flex-1 min-w-0 ml-6 text-xs text-gray-500">
+                        {isCustomer ? (
+                            bookingType && (
+                                <>
+                                    <span
+                                        className="inline-block w-2 h-2 rounded-full mr-1.5 align-middle shrink-0 border border-black/5"
+                                        style={{ background: bookingType.color ?? '#d1d5db' }}
+                                    />
+                                    {bookingType.label}
+                                </>
+                            )
+                        ) : (
+                            <BookingTypePicker
+                                variant="inline"
+                                value={booking.booking_type_id}
+                                onChange={handleReclassify}
+                                types={bookingTypes}
+                                onTypesChanged={reloadBookingTypes}
+                                onError={onError}
+                            />
                         )}
                     </span>
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
@@ -113,7 +148,12 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                     {/* date/time block */}
                     <div className="w-20 shrink-0 text-center leading-tight">
                         <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">{dayName}, {monthStr} {dayNum}</div>
-                        <div className="text-sm font-bold text-gray-800 mt-0.5">{formatTime(booking.start)}</div>
+                        <div className="text-sm font-bold text-gray-800 mt-0.5">
+                            {formatTime(booking.start)}
+                            {booking.series_id && (
+                                <IconRepeat size={13} stroke={2.2} className="inline-block ml-1 -mt-0.5 text-gray-400" aria-label="Recurring" />
+                            )}
+                        </div>
                         <div className="text-[10px] text-gray-400 mt-0.5">{formatTime(booking.end)}</div>
                     </div>
 
@@ -131,6 +171,16 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingLinks, expanded, onExp
                             )}
                         </div>
                         <div className="text-xs text-gray-400 mt-0.5">
+                            {bookingType && (
+                                <>
+                                    <span
+                                        className="inline-block w-2 h-2 rounded-full mr-1.5 align-middle border border-black/5"
+                                        style={{ background: bookingType.color ?? '#d1d5db' }}
+                                    />
+                                    <span className="text-gray-500">{bookingType.label}</span>
+                                    <span className="text-gray-300"> · </span>
+                                </>
+                            )}
                             {bookingLink?.slug}
                         </div>
                     </div>

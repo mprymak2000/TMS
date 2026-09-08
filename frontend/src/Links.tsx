@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { Button, Loader, Modal } from '@mantine/core'
 import { IconPlus, IconPencil, IconTrash, IconExternalLink, IconCopy, IconCheck } from '@tabler/icons-react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import type { Tutor, Schedule, BookingLink } from './types'
+import type { Tutor, Schedule, BookingLink, BookingType } from './types'
 import { useToast } from './useToast'
 import { extractError } from './utils'
 import Toast from './Toast'
@@ -38,6 +38,7 @@ const Links = () => {
     const [bookingLinks, setLinks] = useState<BookingLink[]>([])
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [schedules, setSchedules] = useState<Schedule[]>([])
+    const [bookingTypes, setBookingTypes] = useState<BookingType[]>([])
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
     const [loading, setLoading] = useState(false)
 
@@ -51,10 +52,11 @@ const Links = () => {
     const loadData = async () => {
         setLoading(true)
         try {
-            const [bookingLinksRes, tutorsRes, schedulesRes] = await Promise.all([
+            const [bookingLinksRes, tutorsRes, schedulesRes, typesRes] = await Promise.all([
                 fetch(`${import.meta.env.VITE_API_URL}/booking_links`),
                 fetch(`${import.meta.env.VITE_API_URL}/tutors`),
-                fetch(`${import.meta.env.VITE_API_URL}/schedules`)
+                fetch(`${import.meta.env.VITE_API_URL}/schedules`),
+                fetch(`${import.meta.env.VITE_API_URL}/booking_types/`)
             ])
             if (!bookingLinksRes.ok) {
                 const err = await bookingLinksRes.json()
@@ -74,6 +76,7 @@ const Links = () => {
             setLinks(await bookingLinksRes.json())
             setTutors(await tutorsRes.json())
             setSchedules(await schedulesRes.json())
+            if (typesRes.ok) setBookingTypes(await typesRes.json())
         } catch (error) {
             console.error('Error loading data:', error)
             setLoadErrors(prev => ({ ...prev, unknown: 'An unknown error occurred while loading data' }))
@@ -137,7 +140,11 @@ const Links = () => {
 
     const setStatus = async (id: number, action: 'pause' | 'resume') => {
         try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}/${action}`, { method: 'POST' })
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status: action === 'pause' ? 'paused' : 'active' }),
+            })
             if (!res.ok) {
                 showToast(extractError(await res.json(), `Failed to ${action} booking link`), 'error')
                 return
@@ -171,10 +178,17 @@ const Links = () => {
             {/* cards list */}
             <div className="flex flex-col gap-4">
                 {bookingLinks.map(e => (
-                    <div key={e.id} className="bg-white border border-gray-200 rounded-xl p-5">
+                    // Left accent carries the type colour (Linear/Todoist pattern). Always 4px so
+                    // untyped cards keep the same left edge instead of shifting.
+                    <div
+                        key={e.id}
+                        className="bg-white border border-gray-200 rounded-xl p-5 border-l-4"
+                        style={{ borderLeftColor: bookingTypes.find(t => t.id === e.booking_type_id)?.color ?? '#e5e7eb' }}
+                    >
 
                         {/* card header: name, duration badge, recurring badge + edit/delete */}
-                        <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-start justify-between mb-3">
+                            <div className="flex flex-col gap-1">
                             <div className="flex items-center gap-2">
                                 <span className="group/slug inline-flex items-center gap-2.5 mr-5">
                                     <span className="text-lg font-medium text-gray-800 tracking-tight">
@@ -203,6 +217,21 @@ const Links = () => {
                                 {e.recurring && (
                                     <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">Recurring</span>
                                 )}
+                            </div>
+                            {/* the kind this link stamps — distinct from the slug above it, which is
+                                only the URL. Muted so the slug stays the headline. */}
+                            {(() => {
+                                const type = bookingTypes.find(t => t.id === e.booking_type_id)
+                                return type ? (
+                                    <span className="inline-flex items-center gap-1.5 text-sm text-gray-500">
+                                        <span
+                                            className="w-2 h-2 rounded-full shrink-0 border border-black/5"
+                                            style={{ background: type.color ?? '#d1d5db' }}
+                                        />
+                                        {type.label}
+                                    </span>
+                                ) : null
+                            })()}
                             </div>
 
                             {/* edit / delete buttons */}
@@ -260,9 +289,9 @@ const Links = () => {
                             </div>
                         </div>
 
-                        {/* description */}
+                        {/* description — wraps rather than truncating, so the card grows to fit */}
                         {e.description && (
-                            <p className="text-sm text-gray-500 mb-3 truncate">{e.description}</p>
+                            <p className="text-sm text-gray-500 mb-3 whitespace-pre-wrap break-words">{e.description}</p>
                         )}
 
                         {/* tutor rows */}

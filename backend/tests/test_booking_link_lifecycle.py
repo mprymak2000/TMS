@@ -37,8 +37,8 @@ def _make_link(client, availability, **overrides):
 
 def test_pause_and_resume_round_trip(client):
     _, link, _ = _setup(client)
-    assert client.post(f"/booking_links/{link['id']}/pause").json()["status"] == "paused"
-    assert client.post(f"/booking_links/{link['id']}/resume").json()["status"] == "active"
+    assert client.patch(f"/booking_links/{link['id']}", json={"status": "paused"}).json()["status"] == "paused"
+    assert client.patch(f"/booking_links/{link['id']}", json={"status": "active"}).json()["status"] == "active"
 
 
 def test_archive_is_terminal(client):
@@ -47,15 +47,15 @@ def test_archive_is_terminal(client):
     assert archived["status"] == "archived"
     assert archived["archived_at"] is not None
     # no restore: neither resume nor pause can bring it back
-    assert client.post(f"/booking_links/{link['id']}/resume").status_code == 400
-    assert client.post(f"/booking_links/{link['id']}/pause").status_code == 400
+    assert client.patch(f"/booking_links/{link['id']}", json={"status": "active"}).status_code == 409
+    assert client.patch(f"/booking_links/{link['id']}", json={"status": "paused"}).status_code == 409
     assert client.delete(f"/booking_links/{link['id']}").status_code == 409
 
 
 def test_paused_links_stay_listed_archived_do_not(client):
     _, paused, availability = _setup(client)
     archived = _make_link(client, availability, slug="second-link").json()
-    client.post(f"/booking_links/{paused['id']}/pause")
+    client.patch(f"/booking_links/{paused['id']}", json={"status": "paused"})
     client.delete(f"/booking_links/{archived['id']}")
 
     listed = {l["id"] for l in client.get("/booking_links/").json()}
@@ -68,7 +68,7 @@ def test_paused_links_stay_listed_archived_do_not(client):
 
 def test_create_blocked_on_paused_with_its_own_message(client):
     tutor, link, _ = _setup(client)
-    client.post(f"/booking_links/{link['id']}/pause")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "paused"})
     response = _make_booking(client, link, tutor)
     assert response.status_code == 400
     assert "paused" in response.json()["detail"].lower()
@@ -88,7 +88,7 @@ def test_create_blocked_on_archived_with_its_own_message(client):
 def test_reschedule_still_works_on_paused_link(client):
     tutor, link, _ = _setup(client)
     booking = _make_booking(client, link, tutor).json()
-    client.post(f"/booking_links/{link['id']}/pause")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "paused"})
 
     body = {"tutor_id": tutor["id"], "start": "2099-06-17T16:00:00", "end": "2099-06-17T17:30:00",
             "timezone": "America/New_York"}
@@ -123,10 +123,10 @@ def test_link_edit_blocked_only_when_archived(client):
     _, link, availability = _setup(client)
     body = {**booking_link_standalone, "duration_minutes": 45, "availability": availability}
 
-    client.post(f"/booking_links/{link['id']}/pause")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "paused"})
     assert client.put(f"/booking_links/{link['id']}", json=body).status_code == 200
 
-    client.post(f"/booking_links/{link['id']}/resume")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "active"})
     client.delete(f"/booking_links/{link['id']}")
     assert client.put(f"/booking_links/{link['id']}", json=body).status_code == 403
 
@@ -146,7 +146,7 @@ def test_archive_releases_slug_for_reuse(client):
 
 def test_pause_does_not_release_slug(client):
     _, link, availability = _setup(client)
-    client.post(f"/booking_links/{link['id']}/pause")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "paused"})
     assert _make_link(client, availability).status_code == 409
 
 
@@ -155,10 +155,10 @@ def test_slug_lookup_resolves_paused_but_not_archived(client):
     _, link, _ = _setup(client)
     slug = booking_link_standalone["slug"]
 
-    client.post(f"/booking_links/{link['id']}/pause")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "paused"})
     assert client.get(f"/booking_links/slug/{slug}").json()["status"] == "paused"
 
-    client.post(f"/booking_links/{link['id']}/resume")
+    client.patch(f"/booking_links/{link['id']}", json={"status": "active"})
     client.delete(f"/booking_links/{link['id']}")
     assert client.get(f"/booking_links/slug/{slug}").status_code == 404
 
@@ -186,6 +186,22 @@ def test_series_survives_link_archive(client):
 
 # ── REASSIGNMENT: the repair path ──────────────────────────────────────────
 
+def _reassign(client, booking, booking_link_id):
+    """Repointing a booking is a field on the plain PUT, not its own endpoint — so it carries the
+    whole row, same as any other full-replacement update."""
+    return client.put(f"/bookings/{booking['id']}", json={
+        "booking_link_id": booking_link_id,
+        "booking_type_id": booking.get("booking_type_id"),
+        "student_first": booking["student_first"],
+        "student_last": booking["student_last"],
+        "student_email": booking["student_email"],
+        "student_phone": booking["student_phone"],
+        "parent_email": booking["parent_email"],
+        "parent_phone": booking["parent_phone"],
+        "is_no_show": booking["is_no_show"],
+    })
+
+
 def test_reassign_restores_reschedule_after_archive(client):
     tutor, link, availability = _setup(client)
     booking = _make_booking(client, link, tutor).json()
@@ -198,7 +214,7 @@ def test_reassign_restores_reschedule_after_archive(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         assert client.post(f"/bookings/{booking['id']}/reschedule", json=body).status_code == 400
 
-    assert client.post(f"/bookings/{booking['id']}/reassign?booking_link_id={replacement['id']}").status_code == 200
+    assert _reassign(client, booking, replacement["id"]).status_code == 200
 
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         assert client.post(f"/bookings/{booking['id']}/reschedule", json=body).status_code == 200
@@ -210,7 +226,7 @@ def test_cannot_reassign_to_an_archived_link(client):
     dead = _make_link(client, availability, slug="dead-link").json()
     client.delete(f"/booking_links/{dead['id']}")
 
-    response = client.post(f"/bookings/{booking['id']}/reassign?booking_link_id={dead['id']}")
+    response = _reassign(client, booking, dead["id"])
     assert response.status_code == 400
     assert "archived" in response.json()["detail"].lower()
 

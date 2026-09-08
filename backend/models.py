@@ -113,6 +113,22 @@ _ALL_MODES_SQL = "('not_allowed', 'auto', 'auto_window_block', 'auto_window_requ
 # status governs is whether customers can get *slots* from it — new bookings, and reschedules.
 _LINK_STATUSES_SQL = "('active', 'paused', 'archived')"
 
+
+class BookingType(Base):
+    """A name and a color for the kind of thing a booking is. Purely a label — nothing branches on it.
+
+    A link points at one live (the kind it stamps); bookings and series point at one frozen at
+    creation. Pointing rather than copying the string is what makes a rename a correction: editing
+    this row relabels every booking pointing at it, past included, instead of splitting the group
+    into old-name and new-name buckets. Managed entirely from the type picker — no page of its own.
+    """
+    __tablename__ = "booking_types"
+
+    id = Column(Integer, primary_key=True, index=True)
+    label = Column(String, nullable=False, unique=True)
+    color = Column(String, nullable=True)  # hex; null = neutral
+
+
 class BookingLink(Base):
     """A factory bookings are generated from.
 
@@ -161,7 +177,10 @@ class BookingLink(Base):
     reschedule_notice_minutes = Column(Integer, nullable=True)
     #basic info
     slug = Column(String, nullable=False)  # public URL only; uniqueness enforced by the partial index above
-    description = Column(Text, nullable=True)
+    # The kind this link stamps onto what it generates. Live — editing it reaches future bookings
+    # only. Two links may share a type; that's how their bookings group together.
+    booking_type_id = Column(Integer, ForeignKey("booking_types.id", ondelete="SET NULL"), nullable=True)
+    description = Column(String(500), nullable=True)  # bounded — see DESCRIPTION_MAX_LENGTH in schemas
     duration_minutes = Column(Integer, nullable=False)
     min_duration_minutes = Column(Integer, nullable=True)  # null = fixed duration; 0+ = custom duration on
     max_duration_minutes = Column(Integer, nullable=True)
@@ -183,6 +202,7 @@ class BookingLink(Base):
     only_show_first_slot = Column(Boolean, nullable=True)
     interval_minutes = Column(Integer, nullable=True)  # step between slot start times; null = fall back to duration_minutes (slots don't overlap). e.g. 3hr window + 90min session + 30min interval = 3 possible start times
 
+    booking_type = relationship("BookingType")
     availability = relationship("BookingLinkAvailability", back_populates="booking_link", cascade="all, delete-orphan")
 
 
@@ -229,9 +249,11 @@ class BookingSeries(Base):
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
     created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-    tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
-    booking_link_id = Column(Integer, ForeignKey("booking_links.id"), nullable=False)
-    dtstart = Column(DateTime, nullable=False)  # naive local time, not UTC — see ScheduleDay.start_time
+    # Facet keys, filtered on every list request. Postgres doesn't index foreign keys on its own.
+    tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False, index=True)
+    booking_link_id = Column(Integer, ForeignKey("booking_links.id"), nullable=False, index=True)
+    booking_type_id = Column(Integer, ForeignKey("booking_types.id", ondelete="SET NULL"), nullable=True, index=True)
+    dtstart = Column(DateTime, nullable=False, index=True)  # naive local time, not UTC — see ScheduleDay.start_time
     dtend = Column(DateTime, nullable=False)
     status = Column(String, nullable=True)  # 'cancelled' | 'rescheduled' | null (active/finished derived, see is_active)
     until = Column(Date, nullable=True)      # null = indefinite
@@ -248,6 +270,7 @@ class BookingSeries(Base):
 
     tutor = relationship("Tutor", back_populates="series")
     booking_link = relationship("BookingLink")
+    booking_type = relationship("BookingType")
     student_record = relationship("Student")
     bookings = relationship("Booking", back_populates="series")
     request = relationship("BookingRequest", back_populates="series", uselist=False)
@@ -301,14 +324,21 @@ class Booking(Base):
             "student_phone IS NOT NULL OR parent_phone IS NOT NULL",
             name="chk_booking_phone"
         ),
-        UniqueConstraint("series_id", "start", name="uq_booking_series_occurence")
+        UniqueConstraint("series_id", "start", name="uq_booking_series_occurence"),
+        # Matches how every list query reads: filter a time window, order by (start, public_id), seek
+        # from the cursor's tuple. Composite so the ORDER BY needs no sort step at all — with a page
+        # size of 50 the planner walks 50 index entries instead of sorting the table. Leftmost-prefix
+        # means it also serves plain `start` filters, so no separate index on that column.
+        Index("ix_bookings_start_public_id", "start", "public_id"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
     series_id = Column(Integer, ForeignKey("booking_series.id"), nullable=True) # for recurrent bookings (series means every wed at 5pm for 5 months)
-    tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
-    booking_link_id = Column(Integer, ForeignKey("booking_links.id"), nullable=False)
+    # Facet keys — same reasoning as BookingSeries above.
+    tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False, index=True)
+    booking_link_id = Column(Integer, ForeignKey("booking_links.id"), nullable=False, index=True)
+    booking_type_id = Column(Integer, ForeignKey("booking_types.id", ondelete="SET NULL"), nullable=True, index=True)
     start = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
     timezone = Column(String, nullable=False, default="America/New_York")  # booker's timezone — display/email only, all scheduling logic uses UTC
@@ -333,6 +363,7 @@ class Booking(Base):
 
     tutor = relationship("Tutor", back_populates="bookings")
     booking_link = relationship("BookingLink")
+    booking_type = relationship("BookingType")
     series = relationship("BookingSeries", back_populates="bookings")
     student_record = relationship("Student")
     lesson = relationship("Lesson", back_populates="booking", uselist=False)

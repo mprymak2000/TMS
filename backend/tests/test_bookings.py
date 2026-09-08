@@ -454,7 +454,7 @@ def test_permanent_delete_series_cascade(client):
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         original = client.post("/bookings/", json=payload).json()
-        rescheduled = client.put(f"/bookings/booking-series/{original['series_id']}", json={**reschedule_payload, "tutor_id": tutor["id"]}).json()
+        rescheduled = client.post(f"/bookings/booking-series/{original['series_id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]}).json()
         assert client.delete(f"/bookings/booking-series/{rescheduled['id']}/permanent").status_code == 409
         assert client.delete(f"/bookings/booking-series/{rescheduled['id']}/permanent?cascade=true").status_code == 204
     assert client.get(f"/bookings/manage-series/{rescheduled['id']}").status_code == 404
@@ -513,6 +513,7 @@ def test_update_contact(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     response = client.put(f"/bookings/{created['id']}", json={
+        "booking_link_id": booking_link["id"],
         "student_first": "Test",
         "student_last": "Smith",
         "student_email": "new@example.com",
@@ -528,6 +529,7 @@ def test_mark_no_show(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     response = client.put(f"/bookings/{created['id']}", json={
+        "booking_link_id": booking_link["id"],
         "student_first": created["student_first"],
         "student_last": created["student_last"],
         "student_email": created["student_email"],
@@ -586,7 +588,7 @@ def test_reschedule_series_inactive_tutor_rejected(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
         client.put(f"/tutors/{tutor['id']}", json={**tutor_payload, "is_active": False})
-        response = client.put(f"/bookings/booking-series/{created['series_id']}", json={**reschedule_payload, "tutor_id": tutor["id"]})
+        response = client.post(f"/bookings/booking-series/{created['series_id']}/reschedule", json={**reschedule_payload, "tutor_id": tutor["id"]})
     assert response.status_code == 400
 
 
@@ -1318,6 +1320,22 @@ def test_cancel_virtual_occurrence_materializes_it(client):
     assert len(all_bookings) == 2  # occurrence 1 + the newly materialized occurrence 2
 
 
+def test_permanent_delete_rejected_for_series_occurrences(client):
+    """The cancelled row is what suppresses that date — delete it and the occurrence regenerates."""
+    tutor, booking_link = setup_recurring(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        first_booking = client.post("/bookings/", json=payload).json()
+    virtual_ref = _next_occurrence_ref(first_booking)
+
+    # Materialized occurrence 1 and a virtual occurrence 2 are both refused.
+    assert client.delete(f"/bookings/{first_booking['id']}/permanent").status_code == 409
+    assert client.delete(f"/bookings/{virtual_ref}/permanent").status_code == 409
+
+    # And the refusal doesn't materialize the virtual one as a side effect.
+    assert len(_all_bookings()) == 1
+
+
 def test_action_on_virtual_occurrence_is_idempotent(client):
     tutor, booking_link = setup_recurring(client)
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
@@ -1998,7 +2016,7 @@ def test_reschedule_series_to_identical_pattern_rejected(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
         # a different date, but same weekday and same time-of-day — still the same pattern
-        response = client.put(f"/bookings/booking-series/{created['series_id']}", json={
+        response = client.post(f"/bookings/booking-series/{created['series_id']}/reschedule", json={
             "tutor_id": tutor["id"],
             "start": "2099-06-17T16:00:00",
             "end": "2099-06-17T17:30:00",

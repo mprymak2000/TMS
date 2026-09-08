@@ -2,10 +2,11 @@ import { useState, useEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import { Textarea, Switch, NumberInput, Select, Button, Loader, Input, Modal } from '@mantine/core'
 import { IconChevronLeft, IconPlus, IconTrash, IconExternalLink, IconFileDescription, IconClock, IconRepeat, IconUsers, IconBan, IconAdjustmentsHorizontal, IconCreditCard, IconCopy, IconCheck, IconLinkOff } from '@tabler/icons-react'
-import type { Tutor, Schedule, BookingLink } from './types'
+import type { Tutor, Schedule, BookingLink, BookingType } from './types'
 import { extractError } from './utils'
 import { useToast } from './useToast'
 import Toast from './Toast'
+import BookingTypePicker from './BookingTypePicker'
 
 type NoticeUnit = 'minutes' | 'hours' | 'days'
 const NOTICE_UNITS = [
@@ -16,6 +17,9 @@ const NOTICE_UNITS = [
 const unitToMinutes = (unit: NoticeUnit) => unit === 'minutes' ? 1 : unit === 'hours' ? 60 : 1440
 
 // Trailing hyphens survive typing ("my-" en route to "my-link") and are trimmed at save.
+// Mirrors DESCRIPTION_MAX_LENGTH in schemas.py and the String(500) column.
+const DESCRIPTION_MAX_LENGTH = 500
+
 const slugify = (v: string) => v.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-{2,}/g, '-').replace(/^-/, '')
 
 // Frozen prefix inside the URL field — only the slug after it is editable.
@@ -36,6 +40,7 @@ const CANCEL_MODE_OPTIONS = [
 
 interface FormState {
     slug: string
+    bookingTypeId: number | null
     description: string
     recurring: boolean
     recurWeeks: number | null
@@ -84,6 +89,7 @@ interface FormTouched {
 
 const buildInitial = (link: BookingLink | null): FormState => ({
     slug: link?.slug ?? '',
+    bookingTypeId: link?.booking_type_id ?? null,
     description: link?.description ?? '',
     recurring: link?.recurring ?? false,
     recurWeeks: link?.recur_weeks ?? null,
@@ -163,6 +169,7 @@ const LinkPage = () => {
     const isDirty = JSON.stringify(form) !== JSON.stringify(initial)
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [schedules, setSchedules] = useState<Schedule[]>([])
+    const [bookingTypes, setBookingTypes] = useState<BookingType[]>([])
     const [loading, setLoading] = useState(true)
     const [loadError, setLoadError] = useState<string | null>(null)
     const [saving, setSaving] = useState(false)
@@ -177,14 +184,18 @@ const LinkPage = () => {
         const load = async () => {
             setLoading(true)
             try {
-                const [tutorsRes, schedulesRes] = await Promise.all([
+                const [tutorsRes, schedulesRes, typesRes] = await Promise.all([
                     fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                     fetch(`${import.meta.env.VITE_API_URL}/schedules`),
+                    fetch(`${import.meta.env.VITE_API_URL}/booking_types/`),
                 ])
                 if (!tutorsRes.ok || !schedulesRes.ok) { setLoadError('Failed to load data'); return }
-                const [tutorsData, schedulesData]: [Tutor[], Schedule[]] = await Promise.all([tutorsRes.json(), schedulesRes.json()])
+                const [tutorsData, schedulesData]: [Tutor[], Schedule[]] =
+                    await Promise.all([tutorsRes.json(), schedulesRes.json()])
                 setTutors(tutorsData)
                 setSchedules(schedulesData)
+                // Non-fatal: the type picker just starts empty rather than blocking the whole form.
+                if (typesRes.ok) setBookingTypes(await typesRes.json())
                 if (!isNew) {
                     const linkRes = await fetch(`${import.meta.env.VITE_API_URL}/booking_links/${id}`)
                     if (!linkRes.ok) { setLoadError('Booking link not found'); return }
@@ -201,6 +212,15 @@ const LinkPage = () => {
         load()
     }, [id])
 
+    const reloadBookingTypes = async () => {
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_types/`)
+            if (res.ok) setBookingTypes(await res.json())
+        } catch {
+            showToast('Failed to reload types', 'error')
+        }
+    }
+
     const setField = <K extends keyof FormState>(key: K, value: FormState[K]) =>
         setForm(prev => ({ ...prev, [key]: value }))
 
@@ -214,6 +234,7 @@ const LinkPage = () => {
 
     const buildPayload = () => ({
         slug: form.slug.replace(/-+$/, ''),   // trailing hyphen survives typing, not saving
+        booking_type_id: form.bookingTypeId,
         description: form.description.trim() || null,
         recurring: form.recurring,
         recur_weeks: form.recurring ? form.recurWeeks : null,
@@ -441,15 +462,33 @@ const LinkPage = () => {
                                             </button>
                                         </div>
                                     </Input.Wrapper>
+                                    <Input.Wrapper
+                                        label="Type"
+                                        description="Stamped onto bookings this link creates, and what the bookings list groups by. Changing it affects future bookings only."
+                                    >
+                                        <div className="mt-1.5">
+                                            <BookingTypePicker
+                                                value={form.bookingTypeId}
+                                                onChange={v => setField('bookingTypeId', v)}
+                                                types={bookingTypes}
+                                                onTypesChanged={reloadBookingTypes}
+                                                onError={msg => showToast(msg, 'error')}
+                                            />
+                                        </div>
+                                    </Input.Wrapper>
                                     <Textarea
                                         label="Description"
                                         placeholder="What is this booking link for?"
                                         size="sm"
                                         autosize
                                         minRows={2}
+                                        maxLength={DESCRIPTION_MAX_LENGTH}
                                         value={form.description}
                                         onChange={e => setField('description', e.target.value)}
                                     />
+                                    <p className={`text-xs text-right -mt-1 ${form.description.length >= DESCRIPTION_MAX_LENGTH ? 'text-amber-600' : 'text-gray-400'}`}>
+                                        {form.description.length}/{DESCRIPTION_MAX_LENGTH}
+                                    </p>
                                 </div>
                             </Group>
                         )}

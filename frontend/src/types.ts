@@ -69,9 +69,16 @@ export interface BookingLinkAvailability {
 
 export type BookingLinkStatus = 'active' | 'paused' | 'archived'
 
+export interface BookingType {
+  id: number
+  label: string
+  color: string | null
+}
+
 export interface BookingLink {
   id: number
   slug: string
+  booking_type_id: number | null
   status: BookingLinkStatus
   archived_at: string | null
   description: string | null
@@ -110,6 +117,7 @@ export interface Booking {
   series_id: string | null
   tutor_id: number
   booking_link_id: number
+  booking_type_id: number | null
   student_id: number | null
   start: string
   end: string
@@ -134,6 +142,7 @@ export interface BookingSeries {
   id: string
   tutor_id: number
   booking_link_id: number
+  booking_type_id: number | null
   student_id: number | null
   created: string
   last_modified: string
@@ -168,6 +177,12 @@ export interface BookingLinkFacetOption {
 }
 
 // todo: this will be a guestID identifier in the future
+export interface BookingTypeFacetOption {
+  id: number
+  label: string
+  color: string | null
+}
+
 export interface StudentFacetOption {
   first_name: string
   last_name: string
@@ -176,6 +191,7 @@ export interface StudentFacetOption {
 export interface BookingFacets {
   tutors: TutorFacetOption[]
   booking_links: BookingLinkFacetOption[]
+  booking_types: BookingTypeFacetOption[]
   students: StudentFacetOption[]
 }
 

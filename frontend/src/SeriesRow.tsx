@@ -2,10 +2,11 @@ import { useState, useRef, useEffect } from 'react'
 import { Loader, Menu } from '@mantine/core'
 import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconTrash, IconArrowBackUp, IconPlus, IconMinus } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
-import type { Booking, BookingSeries, Tutor, BookingLink } from './types'
-import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf } from './utils'
+import type { Booking, BookingSeries, Tutor, BookingLink, BookingType } from './types'
+import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf, contactPayload } from './utils'
 import { statusConfig } from './BookingRow'
 import { useBookingActions } from './useBookingActions'
+import BookingTypePicker from './BookingTypePicker'
 
 // Fallback page size before the container has been measured (first render, pre-layout).
 const DEFAULT_PAGE_SIZE = 4
@@ -37,7 +38,7 @@ const OccurrenceCard = ({
     onError: (msg: string) => void
 }) => {
     const navigate = useNavigate()
-    const { isPast, menuItems, modals } = useBookingActions(booking, bookingLink, bookingLinks, onRefresh, onError)
+    const { isPast, menuItems, modals } = useBookingActions({ booking, bookingLink, bookingLinks, onRefresh, onError })
     const cfg = statusConfig(booking, isPast)
     // Series-bound booking public_ids always encode their own start time as a trailing unix
     // timestamp (`{series_public_id}:{unix_timestamp}`, real or virtual — see CLAUDE.md) — so the
@@ -177,6 +178,9 @@ interface SeriesRowProps {
     tutor: Tutor | undefined
     tutors: Tutor[]
     bookingLink: BookingLink | undefined
+    bookingTypes: BookingType[]              // roster, for the inline picker
+    reloadBookingTypes: () => void
+    onSeriesPatched?: (series: BookingSeries) => void
     bookingLinks: BookingLink[]
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
@@ -191,7 +195,35 @@ interface SeriesRowProps {
     includeCancelled?: boolean
 }
 
-const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
+const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBookingTypes, onSeriesPatched, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
+    const bookingType = bookingTypes.find(t => t.id === series.booking_type_id)
+
+    // Relabelling a series carries to every occurrence, past included — the backend does the
+    // cascade; picking the series is what says "all of it".
+    const handleReclassify = async (bookingTypeId: number | null) => {
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    booking_link_id: series.booking_link_id,
+                    booking_type_id: bookingTypeId,
+                    ...contactPayload(series),
+                }),
+            })
+            if (!res.ok) {
+                onError(extractError(await res.json(), 'Failed to change type.'))
+                return
+            }
+            const updated = await res.json()
+            if (onSeriesPatched) onSeriesPatched(updated)
+            else onRefresh('Type updated')
+        } catch (error) {
+            console.error(error)
+            onError('Failed to change type.')
+        }
+    }
+
     const navigate = useNavigate()
     const [loaded, setLoaded] = useState(false)
     const [occurrences, setOccurrences] = useState<Booking[]>([])
@@ -286,6 +318,30 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingLinks, onRefresh
                 </span>
                 <span className={`flex-1 min-w-0 truncate ml-6 text-gray-800 transition-all ${expanded ? 'text-base font-medium' : 'text-sm'}`}>
                     {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {series.student_first} {series.student_last}
+                </span>
+                {/* Kind, editable in place. Bare until the row is hovered — same treatment as a
+                    booking row, except changing it here relabels every occurrence. */}
+                <span className="flex-1 min-w-0 ml-6 text-xs text-gray-500" onClick={e => e.stopPropagation()}>
+                    {isCustomer ? (
+                        bookingType && (
+                            <>
+                                <span
+                                    className="inline-block w-2 h-2 rounded-full mr-1.5 align-middle shrink-0 border border-black/5"
+                                    style={{ background: bookingType.color ?? '#d1d5db' }}
+                                />
+                                {bookingType.label}
+                            </>
+                        )
+                    ) : (
+                        <BookingTypePicker
+                            variant="inline"
+                            value={series.booking_type_id}
+                            onChange={handleReclassify}
+                            types={bookingTypes}
+                            onTypesChanged={reloadBookingTypes}
+                            onError={onError}
+                        />
+                    )}
                 </span>
                 <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
                     {bookingLink?.slug}{series.until ? ` · until ${formatDate(series.until)}` : ''}

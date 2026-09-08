@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Loader, Button, Popover, Switch } from '@mantine/core'
 import { IconX, IconChevronDown, IconSortAscending, IconSortDescending } from '@tabler/icons-react'
-import type { Tutor, BookingLink } from './types'
+import type { Tutor, BookingLink, BookingType } from './types'
 
 // Shared toolbar pieces used by every Bookings tab (Schedule/Recurring/Requests) - filters,
 // active-filter chips, sort toggle, and infinite-scroll trigger. Pulled out of any one tab's
@@ -10,6 +10,7 @@ import type { Tutor, BookingLink } from './types'
 export interface BookingFilters {
     tutorIds: string[]
     bookingLinkIds: string[]
+    bookingTypeIds: string[]
     students: string[]
     dateFrom: string | null
     dateTo: string | null
@@ -82,27 +83,33 @@ const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }
 export const ActiveFilterChips = ({
     tutorIds,
     bookingLinkIds,
+    bookingTypeIds,
     students,
     tutors,
     bookingLinks,
+    bookingTypes,
     includeCancelled,
     onTutorRemove,
     onBookingLinkRemove,
+    onBookingTypeRemove,
     onStudentRemove,
     onIncludeCancelledRemove,
 }: {
     tutorIds: string[]
     bookingLinkIds: string[]
+    bookingTypeIds: string[]
     students: string[]
     tutors: Tutor[]
     bookingLinks: BookingLink[]
+    bookingTypes: BookingType[]
     includeCancelled: boolean
     onTutorRemove: (id: string) => void
     onBookingLinkRemove: (id: string) => void
+    onBookingTypeRemove: (id: string) => void
     onStudentRemove: (value: string) => void
     onIncludeCancelledRemove: () => void
 }) => {
-    if (tutorIds.length === 0 && bookingLinkIds.length === 0 && students.length === 0 && includeCancelled) return null
+    if (tutorIds.length === 0 && bookingLinkIds.length === 0 && bookingTypeIds.length === 0 && students.length === 0 && includeCancelled) return null
     return (
         <div className="flex flex-wrap gap-2 mt-3">
             {tutorIds.map(id => (
@@ -117,6 +124,13 @@ export const ActiveFilterChips = ({
                     key={`event-${id}`}
                     label={`Link: ${bookingLinks.find(e => String(e.id) === id)?.slug ?? ''}`}
                     onRemove={() => onBookingLinkRemove(id)}
+                />
+            ))}
+            {bookingTypeIds.map(id => (
+                <FilterChip
+                    key={`type-${id}`}
+                    label={`Type: ${bookingTypes.find(t => String(t.id) === id)?.label ?? ''}`}
+                    onRemove={() => onBookingTypeRemove(id)}
                 />
             ))}
             {students.map(pair => (
@@ -193,6 +207,9 @@ export const FiltersMenu = ({
     bookingLinkOptions,
     bookingLinkSelected,
     onBookingLinkToggle,
+    bookingTypeOptions,
+    bookingTypeSelected,
+    onBookingTypeToggle,
     studentOptions,
     studentSelected,
     onStudentToggle,
@@ -205,6 +222,9 @@ export const FiltersMenu = ({
     bookingLinkOptions: FilterOption[]
     bookingLinkSelected: string[]
     onBookingLinkToggle: (value: string) => void
+    bookingTypeOptions: FilterOption[]
+    bookingTypeSelected: string[]
+    onBookingTypeToggle: (value: string) => void
     studentOptions: FilterOption[]
     studentSelected: string[]
     onStudentToggle: (value: string) => void
@@ -214,8 +234,8 @@ export const FiltersMenu = ({
     const [opened, setOpened] = useState(false)
     // Independent toggles, not a single-open accordion — expanding Students shouldn't collapse
     // Tutors if it's already open.
-    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'bookingLinks' | 'students'>>(new Set())
-    const toggleSection = (key: 'tutors' | 'bookingLinks' | 'students') => {
+    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'bookingLinks' | 'bookingTypes' | 'students'>>(new Set())
+    const toggleSection = (key: 'tutors' | 'bookingLinks' | 'bookingTypes' | 'students') => {
         setExpandedSections(prev => {
             const next = new Set(prev)
             if (next.has(key)) next.delete(key)
@@ -223,7 +243,7 @@ export const FiltersMenu = ({
             return next
         })
     }
-    const activeCount = tutorSelected.length + bookingLinkSelected.length + studentSelected.length + (includeCancelled ? 0 : 1)
+    const activeCount = tutorSelected.length + bookingLinkSelected.length + bookingTypeSelected.length + studentSelected.length + (includeCancelled ? 0 : 1)
 
     return (
         <Popover
@@ -254,6 +274,8 @@ export const FiltersMenu = ({
                     onToggleOption={onTutorToggle}
                 />
                 <div className="border-t border-gray-100" />
+                {/* Two grouping dimensions, deliberately labelled apart: "Links" is what generated
+                    the booking, "Types" is what it was sold as. Several links can share one type. */}
                 <FilterAccordionSection
                     label="Links"
                     options={bookingLinkOptions}
@@ -261,6 +283,15 @@ export const FiltersMenu = ({
                     expanded={expandedSections.has('bookingLinks')}
                     onToggleExpand={() => toggleSection('bookingLinks')}
                     onToggleOption={onBookingLinkToggle}
+                />
+                <div className="border-t border-gray-100" />
+                <FilterAccordionSection
+                    label="Types"
+                    options={bookingTypeOptions}
+                    selected={bookingTypeSelected}
+                    expanded={expandedSections.has('bookingTypes')}
+                    onToggleExpand={() => toggleSection('bookingTypes')}
+                    onToggleOption={onBookingTypeToggle}
                 />
                 <div className="border-t border-gray-100" />
                 <FilterAccordionSection

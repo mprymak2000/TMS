@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import { Modal, Button, Menu, TextInput, Select } from '@mantine/core'
 import { IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
-import type { Booking, BookingLink } from './types'
-import { formatDate, extractError } from './utils'
+import type { Booking, BookingLink, BookingType } from './types'
+import { formatDate, extractError, contactPayload } from './utils'
 
 interface ContactForm {
     studentEmail: string
@@ -15,14 +15,29 @@ interface ContactForm {
 // All the state/handlers/menu-items/modals behind a booking row's "manage" affordance — shared
 // by BookingRow's own dots-menu and SeriesRow's occurrence pills, so both trigger the exact same
 // actions (reschedule/modify contact/no-show/cancel/delete) without duplicating any of this logic.
-export const useBookingActions = (
-    booking: Booking,
-    bookingLink: BookingLink | undefined,   // resolved from the roster, which can miss
-    bookingLinks: BookingLink[],            // the roster, for reassigning off an archived link
-    onRefresh: (msg: string) => void,
-    onError: (msg: string) => void,
-    onReviewRequest?: (booking: Booking) => void,
-) => {
+interface UseBookingActionsOptions {
+    booking: Booking
+    bookingLink: BookingLink | undefined    // resolved from the roster, which can miss
+    bookingLinks: BookingLink[]             // the roster, for reassigning off an archived link
+    bookingTypes?: BookingType[]            // the roster, for the type picker
+    reloadBookingTypes?: () => void
+    onRefresh: (msg: string) => void
+    onError: (msg: string) => void
+    onReviewRequest?: (booking: Booking) => void
+    onBookingPatched?: (booking: Booking) => void   // patch one row instead of refetching the list
+}
+
+export const useBookingActions = ({
+    booking,
+    bookingLink,
+    bookingLinks,
+    bookingTypes = [],
+    reloadBookingTypes = () => {},
+    onRefresh,
+    onError,
+    onReviewRequest,
+    onBookingPatched,
+}: UseBookingActionsOptions) => {
     const navigate = useNavigate()
     const [confirmingDelete, setConfirmingDelete] = useState(false)
     const [confirmingPermanentDelete, setConfirmingPermanentDelete] = useState(false)
@@ -53,10 +68,11 @@ export const useBookingActions = (
         if (!reassignTarget) return
         setIsSubmitting(true)
         try {
-            const res = await fetch(
-                `${import.meta.env.VITE_API_URL}/bookings/${booking.id}/reassign?booking_link_id=${reassignTarget}`,
-                { method: 'POST' },
-            )
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...buildPayload(), booking_link_id: Number(reassignTarget) }),
+            })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to reassign booking link'))
                 return
@@ -141,14 +157,43 @@ export const useBookingActions = (
         }
     }
 
+    const handleReclassify = async (bookingTypeId: number | null) => {
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...buildPayload(), booking_type_id: bookingTypeId }),
+            })
+            if (!res.ok) {
+                onError(extractError(await res.json(), 'Failed to change type.'))
+                return
+            }
+            // Patch the one row rather than onRefresh()-ing the whole list. The caller follows up
+            // with a silent revalidation, so the facet options still reconcile — the list just
+            // never gets replaced by a spinner on the way.
+            const updated = await res.json()
+            if (onBookingPatched) onBookingPatched(updated)
+            else onRefresh('Type updated')
+        } catch (error) {
+            console.error(error)
+            onError('Failed to change type.')
+        }
+    }
+
+    // Full-replacement PUT, so every mutable column goes on the wire — including the two FKs, which
+    // is how reassignment and reclassification work now that neither has an endpoint of its own.
     const buildPayload = () => ({
-        student_first: booking.student_first,
-        student_last:  booking.student_last,
-        student_email: contact.studentEmail || null,
-        student_phone: contact.studentPhone || null,
-        parent_email:  contact.parentEmail  || null,
-        parent_phone:  contact.parentPhone  || null,
-        is_no_show:    booking.is_no_show,
+        booking_link_id: booking.booking_link_id,
+        booking_type_id: booking.booking_type_id,
+        // Names come off the row (immutable here); the four editable fields come off the form.
+        ...contactPayload({
+            ...booking,
+            student_email: contact.studentEmail || null,
+            student_phone: contact.studentPhone || null,
+            parent_email:  contact.parentEmail  || null,
+            parent_phone:  contact.parentPhone  || null,
+        }),
+        is_no_show: booking.is_no_show,
     })
 
     const handleNoShow = async () => {
@@ -282,9 +327,13 @@ export const useBookingActions = (
             >
                 {isPast ? 'Mark as cancelled' : 'Cancel booking'}
             </Menu.Item>
-            <Menu.Item leftSection={<IconTrash size={14} />} color="red" onClick={() => setConfirmingPermanentDelete(true)}>
-                Delete permanently
-            </Menu.Item>
+            {/* Standalone only. A cancelled occurrence row is what stops the series regenerating
+                that date, so hard-deleting it would just bring the occurrence back. */}
+            {!booking.series_id && (
+                <Menu.Item leftSection={<IconTrash size={14} />} color="red" onClick={() => setConfirmingPermanentDelete(true)}>
+                    Delete permanently
+                </Menu.Item>
+            )}
         </>
     )
 
@@ -359,5 +408,5 @@ export const useBookingActions = (
         </>
     )
 
-    return { isPast, menuItems, modals }
+    return { isPast, menuItems, modals, handleReclassify, bookingTypes, reloadBookingTypes }
 }

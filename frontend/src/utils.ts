@@ -42,6 +42,26 @@ const TUTOR_BUBBLE_COLORS = [
 export const tutorBubbleClass = (t: { id: number }) =>
     TUTOR_BUBBLE_COLORS[t.id % TUTOR_BUBBLE_COLORS.length]
 
+// The contact columns, identical on Booking and BookingSeries. Both plain-column PUTs are
+// full-replacement, so they send all six.
+export interface ContactFields {
+    student_first: string
+    student_last: string
+    student_email: string | null
+    student_phone: string | null
+    parent_email: string | null
+    parent_phone: string | null
+}
+
+export const contactPayload = (r: ContactFields): ContactFields => ({
+    student_first: r.student_first,
+    student_last:  r.student_last,
+    student_email: r.student_email,
+    student_phone: r.student_phone,
+    parent_email:  r.parent_email,
+    parent_phone:  r.parent_phone,
+})
+
 export const tutorInitials = (t: { first_name: string; last_name: string }) =>
     `${t.first_name[0]}${t.last_name[0]}`.toUpperCase()
 

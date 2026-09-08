@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Outlet, NavLink } from 'react-router-dom'
 import { IconRepeat } from '@tabler/icons-react'
-import type { Tutor, BookingLink } from './types'
+import type { Tutor, BookingLink, BookingType } from './types'
 import { extractError } from './utils'
 import { useToast } from './useToast'
 import Toast from './Toast'
@@ -10,6 +10,8 @@ import Toast from './Toast'
 export interface BookingsOutletContext {
     tutors: Tutor[]
     bookingLinks: BookingLink[]
+    bookingTypes: BookingType[]
+    reloadBookingTypes: () => void   // the picker is the CRUD, so rows can add/rename/delete types
     isLoadingRoster: boolean
     showToast: (msg: string, type?: 'success' | 'error') => void
 }
@@ -25,6 +27,7 @@ const BookingsLayout = () => {
     // STATE
     const [tutors, setTutors] = useState<Tutor[]>([])
     const [bookingLinks, setLinks] = useState<BookingLink[]>([])
+    const [bookingTypes, setBookingTypes] = useState<BookingType[]>([])
     const [isLoadingRoster, setIsLoadingRoster] = useState(false)
     const [rosterError, setRosterError] = useState<string | null>(null)
     const { toast, showToast } = useToast()
@@ -34,16 +37,19 @@ const BookingsLayout = () => {
         const loadRoster = async () => {
             setIsLoadingRoster(true)
             try {
-                const [tutorResponse, bookingLinkResponse] = await Promise.all([
+                const [tutorResponse, bookingLinkResponse, bookingTypeResponse] = await Promise.all([
                     fetch(`${import.meta.env.VITE_API_URL}/tutors`),
                     // include_archived — bookings keep pointing at their link forever, so the roster
                     // has to resolve retired ones or every row that came from one renders blank.
                     fetch(`${import.meta.env.VITE_API_URL}/booking_links/?include_archived=true`),
+                    fetch(`${import.meta.env.VITE_API_URL}/booking_types/`),
                 ])
                 if (!tutorResponse.ok) { setRosterError(extractError(await tutorResponse.json(), 'Failed to load tutors.')); return }
                 if (!bookingLinkResponse.ok) { setRosterError(extractError(await bookingLinkResponse.json(), 'Failed to load booking links.')); return }
                 setTutors(await tutorResponse.json())
                 setLinks(await bookingLinkResponse.json())
+                // Non-fatal: rows fall back to showing no type rather than the list failing to render.
+                if (bookingTypeResponse.ok) setBookingTypes(await bookingTypeResponse.json())
             } catch (error) {
                 console.error(error)
                 setRosterError('An unknown error occurred while loading tutors/booking links.')
@@ -53,6 +59,21 @@ const BookingsLayout = () => {
         }
         loadRoster()
     }, [])
+
+    // Types are editable from the picker wherever it appears, so any tab can invalidate this roster.
+    const reloadBookingTypes = async () => {
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/booking_types/`)
+            if (!res.ok) {
+                showToast(extractError(await res.json(), 'Failed to reload booking types'), 'error')
+                return
+            }
+            setBookingTypes(await res.json())
+        } catch (error) {
+            console.error(error)
+            showToast('An unknown error occurred while reloading booking types', 'error')
+        }
+    }
 
     // regardless of path (/booking/*) the below is rendered. In the Outlet section, the correct subpath gets rendered
     // Context (BookingOutletContext, which is the loaded data on mount with useEffect) is passed to the Outlet so that 
@@ -85,7 +106,7 @@ const BookingsLayout = () => {
             </div>
             {/* OUTLET — whichever tab matched the URL renders here */}
             <div className="flex-1 min-h-0">
-                <Outlet context={{ tutors, bookingLinks, isLoadingRoster, showToast } satisfies BookingsOutletContext} />
+                <Outlet context={{ tutors, bookingLinks, bookingTypes, reloadBookingTypes, isLoadingRoster, showToast } satisfies BookingsOutletContext} />
             </div>
             {/* TOAST */}
             <Toast toast={toast} />

@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from datetime import date, time, datetime, timezone
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 #todo: consider patch instead of put for updates, as it allows for partial updates and is more flexible but more complex to implement. put requires the entire object to be sent, which can be simpler but less efficient for updates that only change a few fields.
@@ -198,9 +199,48 @@ class TutorAvailability(BaseModel):
     schedule_id: int
 
 
+_HEX_COLOR_PATTERN = r'^#[0-9a-fA-F]{6}$'
+
+
+class BookingLinkStatusUpdate(BaseModel):
+    """Pause and resume only. Archiving is DELETE — it's the irreversible "get rid of this" action,
+    so it stays out of reach of a status write."""
+    status: Literal["active", "paused"]
+
+
+class BookingTypeCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=60)
+    color: str | None = Field(default=None, pattern=_HEX_COLOR_PATTERN)
+
+
+class BookingTypeUpdate(BaseModel):
+    label: str = Field(min_length=1, max_length=60)
+    color: str | None = Field(default=None, pattern=_HEX_COLOR_PATTERN)
+
+
+class BookingTypeResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    label: str
+    color: str | None = None
+
+
+class BookingTypeUsage(BaseModel):
+    """Counted on delete-click only, never on picker open. Split by referrer because the losses differ:
+    a booking or series loses a label off a historical record, a link just needs a new type picked."""
+    links: int
+    bookings: int
+    series: int
+
+
 # Lowercase alphanumerics with single hyphens between — a slug goes straight into a URL, and the
 # frontend's slugify is a convenience, not a guarantee.
 _SLUG_PATTERN = r'^[a-z0-9]+(?:-[a-z0-9]+)*$'
+
+# Matches the String(500) column. Bounded because it renders on the public booking page and into
+# calendar invites; 500 is the common ceiling for a short description field (Stripe uses the same).
+DESCRIPTION_MAX_LENGTH = 500
 
 _VALID_MODES = ('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')
 _WINDOW_MODES = ('auto_window_block', 'auto_window_request', 'request_window')
@@ -262,7 +302,8 @@ def _validate_recurrence(recur_weeks, expires_on, booker_can_set_recur_until):
 
 class BookingLinkCreate(BaseModel):
     slug: str = Field(pattern=_SLUG_PATTERN, max_length=100)
-    description: str | None = None
+    booking_type_id: int | None = None
+    description: str | None = Field(default=None, max_length=DESCRIPTION_MAX_LENGTH)
     recurring: bool = True
     duration_minutes: int
     min_duration_minutes: int | None = None
@@ -306,7 +347,8 @@ class BookingLinkCreate(BaseModel):
 # same as Create — all fields are mutable
 class BookingLinkUpdate(BaseModel):
     slug: str = Field(pattern=_SLUG_PATTERN, max_length=100)
-    description: str | None = None
+    booking_type_id: int | None = None
+    description: str | None = Field(default=None, max_length=DESCRIPTION_MAX_LENGTH)
     recurring: bool = True
     duration_minutes: int
     min_duration_minutes: int | None = None
@@ -352,6 +394,7 @@ class BookingLinkResponse(BaseModel):
 
     id: int
     slug: str
+    booking_type_id: int | None = None
     status: str
     archived_at: datetime | None = None
     description: str | None = None
@@ -447,6 +490,7 @@ class BookingResponse(BaseModel):
     series_id: str | None = Field(default=None, validation_alias="series_public_id")
     tutor_id: int
     booking_link_id: int
+    booking_type_id: int | None = None
     student_id: int | None = None
     start: datetime
     end: datetime
@@ -474,6 +518,7 @@ class BookingSeriesResponse(BaseModel):
     id: str = Field(validation_alias="public_id")
     tutor_id: int
     booking_link_id: int
+    booking_type_id: int | None = None
     student_id: int | None = None
     created: datetime
     last_modified: datetime
@@ -539,7 +584,12 @@ class BookingCreate(BaseModel):
         return self
 
 
+# Plain-column updates. Everything here is a column write with at most a validation — no side
+# effects, no new rows. Anything that creates a resource or runs a calendar saga gets its own route
+# (see reschedule), so these never have to branch on which fields changed.
 class BookingUpdate(BaseModel):
+    booking_link_id: int         # which link's rules govern future reschedules; rejects archived
+    booking_type_id: int | None = None  # null clears the kind label — it's optional
     student_first: str
     student_last: str
     student_email: str | None = None
@@ -547,6 +597,28 @@ class BookingUpdate(BaseModel):
     parent_email: str | None = None
     parent_phone: str | None = None
     is_no_show: bool = False
+
+    @model_validator(mode="after")
+    def validate_contact(self):
+        if self.student_email is None and self.parent_email is None:
+            raise ValueError("at least one of student_email or parent_email is required")
+        if self.student_phone is None and self.parent_phone is None:
+            raise ValueError("at least one of student_phone or parent_phone is required")
+        return self
+
+
+class BookingSeriesUpdate(BaseModel):
+    """The series equivalent of BookingUpdate, which a series never had — its bare PUT was the
+    reschedule saga until that moved to POST .../reschedule. Excludes dtstart/dtend deliberately:
+    moving a series creates a new row, so it can't be a PUT."""
+    booking_link_id: int
+    booking_type_id: int | None = None
+    student_first: str
+    student_last: str
+    student_email: str | None = None
+    student_phone: str | None = None
+    parent_email: str | None = None
+    parent_phone: str | None = None
 
     @model_validator(mode="after")
     def validate_contact(self):
@@ -591,6 +663,12 @@ class BookingLinkFacetOption(BaseModel):
     slug: str
 
 
+class BookingTypeFacetOption(BaseModel):
+    id: int
+    label: str
+    color: str | None = None
+
+
 class StudentFacetOption(BaseModel):
     first_name: str
     last_name: str
@@ -599,6 +677,7 @@ class StudentFacetOption(BaseModel):
 class BookingFacets(BaseModel):
     tutors: list[TutorFacetOption]
     booking_links: list[BookingLinkFacetOption]
+    booking_types: list[BookingTypeFacetOption]
     students: list[StudentFacetOption]
 
 

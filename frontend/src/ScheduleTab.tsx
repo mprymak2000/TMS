@@ -4,7 +4,7 @@ import { TextInput, Loader, Button, Modal, Popover } from '@mantine/core'
 import { DatePicker } from '@mantine/dates'
 import { IconSearch, IconChevronLeft, IconChevronRight } from '@tabler/icons-react'
 import type { ReactNode } from 'react'
-import type { Booking, TutorFacetOption, BookingLinkFacetOption, StudentFacetOption } from './types'
+import type { Booking, TutorFacetOption, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption } from './types'
 import { extractError, formatDate, formatTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, parseLocalDateStr } from './utils'
 import BookingRow from './BookingRow'
 import type { BookingsOutletContext } from './BookingsLayout'
@@ -325,7 +325,7 @@ const ScopeSwitcher = ({
 
 const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // shared context (from BookingsLayout)
-    const { tutors, bookingLinks, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
+    const { tutors, bookingLinks, bookingTypes, reloadBookingTypes, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
 
     // ---- STATE ----
     const [email] = useState('')
@@ -334,6 +334,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const [bookings, setBookings] = useState<Booking[]>([])
     const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
     const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
+    const [bookingTypeFacetOptions, setBookingTypeFacetOptions] = useState<BookingTypeFacetOption[]>([])
     const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
     const [isLoading, setIsLoading] = useState(false)
@@ -348,7 +349,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // Client side display order, does not influence backend fetch order (load more still gets future dates, despite them now being on the bottom)
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>(() => ({
-        tutorIds: [], bookingLinkIds: [], students: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
         ...periodBounds('week', new Date()),
     }))
 
@@ -367,6 +368,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const loadBookings = async ({
         tutorIds = filters.tutorIds,
         bookingLinkIds = filters.bookingLinkIds,
+        bookingTypeIds = filters.bookingTypeIds,
         students = filters.students,
         dateFrom = filters.dateFrom,
         dateTo = filters.dateTo,
@@ -375,9 +377,11 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         emailFilter,
         cursor: cursorParam = null,
         append = false,
+        silent = false,
     }: {
         tutorIds?: string[]
         bookingLinkIds?: string[]
+        bookingTypeIds?: string[]
         students?: string[]
         dateFrom?: string | null
         dateTo?: string | null
@@ -386,6 +390,9 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         emailFilter?: string
         cursor?: string | null
         append?: boolean
+        // Background revalidation after an inline edit — skips the loading flag so the list
+        // isn't replaced by a spinner; only genuinely-changed rows re-render.
+        silent?: boolean
     } = {}) => {
         const timeMin = dateFrom ? `${dateFrom}T00:00:00` : undefined
         const timeMax = dateTo ? `${dateTo}T23:59:59` : undefined
@@ -396,7 +403,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         const pageSize = isRange ? PAGE_SIZE : undefined
         // can be loading on mount or be called to load more data from backend and append... set correct loading state
         if (append) setIsLoadingMore(true)
-        else setIsLoading(true)
+        else if (!silent) setIsLoading(true)
         try {
             const base = `${import.meta.env.VITE_API_URL}/bookings/`
             const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
@@ -405,12 +412,13 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             const orderParam = `&order=${fetchOrder}`
             const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
             const bookingLinkParams = bookingLinkIds.map(id => `&booking_link_ids=${id}`).join('')
+            const bookingTypeParams = bookingTypeIds.map(id => `&booking_type_ids=${id}`).join('')
             const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
             const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
             const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
             const cursorParamStr = cursorParam ? `&cursor=${encodeURIComponent(cursorParam)}` : ''
 
-            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${bookingLinkParams}${studentParams}${includeCancelledParam}${emailParam}`)
+            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${bookingLinkParams}${bookingTypeParams}${studentParams}${includeCancelledParam}${emailParam}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load bookings.') }))
@@ -422,6 +430,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             // filter options
             setTutorFacetOptions(body.facets.tutors)
             setBookingLinkFacetOptions(body.facets.booking_links)
+            setBookingTypeFacetOptions(body.facets.booking_types)
             setStudentFacetOptions(body.facets.students)
             // pagination
             setCursor(body.next_cursor)
@@ -530,6 +539,12 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         loadBookings({ emailFilter: isCustomer ? email : undefined, bookingLinkIds: next })
     }
 
+    const handleBookingTypeFilterToggle = (id: string) => {
+        const next = filters.bookingTypeIds.includes(id) ? filters.bookingTypeIds.filter(x => x !== id) : [...filters.bookingTypeIds, id]
+        setFilters(f => ({ ...f, bookingTypeIds: next }))
+        loadBookings({ emailFilter: isCustomer ? email : undefined, bookingTypeIds: next })
+    }
+
     const handleStudentFilterToggle = (value: string) => {
         const next = filters.students.includes(value) ? filters.students.filter(x => x !== value) : [...filters.students, value]
         setFilters(f => ({ ...f, students: next }))
@@ -635,6 +650,9 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     bookingLinkOptions={bookingLinkFacetOptions.map(e => ({ value: String(e.id), label: e.slug }))}
                                     bookingLinkSelected={filters.bookingLinkIds}
                                     onBookingLinkToggle={handleBookingLinkFilterToggle}
+                                    bookingTypeOptions={bookingTypeFacetOptions.map(t => ({ value: String(t.id), label: t.label }))}
+                                    bookingTypeSelected={filters.bookingTypeIds}
+                                    onBookingTypeToggle={handleBookingTypeFilterToggle}
                                     studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
                                     studentSelected={filters.students}
                                     onStudentToggle={handleStudentFilterToggle}
@@ -650,12 +668,15 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     <ActiveFilterChips
                         tutorIds={filters.tutorIds}
                         bookingLinkIds={filters.bookingLinkIds}
+                        bookingTypeIds={filters.bookingTypeIds}
                         students={filters.students}
                         tutors={tutors}
                         bookingLinks={bookingLinks}
+                        bookingTypes={bookingTypes}
                         includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onBookingLinkRemove={handleBookingLinkFilterToggle}
+                        onBookingTypeRemove={handleBookingTypeFilterToggle}
                         onStudentRemove={handleStudentFilterToggle}
                         onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
@@ -702,6 +723,15 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                 booking={b}
                                                 tutor={tutors.find(t => t.id === b.tutor_id)}
                                                 bookingLink={bookingLinks.find(e => e.id === b.booking_link_id)}
+                                                bookingType={bookingTypes.find(t => t.id === b.booking_type_id)}
+                                                bookingTypes={bookingTypes}
+                                                reloadBookingTypes={reloadBookingTypes}
+                                                onBookingPatched={updated => {
+                                                    // Optimistic: the row updates instantly, then a
+                                                    // silent refetch reconciles the facet options.
+                                                    setBookings(prev => prev.map(x => x.id === updated.id ? updated : x))
+                                                    loadBookings({ emailFilter: isCustomer ? email : undefined, silent: true })
+                                                }}
                                                 bookingLinks={bookingLinks}
                                                 expanded={expandedId === b.id}
                                                 onExpand={() => setExpandedId(expandedId === b.id ? null : b.id)}

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 from database import get_db
 from models import BookingLink, BookingLinkAvailability, Booking, BookingSeries
-from schemas import BookingLinkCreate, BookingLinkUpdate, BookingLinkResponse
+from schemas import BookingLinkCreate, BookingLinkUpdate, BookingLinkResponse, BookingLinkStatusUpdate
 from booking_utils import active_series_filter
 
 router = APIRouter(prefix="/booking_links", tags=["booking_links"])
@@ -41,7 +41,7 @@ def get_booking_link_by_slug(slug: str, db: Session = Depends(get_db)):
     db_link = db.query(BookingLink).filter(
         BookingLink.slug == slug, BookingLink.status != "archived"
     ).first()
-    if not db_link:
+    if not  db_link:
         raise HTTPException(status_code=404, detail="Booking link not found")
     return db_link
 
@@ -115,54 +115,44 @@ def update_booking_link(booking_link_id: int, link_in: BookingLinkUpdate, db: Se
     return db_link
 
 
-@router.delete("/{booking_link_id:int}", response_model=BookingLinkResponse)
-def archive_booking_link(booking_link_id: int, db: Session = Depends(get_db)):
-    """Archive is the only delete — there is no hard delete at any child count.
+_ARCHIVED_REFUSALS = {
+    "paused": "This link is archived and can't be paused.",
+    "active": "This link is archived and can't be reactivated. Make a new one — the slug is free to reuse.",
+}
 
-    The row lives forever so `booking_link_id` never dangles, which is what keeps a link's bookings
-    groupable and, more importantly, bulk-reassignable to a live link. Permanent in behavior: no
-    restore. A booking stranded on an archived link is rescued by reassigning *the booking*, never
-    by reviving the link.
-    """
+
+@router.patch("/{booking_link_id:int}", response_model=BookingLinkResponse)
+def set_booking_link_status(booking_link_id: int, status_in: BookingLinkStatusUpdate, db: Session = Depends(get_db)):
+    """Pause and resume — reversible visibility. Archiving is DELETE."""
     db_link = db.query(BookingLink).options(joinedload(BookingLink.availability)).filter(
         BookingLink.id == booking_link_id
     ).first()
     if not db_link:
         raise HTTPException(status_code=404, detail="Booking link not found")
     if db_link.status == "archived":
-        raise HTTPException(status_code=409, detail="Booking link is already archived")
+        raise HTTPException(status_code=409, detail=_ARCHIVED_REFUSALS[status_in.status])
 
-    db_link.status = "archived"
-    db_link.archived_at = datetime.now(UTC)
+    db_link.status = status_in.status
     db.commit()
     db.refresh(db_link)
     return db_link
 
 
-@router.post("/{booking_link_id:int}/pause", response_model=BookingLinkResponse)
-def pause_booking_link(booking_link_id: int, db: Session = Depends(get_db)):
-    """Stop taking new bookings, reversibly. Unlike archive, calendar rules stay live and editable,
-    so existing bookings can still be rescheduled and series keep running untouched."""
-    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
+@router.delete("/{booking_link_id:int}", response_model=BookingLinkResponse)
+def archive_booking_link(booking_link_id: int, db: Session = Depends(get_db)):
+    """Soft: sets status='archived'. There is no hard delete at any child count — the row lives
+    forever so booking_link_id never dangles, which keeps a link's bookings groupable and
+    bulk-reassignable. Terminal, no restore."""
+    db_link = db.query(BookingLink).options(joinedload(BookingLink.availability)).filter(
+        BookingLink.id == booking_link_id
+    ).first()
     if not db_link:
         raise HTTPException(status_code=404, detail="Booking link not found")
     if db_link.status == "archived":
-        raise HTTPException(status_code=400, detail="Archived booking links cannot be paused")
-    db_link.status = "paused"
-    db.commit()
-    db.refresh(db_link)
-    return db_link
+        raise HTTPException(status_code=409, detail="This link is already archived.")
 
-
-@router.post("/{booking_link_id:int}/resume", response_model=BookingLinkResponse)
-def resume_booking_link(booking_link_id: int, db: Session = Depends(get_db)):
-    """Undo a pause. Only paused links can resume — archive is terminal."""
-    db_link = db.query(BookingLink).filter(BookingLink.id == booking_link_id).first()
-    if not db_link:
-        raise HTTPException(status_code=404, detail="Booking link not found")
-    if db_link.status != "paused":
-        raise HTTPException(status_code=400, detail="Only paused booking links can be resumed")
-    db_link.status = "active"
+    db_link.status = "archived"
+    db_link.archived_at = datetime.now(UTC)
     db.commit()
     db.refresh(db_link)
     return db_link
