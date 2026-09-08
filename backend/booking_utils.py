@@ -1,11 +1,11 @@
 import base64
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 import hashlib
 import json
 from zoneinfo import ZoneInfo
-from sqlalchemy import and_, func, or_, tuple_
+from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.orm import Session
-from models import Booking, BookingSeries, BookingLink, BookingType, Tutor
+from models import Booking, BookingSeries, BookingLink, BookingLinkAvailability, BookingType, Tutor, FREQ_DAYS
 from schemas import BookingFacets, BookingResponse, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption, TutorFacetOption
 from policy import get_cancel_action, get_reschedule_action
 from fastapi import HTTPException
@@ -24,6 +24,56 @@ def _to_local_date(dt: datetime, tz: ZoneInfo) -> date:
     return dt_utc.astimezone(tz).date()
 
 
+## -------------- Recurrence rule (freq/interval/until/count) -------------- ##
+# until and count are mutually exclusive per RFC5545. Everything that needs to reason about where a
+# series ends goes through one of the three helpers below rather than reading the columns directly.
+
+def series_step(series: BookingSeries) -> timedelta:
+    """Time between consecutive occurrences of a series' rule."""
+    return timedelta(days=series.interval * FREQ_DAYS[series.freq])
+
+
+def is_indefinite(series: BookingSeries) -> bool:
+    """Python-side equivalent of indefinite_series_filter, for a single already-loaded series."""
+    return series.until is None and series.count is None
+
+
+def series_last_date(series: BookingSeries) -> date | None:
+    """Last local date the rule can generate on, or None if indefinite.
+
+    count is an arithmetic progression from dtstart, so it resolves to a date rather than needing an
+    occurrence tally."""
+    if series.count is not None:
+        return series.dtstart.date() + (series.count - 1) * series_step(series)
+    return series.until
+
+
+def build_rrule(freq: str, interval: int, until: date | datetime | None = None,
+                count: int | None = None, tz: ZoneInfo | None = None) -> str:
+    """iCal RRULE line for a recurrence. Emits COUNT or UNTIL, never both.
+
+    UNTIL is an absolute instant in UTC, which RFC5545 requires whenever DTSTART is a date-time
+    (ours always is). So a `date` until — "runs through this day" — resolves to the END of that day
+    in `tz`, then converts: Dec 9 in America/New_York is 20261210T045959Z, NOT 20261209T235959Z.
+    That naive form is Dec 9 18:59 local and would drop a 7pm session that evening.
+
+    A datetime `until` is already an instant (a mid-day truncation) and only gets converted to UTC."""
+    rrule = f"RRULE:FREQ={freq}"
+    if interval != 1:
+        rrule += f";INTERVAL={interval}"
+    if count is not None:
+        rrule += f";COUNT={count}"
+    elif until is not None:
+        if isinstance(until, datetime):  # checked first — datetime is a subclass of date
+            until_utc = until.astimezone(UTC)
+        else:
+            if tz is None:
+                raise ValueError("build_rrule: a date `until` needs tz to resolve to an instant")
+            until_utc = datetime.combine(until, time(23, 59, 59), tzinfo=tz).astimezone(UTC)
+        rrule += f";UNTIL={until_utc.strftime('%Y%m%dT%H%M%SZ')}"
+    return rrule
+
+
 def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, settings) -> Booking:
     """Ensure a specific occurrence of a series exists. Returns existing or newly created Booking.
 
@@ -38,9 +88,13 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
     if series.status in ('cancelled', 'rescheduled'):
         raise ValueError("Cannot materialize an occurrence for a cancelled or rescheduled series")
     start_local = start_utc.astimezone(tz)
-    if series.until is not None and start_local.date() > series.until:
-        raise ValueError("Datetime is past this series' until date")
-    if start_local.weekday() != series.dtstart.weekday() or start_local.time() != series.dtstart.time():
+    last_date = series_last_date(series)
+    if last_date is not None and start_local.date() > last_date:
+        raise ValueError("Datetime is past the end of this series")
+    # Must land exactly on the rule's grid: a whole number of steps from dtstart, same time of day.
+    # Matching weekday alone would let an off-week date through once interval > 1.
+    days_from_start = (start_local.date() - series.dtstart.date()).days
+    if days_from_start % series_step(series).days != 0 or start_local.time() != series.dtstart.time():
         raise ValueError("Datetime does not match series schedule")
     earliest = db.query(func.min(Booking.start)).filter(Booking.series_id == series.id).scalar()
     if earliest is not None:
@@ -86,6 +140,46 @@ def require_link_bookable(link) -> None:
         raise HTTPException(status_code=400, detail="This booking link is no longer offered.")
 
 
+def require_slot_in_schedule(db: Session, link, tutor_id: int, start_utc: datetime, end_utc: datetime) -> None:
+    """The requested slot must sit inside the tutor's schedule for this link.
+
+    Every other calendar rule is applied by /available-slots, which runs BEFORE the write and can
+    simply be skipped — a direct POST reaches the router having consulted nothing. This is the write
+    path's own floor, so no slot can be booked on a day the tutor doesn't work.
+
+    Only occurrence 1 is checked: a series repeats on the same weekday and time, so if the first
+    lands inside the schedule every later one does too."""
+    availability = db.query(BookingLinkAvailability).filter(
+        BookingLinkAvailability.booking_link_id == link.id,
+        BookingLinkAvailability.tutor_id == tutor_id,
+    ).first()
+    if availability is None:
+        raise HTTPException(status_code=400, detail="This tutor does not host this booking link")
+
+    schedule = availability.schedule
+    tz = ZoneInfo(schedule.timezone)
+    start_local = start_utc.astimezone(tz)
+    end_local = end_utc.astimezone(tz)
+
+    for day in schedule.days:
+        # A window ending at/before it starts wraps past midnight, so a slot can belong to a window
+        # anchored on the previous local day.
+        for anchor in (start_local.date(), start_local.date() - timedelta(days=1)):
+            if anchor.weekday() != day.day_of_week:
+                continue
+            window_start = datetime.combine(anchor, day.start_time, tzinfo=tz)
+            window_end = datetime.combine(anchor, day.end_time, tzinfo=tz)
+            if day.end_time <= day.start_time:
+                window_end += timedelta(days=1)
+            if window_start <= start_local and end_local <= window_end:
+                return
+
+    raise HTTPException(
+        status_code=400,
+        detail="That time is outside this tutor's availability for this booking link",
+    )
+
+
 def require_link_not_archived(link) -> None:
     """Anything needing the link's calendar rules to still resolve — reschedules, edits.
 
@@ -98,18 +192,35 @@ def require_link_not_archived(link) -> None:
         )
 
 
+def indefinite_series_filter():
+    """SQL filter expression - a series whose rule has no end, so occurrences must be materialized
+    on a rolling basis rather than all at creation."""
+    return and_(BookingSeries.until == None, BookingSeries.count == None)
+
+
 def active_series_filter(today: date):
-    """SQL filter expression - a series is active unless explicitly cancelled/rescheduled, or its
-    until has passed. Full (customer-facing) definition - admin routes use a narrower status-only
-    check instead, see routers/bookings.py.
+    """SQL filter expression - a series is active unless explicitly cancelled/rescheduled, or it has
+    run out of occurrences. Full (customer-facing) definition - admin routes use a narrower
+    status-only check instead, see routers/bookings.py.
+
+    A finite series is running while any of its occurrences hasn't passed, asked of the bookings
+    rather than of until/count. Every finite occurrence exists from creation, so this is exact - and
+    unlike the rule, it follows an occurrence that was rescheduled past where the rule ends.
 
     Deliberately says nothing about the series' BookingLink: a series is its own booking template
     and keeps running whatever its link's status is."""
+    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
     return and_(
         # NULL NOT IN (...) evaluates to NULL in SQL, not True - a fresh series (status IS NULL)
         # would otherwise get silently filtered out. Handle NULL explicitly instead of relying on notin_.
         or_(BookingSeries.status == None, BookingSeries.status.notin_(['cancelled', 'rescheduled'])),
-        or_(BookingSeries.until == None, BookingSeries.until >= today)
+        or_(
+            indefinite_series_filter(),
+            select(Booking.id).where(and_(
+                Booking.series_id == BookingSeries.id,
+                Booking.start >= today_start,
+            )).exists(),
+        ),
     )
 
 
@@ -117,7 +228,9 @@ def is_series_active(series: BookingSeries, today: date) -> bool:
     """Python-side equivalent of active_series_filter, for a single already-loaded series."""
     if series.status in ('cancelled', 'rescheduled'):
         return False
-    return series.until is None or series.until >= today
+    if series.until is None and series.count is None:
+        return True
+    return any(_to_local_date(b.start, ZoneInfo("UTC")) >= today for b in series.bookings)
 
 
 def series_inactive_reason(series: BookingSeries, today: date) -> str:
@@ -127,7 +240,7 @@ def series_inactive_reason(series: BookingSeries, today: date) -> str:
         return "This series has been cancelled"
     if series.status == 'rescheduled':
         return "This series has been rescheduled"
-    if series.until is not None and series.until < today:
+    if series.until is not None or series.count is not None:
         return "This series has ended"
     return "This series is not currently active"  # defensive fallback - shouldn't be reachable
 
@@ -169,9 +282,9 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
     today = datetime.now(tz).date()
     if not is_series_active(series, today):
         raise HTTPException(status_code=400, detail=series_inactive_reason(series, today))
-    if series.until is not None:
-        if _to_local_date(start_utc, tz) > series.until:
-            raise HTTPException(status_code=400, detail="Occurrence is past the end of this series")
+    last_date = series_last_date(series)
+    if last_date is not None and _to_local_date(start_utc, tz) > last_date:
+        raise HTTPException(status_code=400, detail="Occurrence is past the end of this series")
 
     try:
         return _ensure_occurrence(series, start_utc, db, settings)
@@ -189,18 +302,22 @@ def _virtual_occurrences(
         settings,
         cursor: tuple[datetime, str] | None = None, # decoded pagination cursor
     ) -> list[BookingResponse]:
-    """Generate up to `count` virtual occurrences for a series within [time_min, time_max],
+    """Generate up to `count` virtual occurrences for an INDEFINITE series within [time_min, time_max],
     skipping materialized dates and anything at/before `cursor`. Never touches the DB.
 
+    Indefinite only: a bounded series has every occurrence materialized from creation, so it has
+    nothing left to generate. Callers scope with indefinite_series_filter / is_indefinite.
+
     time_min/time_max are optional, mirroring Google's timeMin/timeMax. count=None is only
-    safe when time_max or until bounds the walk - otherwise it never terminates.
+    safe when time_max bounds the walk - otherwise it never terminates.
     Cursor is a decoded (start, public_id) resume point from the client's prior page - resumes
     from there instead of walking from series.dtstart/time_min. Guaranteed to fall within
     [time_min/flor_date, time_max]: decode_cursor rejects a cursor minted under a different time window
     before this function ever sees it.
     """
-    if count is None and time_max is None and series.until is None:
-        raise ValueError("_virtual_occurrences: unbounded walk - series is indefinite and neither count nor time_max is set")
+    assert is_indefinite(series), "_virtual_occurrences only applies to indefinite series"
+    if count is None and time_max is None:
+        raise ValueError("_virtual_occurrences: unbounded walk - neither count nor time_max is set")
 
     tz = ZoneInfo(settings.business_timezone)
     existing_starts = {b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC) for b in series.bookings} # existing materialized occurrences part of series, to skip when generating virtual occurrences
@@ -215,16 +332,13 @@ def _virtual_occurrences(
 
     time_max_date = _to_local_date(time_max, tz) if time_max is not None else None
 
-    # point at the first occurrence in local time, then jump forward by one week (DST safe) and generate occurrence objects
+    # point at the first occurrence in local time, then jump forward one step at a time (DST safe) and generate occurrence objects
     current_date = floor_date
     days_until_next_occurrence = (series.dtstart.weekday() - current_date.weekday()) % 7 # 0 if current_date is already on the right day of week
     current_date += timedelta(days=days_until_next_occurrence) # no-op if days_until_next_occurrence is 0
 
     occurrences = []
     while count is None or len(occurrences) < count:
-        # if series is finite, stop generating occurrences after until - can't have more occurrences
-        if series.until is not None and current_date > series.until:
-            break
         # if upper bound date is set, stop generating occurrences after time_max
         if time_max_date is not None and current_date > time_max_date:
             break
@@ -267,7 +381,7 @@ def _virtual_occurrences(
                     request=None,
                 )
             )
-        current_date += timedelta(days=7)
+        current_date += timedelta(days=series.interval * FREQ_DAYS[series.freq])
     return occurrences
 
 
@@ -424,9 +538,10 @@ def compute_timeline_facets(materialized_base_query, series_base_query, tutor_id
 
     # apply_series_time_scope already dropped series that can't possibly overlap; here we confirm
     # each survivor actually has an occurrence in [time_min, time_max] (count=1 - existence only,
-    # not the full list, since every occurrence of a series shares the same tutor/booking_link/student)
+    # not the full list, since every occurrence of a series shares the same tutor/booking_link/student).
+    # Indefinite only - a bounded series is fully materialized, so it already contributed above.
     if series_base_query is not None:
-        for series in series_base_query.all():
+        for series in series_base_query.filter(indefinite_series_filter()).all():
             if not _virtual_occurrences(series, time_min, time_max, 1, settings):
                 continue
             if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="tutor"):

@@ -113,6 +113,16 @@ _ALL_MODES_SQL = "('not_allowed', 'auto', 'auto_window_block', 'auto_window_requ
 # status governs is whether customers can get *slots* from it — new bookings, and reschedules.
 _LINK_STATUSES_SQL = "('active', 'paused', 'archived')"
 
+# iCal recurrence vocabulary, shared by BookingLink (which configures it) and BookingSeries (which
+# is stamped with it). Days between occurrences is `interval * FREQ_DAYS[freq]` — every occurrence
+# walk derives its step from that, so nothing hardcodes a week.
+# TODO: DAILY and MONTHLY are planned; add them here once their generation paths are covered.
+FREQ_DAYS = {"WEEKLY": 7}
+# Only 1 is offered today. Biweekly and beyond are planned and the arithmetic already handles any N
+# — this tuple is what stops an untested value being stored.
+# TODO: widen as each interval gets tested end to end.
+SUPPORTED_INTERVALS = (1,)
+
 
 class BookingType(Base):
     """A name and a color for the kind of thing a booking is. Purely a label — nothing branches on it.
@@ -159,6 +169,18 @@ class BookingLink(Base):
             f"status IN {_LINK_STATUSES_SQL}",
             name="chk_booking_link_status"
         ),
+        CheckConstraint(
+            f"freq IN ({', '.join(repr(f) for f in FREQ_DAYS)})",
+            name="chk_booking_link_freq",
+        ),
+        CheckConstraint("count IS NULL OR expires_on IS NULL", name="chk_booking_link_not_both_count_and_until"),
+        CheckConstraint("NOT (booker_can_set_recur_until AND booker_can_set_count)", name="chk_booking_link_one_booker_override"),
+        CheckConstraint("expires_on IS NULL OR NOT (booker_can_set_recur_until OR booker_can_set_count)", name="chk_booking_link_fixed_date_no_override"),
+        CheckConstraint("count IS NULL OR NOT booker_can_set_recur_until", name="chk_booking_link_count_override_is_count"),
+        CheckConstraint(
+            f"interval IN ({', '.join(str(i) for i in SUPPORTED_INTERVALS)})",
+            name="chk_booking_link_interval",
+        ),
         # Slug is unique among ACTIVE links only — archiving releases the name for reuse. Both
         # Postgres and SQLite support partial indexes, so tests and prod agree.
         Index(
@@ -186,9 +208,17 @@ class BookingLink(Base):
     max_duration_minutes = Column(Integer, nullable=True)
     # recurrence
     recurring = Column(Boolean, nullable=False, default=True)
-    recur_weeks = Column(Integer, nullable=True)       # mutually exclusive with expires_on; N weeks from booking start date
-    expires_on = Column(Date, nullable=True)           # mutually exclusive with recur_weeks; booker_can_set_recur_until must be false, all series from this type end on this date
+    # The recurrence shape this link stamps onto every series it creates. Only WEEKLY/1 is offered
+    # today — DAILY, MONTHLY and biweekly are planned, and the generation arithmetic already
+    # handles them; the CHECKs and the schema Literal are what hold the line until each is tested.
+    freq = Column(String, nullable=False, default="WEEKLY")
+    interval = Column(Integer, nullable=False, default=1)
+    count = Column(Integer, nullable=True)             # mutually exclusive with expires_on; N occurrences, stamped onto BookingSeries.count
+    expires_on = Column(Date, nullable=True)           # mutually exclusive with count; booker_can_set_recur_until must be false, all series from this type end on this date
+    # Booker picks the end instead of the admin. Exclusive with each other; each only valid for its
+    # own form — until with an indefinite link, count with a count link.
     booker_can_set_recur_until = Column(Boolean, nullable=False, default=False)
+    booker_can_set_count = Column(Boolean, nullable=False, default=False)
     #optional advanced limits
     price = Column(Float, nullable=True)
     # limits 
@@ -244,6 +274,19 @@ class BookingLinkAvailability(Base):
 
 class BookingSeries(Base):
     __tablename__ = "booking_series"
+    __table_args__ = (
+        # Both constrained to what generation is tested for, not to what iCal allows.
+        CheckConstraint(
+            f"freq IN ({', '.join(repr(f) for f in FREQ_DAYS)})",
+            name="chk_booking_series_freq",
+        ),
+        CheckConstraint(
+            f"interval IN ({', '.join(str(i) for i in SUPPORTED_INTERVALS)})",
+            name="chk_booking_series_interval",
+        ),
+        # RFC5545: a rule carries one or the other, never both.
+        CheckConstraint("until IS NULL OR count IS NULL", name="chk_booking_series_not_both_until_and_count"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
@@ -256,7 +299,17 @@ class BookingSeries(Base):
     dtstart = Column(DateTime, nullable=False, index=True)  # naive local time, not UTC — see ScheduleDay.start_time
     dtend = Column(DateTime, nullable=False)
     status = Column(String, nullable=True)  # 'cancelled' | 'rescheduled' | null (active/finished derived, see is_active)
-    until = Column(Date, nullable=True)      # null = indefinite
+    # iCal RRULE shape. until and count are the two mutually exclusive ways to end a recurrence
+    # (RFC5545 forbids both in one rule): until is a fixed date, count is a quota of occurrences.
+    # Both null = indefinite. count counts occurrences of the rule, not attended sessions — a
+    # cancelled occurrence still fills its slot, same as Google.
+    freq = Column(String, nullable=False, default="WEEKLY")      # WEEKLY today; DAILY/MONTHLY planned — see FREQ_DAYS
+    interval = Column(Integer, nullable=False, default=1)        # every N periods; 1 today, biweekly and beyond planned — see SUPPORTED_INTERVALS
+    until = Column(Date, nullable=True)
+    count = Column(Integer, nullable=True)
+    # byday: omitted, derivable from dtstart.weekday() until multi-day-per-series is supported.
+    # Real support needs an array column, not a scalar, so a placeholder now would just be replaced.
+    # wkst: omitted, only defines week boundaries when grouping multi-day recurrence — moot without byday.
     rescheduled_to = Column(Integer, ForeignKey("booking_series.id", ondelete="SET NULL"), nullable=True)
     google_event_id = Column(String, nullable=True) # google calendar series master event
 

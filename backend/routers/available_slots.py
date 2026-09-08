@@ -20,7 +20,7 @@ viewing window:
   - whatever survives every check is a genuinely free, bookable slot
 
 TIME COMPLEXITY
-Let C = candidates in a batch, N = weeks checked (recur_weeks, or weeks to horizon),
+Let C = candidates in a batch, N = weeks checked (the link's count, or weeks to horizon),
 R = active infinite rules for the tutor, B = real busy blocks per week.
 
   Per-candidate walk (naive):  O(C x N x (R + B))
@@ -118,10 +118,29 @@ Display timezone is separate from storage timezone. The frontend converts canoni
 times to the viewer's browser timezone (or a user-selected display timezone) for
 display only. Stored values are never in the viewer's local time.
 
-timedelta(days=7) advances inside run_finite / run_infinite act on datetimes carrying
-ZoneInfo — they add to the naive component, which is DST-safe. Advances in bookings.py
-generation loops must go through .astimezone(BUSINESS_TZ) + timedelta(days=7) +
-.astimezone(UTC) to preserve wall-clock time across DST boundaries.
+Advances inside run_finite / run_infinite (both the schedule week and `step`) act on datetimes
+carrying ZoneInfo — they add to the naive component, which is DST-safe. Advances in bookings.py
+generation loops must go through .astimezone(BUSINESS_TZ) + step + .astimezone(UTC) to preserve
+wall-clock time across DST boundaries.
+
+TWO DIFFERENT CADENCES, deliberately not the same value:
+  - Outer loop (weekly_free_blocks += timedelta(days=7)) walks the TUTOR'S SCHEDULE. Schedules are
+    weekly by definition, so this is 7 regardless of the link's recurrence.
+  - `step` — the gap between consecutive occurrences of a series (interval * FREQ_DAYS[freq]).
+    Drives the inner sweep, the expires_on lookahead, and the finite horizon. Not hardcoded.
+Also distinct: `slot_increment` (interval_minutes) spaces candidate START TIMES within a day, and
+has nothing to do with the RRULE's INTERVAL.
+
+REMAINING WEEKLY ASSUMPTION — in how EXISTING series are read, not in the sweep. inf_rules are
+WeekdayTime bands, so both consumers assume a rule occupies its weekday every week:
+  - materialize_inf_rules matches on d.weekday() == rule_start.weekday (all three modes).
+  - thin_schedule_dateless subtracts in dateless (weekday, time) space (infinite mode).
+A biweekly rule occupies its band only every other week, and the dateless form can't express that
+at all — parity is unknowable without a date. Materializing can (it already has real dates); the
+dateless shortcut would need a fallback to it for rules it can't represent.
+
+Both are what to handle before widening models.FREQ_DAYS / SUPPORTED_INTERVALS, which are
+CHECK-enforced on booking_links and booking_series and are what keep this correct meanwhile.
 """
 
 from datetime import UTC, date, datetime, time, timedelta
@@ -131,10 +150,10 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from booking_utils import active_series_filter
+from booking_utils import active_series_filter, indefinite_series_filter
 from database import get_db
 from gcal import SCOPES, get_calendar_service
-from models import Booking, BookingSeries, BookingLink, BookingLinkAvailability, Settings, Tutor
+from models import FREQ_DAYS, Booking, BookingSeries, BookingLink, BookingLinkAvailability, Settings, Tutor
 from schemas import AvailableSlotResponse
 
 router = APIRouter(prefix="/available-slots", tags=["available-slots"])
@@ -381,7 +400,7 @@ def resolve_schedule(schedule, time_min: datetime) -> list:
 
 
 def generate_weekly_free_slots(positions: list, time_min: datetime, time_max: datetime,
-                                duration: timedelta, interval: timedelta) -> list:
+                                duration: timedelta, slot_increment: timedelta) -> list:
     # time_max edge: a candidate is only ever produced if its END fits inside time_max —
     # nothing can spill past the window's close.
     candidate_slots = []
@@ -389,7 +408,7 @@ def generate_weekly_free_slots(positions: list, time_min: datetime, time_max: da
         c_start = max(b_start, time_min)
         while c_start + duration <= min(b_end, time_max):
             candidate_slots.append((c_start, c_start + duration))
-            c_start += interval
+            c_start += slot_increment
     return candidate_slots
 
 
@@ -457,16 +476,16 @@ def merge_freebusy_into(busy_dict_for_tutor: dict, tutor, fb_min: datetime, fb_m
 # ============================================================
 
 def run_standalone(free_blocks: list, tutor_id: int, time_min: datetime, time_max: datetime,
-                    duration: timedelta, interval: timedelta,
+                    duration: timedelta, slot_increment: timedelta,
                     busy_dict: dict, inf_rules: dict, tz: ZoneInfo) -> list:
     results = []
     weekly_free_blocks = free_blocks[:]
 
-    # advance one occurrence at a time, 7 days per pass, until past the viewing window
+    # walk the tutor's schedule a week at a time until past the viewing window
     while any(b_start <= time_max for (b_start, _) in weekly_free_blocks):
 
         # generate every candidate slot across all free_blocks at once
-        free_slots = generate_weekly_free_slots(weekly_free_blocks, time_min, time_max, duration, interval)
+        free_slots = generate_weekly_free_slots(weekly_free_blocks, time_min, time_max, duration, slot_increment)
         if not free_slots:
             weekly_free_blocks = [(b_s + timedelta(days=7), b_e + timedelta(days=7)) for (b_s, b_e) in weekly_free_blocks]
             continue
@@ -483,17 +502,17 @@ def run_standalone(free_blocks: list, tutor_id: int, time_min: datetime, time_ma
 
 
 def run_finite(free_blocks: list, tutor_id: int, time_min: datetime, time_max: datetime,
-               duration: timedelta, interval: timedelta, recur_weeks, expires_on,
+               duration: timedelta, slot_increment: timedelta, step: timedelta, count, expires_on,
                busy_dict: dict, inf_rules: dict, tz: ZoneInfo) -> list:
     results = []
     weekly_free_blocks = free_blocks[:]
 
     while any(b_start <= time_max for (b_start, _) in weekly_free_blocks):
-        free_slots = generate_weekly_free_slots(weekly_free_blocks, time_min, time_max, duration, interval)
-        weeks_checked = 0
+        free_slots = generate_weekly_free_slots(weekly_free_blocks, time_min, time_max, duration, slot_increment)
+        occurrences_checked = 0
         filtered_free_slots = []
 
-        # sweep the shrinking batch week by week — must survive EVERY future occurrence
+        # sweep the shrinking batch one occurrence at a time — must survive EVERY future occurrence
         while free_slots:
             ranges = merge_continuous_slots(free_slots)
             busy_slice = gather_busy_slice(busy_dict[tutor_id], ranges)
@@ -502,24 +521,24 @@ def run_finite(free_blocks: list, tutor_id: int, time_min: datetime, time_max: d
             if not filtered_free_slots:
                 break  # everyone died this week
 
-            weeks_checked += 1
+            occurrences_checked += 1
             earliest_date = filtered_free_slots[0][0].date()
 
             # stop at a fixed end date, or after a fixed number of occurrences
             if expires_on is not None:
-                if earliest_date + timedelta(days=7) > expires_on:
+                if earliest_date + step > expires_on:
                     break
             else:
-                if weeks_checked >= recur_weeks:
+                if occurrences_checked >= count:
                     break
 
-            # shift forward to check next week's busy data; undone once at the end
-            shifted_free_slots = [(s + timedelta(days=7), e + timedelta(days=7)) for (s, e) in filtered_free_slots]
+            # shift forward to check the next occurrence's busy data; undone once at the end
+            shifted_free_slots = [(s + step, e + step) for (s, e) in filtered_free_slots]
             free_slots = shifted_free_slots
 
         # shift back to the original bookable time — filtered_free_slots holds survivors
-        # from the last successful check, shifted (weeks_checked-1) times forward
-        total_shift = timedelta(days=7 * (weeks_checked - 1)) if weeks_checked > 0 else timedelta(0)
+        # from the last successful check, shifted (occurrences_checked-1) times forward
+        total_shift = (occurrences_checked - 1) * step if occurrences_checked > 0 else timedelta(0)
         results.extend((tutor_id, s - total_shift, e - total_shift) for (s, e) in filtered_free_slots)
 
         weekly_free_blocks = [(b_s + timedelta(days=7), b_e + timedelta(days=7)) for (b_s, b_e) in weekly_free_blocks]
@@ -527,7 +546,7 @@ def run_finite(free_blocks: list, tutor_id: int, time_min: datetime, time_max: d
 
 
 def run_infinite(free_blocks: list, tutor_id: int, time_min: datetime, time_max: datetime,
-                  duration: timedelta, interval: timedelta, horizon: datetime,
+                  duration: timedelta, slot_increment: timedelta, step: timedelta, horizon: datetime,
                   busy_dict: dict, inf_rules: dict, tz: ZoneInfo) -> list:
     results = []
     weekly_free_blocks = free_blocks[:]
@@ -536,8 +555,8 @@ def run_infinite(free_blocks: list, tutor_id: int, time_min: datetime, time_max:
         # free_blocks already had any colliding-forever ranges thinned out before this
         # runner was even called (see thin_schedule_dateless) — no per-candidate
         # guard needed here.
-        free_slots = generate_weekly_free_slots(weekly_free_blocks, time_min, time_max, duration, interval)
-        weeks_checked = 0
+        free_slots = generate_weekly_free_slots(weekly_free_blocks, time_min, time_max, duration, slot_increment)
+        occurrences_checked = 0
         filtered_free_slots = []
 
         # same shrinking-batch sweep as finite, stopping at the tutor's horizon instead
@@ -550,14 +569,14 @@ def run_infinite(free_blocks: list, tutor_id: int, time_min: datetime, time_max:
             if not filtered_free_slots:
                 break
 
-            weeks_checked += 1
-            if filtered_free_slots[0][0] + timedelta(days=7) > horizon:
+            occurrences_checked += 1
+            if filtered_free_slots[0][0] + step > horizon:
                 break  # nothing finite exists past this point
 
-            shifted_free_slots = [(s + timedelta(days=7), e + timedelta(days=7)) for (s, e) in filtered_free_slots]
+            shifted_free_slots = [(s + step, e + step) for (s, e) in filtered_free_slots]
             free_slots = shifted_free_slots
 
-        total_shift = timedelta(days=7 * (weeks_checked - 1)) if weeks_checked > 0 else timedelta(0)
+        total_shift = (occurrences_checked - 1) * step if occurrences_checked > 0 else timedelta(0)
         results.extend((tutor_id, s - total_shift, e - total_shift) for (s, e) in filtered_free_slots)
 
         weekly_free_blocks = [(b_s + timedelta(days=7), b_e + timedelta(days=7)) for (b_s, b_e) in weekly_free_blocks]
@@ -626,14 +645,17 @@ def get_available_slots(
             exclude_series_pattern = (s.dtstart.weekday(), s.dtstart.time(), s.dtend.time())
 
     duration = timedelta(minutes=db_booking_link.duration_minutes)
-    interval = timedelta(minutes=db_booking_link.interval_minutes or db_booking_link.duration_minutes)
+    slot_increment = timedelta(minutes=db_booking_link.interval_minutes or db_booking_link.duration_minutes)
+    # Gap between consecutive occurrences of a series booked through this link — the RRULE step,
+    # unrelated to slot_increment (which spaces candidate start times within a day).
+    step = timedelta(days=db_booking_link.interval * FREQ_DAYS[db_booking_link.freq])
     expires_on = db_booking_link.expires_on
-    recur_weeks = db_booking_link.recur_weeks
+    count = db_booking_link.count
 
     if not db_booking_link.recurring or exclude_ref is not None:
         # exclude_ref means one occurrence is moving — one date, not a recurring claim
         mode = "standalone"
-    elif expires_on is not None or recur_weeks is not None:
+    elif expires_on is not None or count is not None:
         mode = "finite"
     else:
         mode = "infinite"
@@ -648,7 +670,7 @@ def get_available_slots(
             horizon = datetime.combine(expires_on + timedelta(days=1), time.min, tzinfo=UTC)
         else:
             horizon = datetime.combine(
-                time_max.date() + timedelta(weeks=recur_weeks - 1, days=1), time.min, tzinfo=UTC
+                time_max.date() + (count - 1) * step + timedelta(days=1), time.min, tzinfo=UTC
             )
     else:
         horizon = None
@@ -702,7 +724,7 @@ def get_available_slots(
     series_q = db.query(BookingSeries).filter(
         BookingSeries.tutor_id.in_(tutor_ids),
         active_series_filter(today),
-        BookingSeries.until == None,
+        indefinite_series_filter(),
     )
     if exclude_series_id is not None:
         series_q = series_q.filter(BookingSeries.id != exclude_series_id)
@@ -757,14 +779,14 @@ def get_available_slots(
             tutor_horizon = horizon
 
         if mode == "standalone":
-            tutor_slots = run_standalone(free_blocks, tutor.id, time_min, time_max, duration, interval,
+            tutor_slots = run_standalone(free_blocks, tutor.id, time_min, time_max, duration, slot_increment,
                                           busy_dict, inf_rules, business_tz)
         elif mode == "finite":
-            tutor_slots = run_finite(free_blocks, tutor.id, time_min, time_max, duration, interval,
-                                      recur_weeks, expires_on, busy_dict, inf_rules, business_tz)
+            tutor_slots = run_finite(free_blocks, tutor.id, time_min, time_max, duration, slot_increment,
+                                      step, count, expires_on, busy_dict, inf_rules, business_tz)
         else:
-            tutor_slots = run_infinite(free_blocks, tutor.id, time_min, time_max, duration, interval,
-                                       tutor_horizon, busy_dict, inf_rules, business_tz)
+            tutor_slots = run_infinite(free_blocks, tutor.id, time_min, time_max, duration, slot_increment,
+                                       step, tutor_horizon, busy_dict, inf_rules, business_tz)
 
         all_slots.extend(tutor_slots)
 

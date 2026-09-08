@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
-import { Textarea, Switch, NumberInput, Select, Button, Loader, Input, Modal } from '@mantine/core'
+import { Textarea, Switch, NumberInput, Select, Button, Loader, Input, Modal, Radio } from '@mantine/core'
 import { IconChevronLeft, IconPlus, IconTrash, IconExternalLink, IconFileDescription, IconClock, IconRepeat, IconUsers, IconBan, IconAdjustmentsHorizontal, IconCreditCard, IconCopy, IconCheck, IconLinkOff } from '@tabler/icons-react'
 import type { Tutor, Schedule, BookingLink, BookingType } from './types'
 import { extractError } from './utils'
@@ -43,9 +43,10 @@ interface FormState {
     bookingTypeId: number | null
     description: string
     recurring: boolean
-    recurWeeks: number | null
+    recurCount: number | null
     expiresOn: string | null
     bookerCanSetRecurUntil: boolean
+    bookerCanSetCount: boolean
     durationMinutes: number
     minDurationMinutes: number | null
     maxDurationMinutes: number | null
@@ -70,7 +71,7 @@ interface FormErrors {
     durationMinutes?: string
     minDurationMinutes?: string
     maxDurationMinutes?: string
-    recurWeeks?: string
+    recurCount?: string
     tutorRows?: string
     cancelNoticeMinutes?: string
     rescheduleNoticeMinutes?: string
@@ -81,7 +82,7 @@ interface FormTouched {
     durationMinutes?: boolean
     minDurationMinutes?: boolean
     maxDurationMinutes?: boolean
-    recurWeeks?: boolean
+    recurCount?: boolean
     tutorRows?: boolean
     cancelNoticeMinutes?: boolean
     rescheduleNoticeMinutes?: boolean
@@ -92,9 +93,10 @@ const buildInitial = (link: BookingLink | null): FormState => ({
     bookingTypeId: link?.booking_type_id ?? null,
     description: link?.description ?? '',
     recurring: link?.recurring ?? false,
-    recurWeeks: link?.recur_weeks ?? null,
+    recurCount: link?.count ?? null,
     expiresOn: link?.expires_on ?? null,
     bookerCanSetRecurUntil: link?.booker_can_set_recur_until ?? false,
+    bookerCanSetCount: link?.booker_can_set_count ?? false,
     durationMinutes: link?.duration_minutes ?? 90,
     minDurationMinutes: link?.min_duration_minutes ?? null,
     maxDurationMinutes: link?.max_duration_minutes ?? null,
@@ -125,7 +127,7 @@ const validate = (f: FormState): FormErrors => {
     } else {
         if (f.durationMinutes <= 0) errs.durationMinutes = 'Must be positive'
     }
-    if (f.recurring && f.recurWeeks !== null && f.recurWeeks < 2) errs.recurWeeks = 'Must be at least 2 weeks'
+    if (f.recurring && f.recurCount !== null && f.recurCount < 2) errs.recurCount = 'Must be at least 2 sessions'
     if (f.tutorRows.length === 0) errs.tutorRows = 'At least one host is required'
     if (f.tutorRows.some(r => !r.tutorId || !r.scheduleId)) errs.tutorRows = 'All rows must have a tutor and schedule'
     if (f.cancelMode && WINDOW_MODES.includes(f.cancelMode) && !(f.cancelNoticeMinutes && f.cancelNoticeMinutes > 0))
@@ -229,7 +231,7 @@ const LinkPage = () => {
 
     const touchAll = () => setTouched({
         slug: true, durationMinutes: true, minDurationMinutes: true, maxDurationMinutes: true,
-        recurWeeks: true, tutorRows: true, cancelNoticeMinutes: true, rescheduleNoticeMinutes: true,
+        recurCount: true, tutorRows: true, cancelNoticeMinutes: true, rescheduleNoticeMinutes: true,
     })
 
     const buildPayload = () => ({
@@ -237,9 +239,10 @@ const LinkPage = () => {
         booking_type_id: form.bookingTypeId,
         description: form.description.trim() || null,
         recurring: form.recurring,
-        recur_weeks: form.recurring ? form.recurWeeks : null,
+        count: form.recurring ? form.recurCount : null,
         expires_on: form.recurring ? form.expiresOn : null,
         booker_can_set_recur_until: form.recurring ? form.bookerCanSetRecurUntil : false,
+        booker_can_set_count: form.recurring ? form.bookerCanSetCount : false,
         duration_minutes: form.durationMinutes,
         min_duration_minutes: form.minDurationMinutes,
         max_duration_minutes: form.maxDurationMinutes,
@@ -310,7 +313,7 @@ const LinkPage = () => {
     const tabHasError = {
         details: !!(errors.slug),
         duration: !!(errors.durationMinutes || errors.minDurationMinutes || errors.maxDurationMinutes),
-        recurrence: !!(errors.recurWeeks),
+        recurrence: !!(errors.recurCount),
         hosts: !!errors.tutorRows,
         cancellation: !!(errors.cancelNoticeMinutes || errors.rescheduleNoticeMinutes),
     }
@@ -565,7 +568,7 @@ const LinkPage = () => {
                                         onChange={e => setForm(prev => ({
                                             ...prev,
                                             recurring: e.target.checked,
-                                            recurWeeks: null,
+                                            recurCount: null,
                                             expiresOn: null,
                                             bookerCanSetRecurUntil: false,
                                         }))}
@@ -574,51 +577,73 @@ const LinkPage = () => {
                                 </SectionRow>
                                 {form.recurring && <>
                                     <div className="p-4 space-y-3">
-                                        <Select
-                                            label="Series end"
+                                        {/* Ends: never / on a date / after N sessions — mutually exclusive, mirroring
+                                            RFC5545's UNTIL-xor-COUNT (and Google's own recurrence dialog). Both nulls = never. */}
+                                        <Radio.Group
+                                            label="Ends"
                                             size="sm"
-                                            data={[
-                                                { value: 'none', label: 'Indefinite (no end)' },
-                                                { value: 'date', label: 'Fixed end date' },
-                                                { value: 'weeks', label: 'After N weeks' },
-                                            ]}
-                                            value={form.expiresOn !== null ? 'date' : form.recurWeeks !== null ? 'weeks' : 'none'}
+                                            value={form.expiresOn !== null ? 'date' : form.recurCount !== null ? 'count' : 'never'}
                                             onChange={val => {
-                                                if (val === 'none') setForm(prev => ({ ...prev, expiresOn: null, recurWeeks: null }))
-                                                else if (val === 'date') setForm(prev => ({ ...prev, expiresOn: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10), recurWeeks: null, bookerCanSetRecurUntil: false }))
-                                                else setForm(prev => ({ ...prev, recurWeeks: 12, expiresOn: null }))
+                                                // Each mode allows at most one booker override, so switching clears the other.
+                                                if (val === 'never') setForm(prev => ({ ...prev, expiresOn: null, recurCount: null, bookerCanSetCount: false }))
+                                                else if (val === 'date') setForm(prev => ({ ...prev, expiresOn: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10), recurCount: null, bookerCanSetRecurUntil: false, bookerCanSetCount: false }))
+                                                else setForm(prev => ({ ...prev, recurCount: 12, expiresOn: null, bookerCanSetRecurUntil: false }))
                                             }}
-                                        />
-                                        {form.expiresOn !== null && (
-                                            <input
-                                                type="date"
-                                                value={form.expiresOn}
-                                                min={new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)}
-                                                onChange={e => setField('expiresOn', e.target.value || null)}
-                                                className="border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-                                            />
-                                        )}
-                                        {form.recurWeeks !== null && (
-                                            <NumberInput
-                                                label="Duration"
-                                                rightSection={<span className="text-xs text-gray-400 pr-2">weeks</span>}
-                                                size="sm"
-                                                value={form.recurWeeks ?? ''}
-                                                onChange={val => setField('recurWeeks', val === '' ? null : Number(val))}
-                                                onBlur={() => setTouched(prev => ({ ...prev, recurWeeks: true }))}
-                                                error={touched.recurWeeks ? errors.recurWeeks : undefined}
-                                                min={2} className="w-44"
-                                            />
-                                        )}
+                                        >
+                                            <div className="space-y-3 mt-2">
+                                                <Radio value="never" label="When cancelled" />
+
+                                                <div className="flex items-center gap-3">
+                                                    <Radio value="date" label="On" className="w-20" />
+                                                    <input
+                                                        type="date"
+                                                        disabled={form.expiresOn === null}
+                                                        value={form.expiresOn ?? ''}
+                                                        min={new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10)}
+                                                        onChange={e => setField('expiresOn', e.target.value || null)}
+                                                        className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-gray-50 disabled:text-gray-400"
+                                                    />
+                                                </div>
+
+                                                <div className="flex items-start gap-3">
+                                                    <Radio value="count" label="After" className="w-20 mt-2" />
+                                                    <NumberInput
+                                                        disabled={form.recurCount === null}
+                                                        rightSection={<span className="text-xs text-gray-400 pr-2">sessions</span>}
+                                                        rightSectionWidth={64}
+                                                        size="sm"
+                                                        value={form.recurCount ?? ''}
+                                                        onChange={val => setField('recurCount', val === '' ? null : Number(val))}
+                                                        onBlur={() => setTouched(prev => ({ ...prev, recurCount: true }))}
+                                                        error={touched.recurCount ? errors.recurCount : undefined}
+                                                        min={2} className="w-44"
+                                                    />
+                                                </div>
+                                            </div>
+                                        </Radio.Group>
                                     </div>
-                                    <SectionRow label="Booker sets end date" description="Show an end date picker on the booking page">
-                                        <Switch
-                                            checked={form.bookerCanSetRecurUntil}
-                                            disabled={form.expiresOn !== null}
-                                            onChange={e => setField('bookerCanSetRecurUntil', e.target.checked)}
-                                            color="indigo" size="sm"
-                                        />
-                                    </SectionRow>
+                                    {/* The override follows the mode: a link ending on a count lets the booker pick the
+                                        count, one with no end lets them pick a date. A fixed end date allows neither —
+                                        that date is the admin's decision. Mirrors the CHECKs on booking_links. */}
+                                    {form.expiresOn === null && (
+                                        form.recurCount !== null ? (
+                                            <SectionRow label="Booker sets session count" description="Show a session-count picker on the booking page">
+                                                <Switch
+                                                    checked={form.bookerCanSetCount}
+                                                    onChange={e => setField('bookerCanSetCount', e.target.checked)}
+                                                    color="indigo" size="sm"
+                                                />
+                                            </SectionRow>
+                                        ) : (
+                                            <SectionRow label="Booker sets end date" description="Show an end date picker on the booking page">
+                                                <Switch
+                                                    checked={form.bookerCanSetRecurUntil}
+                                                    onChange={e => setField('bookerCanSetRecurUntil', e.target.checked)}
+                                                    color="indigo" size="sm"
+                                                />
+                                            </SectionRow>
+                                        )
+                                    )}
                                 </>}
                             </Group>
                         )}

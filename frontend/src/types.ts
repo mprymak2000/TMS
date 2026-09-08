@@ -86,9 +86,10 @@ export interface BookingLink {
   duration_minutes: number
   min_duration_minutes: number | null
   max_duration_minutes: number | null
-  recur_weeks: number | null
+  count: number | null
   expires_on: string | null
   booker_can_set_recur_until: boolean
+  booker_can_set_count: boolean
   price: number | null
   buffer_minutes: number | null
   interval_minutes: number | null

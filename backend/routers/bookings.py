@@ -13,11 +13,11 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import tuple_
 
-from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, is_series_active, require_link_bookable, require_link_not_archived, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason
+from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_step
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
-from models import Booking, BookingRequest, BookingSeries, BookingLink, BookingType, Tutor
+from models import Booking, BookingRequest, BookingSeries, BookingLink, BookingType, Tutor, FREQ_DAYS
 from policy import (
     get_cancel_action,
     get_reschedule_action,
@@ -123,8 +123,10 @@ def get_booking_series_occurrences(
         past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
         materialized_query = materialized_query.filter(past_cursor)
 
-    # execute queries, generate virtual occurrences from series rules
-    virtual = scoped_virtual_occurrences([series], time_min, time_max, page_size + 1, settings, decoded_cursor)
+    # execute queries, generate virtual occurrences from series rules (indefinite only — a bounded
+    # series has every occurrence materialized, so materialized_query already has all of them)
+    indefinite = [series] if is_indefinite(series) else []
+    virtual = scoped_virtual_occurrences(indefinite, time_min, time_max, page_size + 1, settings, decoded_cursor)
     materialized = [BookingResponse.model_validate(b) for b in materialized_query.all()]
 
     # merge into a sorted list, take first page_size's worth, encode a cursor as a bookmark and discard the tail
@@ -213,9 +215,10 @@ def get_bookings(
         past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
         scoped_materialized_query = scoped_materialized_query.filter(past_cursor)
 
-    # execute queries, generate virtual occurrences from series rules
+    # execute queries, generate virtual occurrences from series rules (indefinite only — a bounded
+    # series has every occurrence materialized, so it's already in scoped_materialized_bookings)
     scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
-    scoped_series = scoped_series_query.all()
+    scoped_series = scoped_series_query.filter(indefinite_series_filter()).all()
     scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, page_size + 1, settings, decoded_cursor)
 
     # merge into a sorted list, take first page_size's worth, encode a cursor as a bookmark and discard the tail
@@ -305,7 +308,8 @@ def list_bookings(
 
     ## time/status-scope (series only) - different mechanism than bookings materialized in db
     scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs) # first scope series
-    scoped_series = scoped_series_query.all() # execute query to get series rows.
+    # indefinite only - a bounded series has every occurrence materialized, so it's already above
+    scoped_series = scoped_series_query.filter(indefinite_series_filter()).all() # execute query to get series rows.
 
     # generate occurrence from scoped series rows
     bounded = time_max is not None
@@ -351,6 +355,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
         raise HTTPException(status_code=404, detail="Booking link not found")
     # Authoritative — the slug lookup and slots endpoint only fail earlier and more legibly.
     require_link_bookable(db_booking_link)
+    require_slot_in_schedule(db, db_booking_link, booking_in.tutor_id, booking_in.start, booking_in.end)
     BUSINESS_TZ = ZoneInfo(settings.business_timezone)
     # Conflict check — must run before touching Google Calendar so a rejection is cheap.
     # The loop walks every occurrence that would be created and queries the DB for any
@@ -360,19 +365,31 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
     if db_booking_link.expires_on is not None and booking_in.start.date() > db_booking_link.expires_on:
         raise HTTPException(status_code=400, detail="Booking start is after this event type's expiry date")
 
-    # _gen_through: last occurrence date to conflict-check before accepting the booking.
+    # Days between occurrences, off the link that configures the recurrence.
+    _step = timedelta(days=db_booking_link.interval * FREQ_DAYS[db_booking_link.freq])
+
+    # How the series ends — a date (UNTIL) or a quota (COUNT), never both. The admin fixes it via
+    # expires_on/count; the booker picks it when the matching flag is on.
+    recur_until_date = None
+    recur_count = None
     if db_booking_link.recurring:
         if db_booking_link.expires_on is not None:
-            # Mode A: all series of this event type end on a fixed calendar date
-            _gen_through = db_booking_link.expires_on
+            recur_until_date = db_booking_link.expires_on
         elif db_booking_link.booker_can_set_recur_until and booking_in.recur_until is not None:
-            # Mode B/C variant: booker explicitly chose an end date for the series on the booking form
-            _gen_through = booking_in.recur_until
-        elif db_booking_link.recur_weeks is not None:
-            # Mode B: recur_weeks = total number of occurrences; last is at start + (N-1) weeks
-            _gen_through = booking_in.start.date() + timedelta(weeks=db_booking_link.recur_weeks - 1)
+            recur_until_date = booking_in.recur_until
+        elif db_booking_link.booker_can_set_count and booking_in.recur_count is not None:
+            recur_count = booking_in.recur_count
+        elif db_booking_link.count is not None:
+            recur_count = db_booking_link.count
+
+    # _gen_through: last occurrence date to conflict-check before accepting the booking. Indefinite
+    # series check only occurrence 1 — the slot picker handles future conflicts.
+    if db_booking_link.recurring:
+        if recur_count is not None:
+            _gen_through = booking_in.start.date() + (recur_count - 1) * _step
+        elif recur_until_date is not None:
+            _gen_through = recur_until_date
         else:
-            # Mode C (indefinite): only check occurrence 1 — slot picker handles future conflict detection
             _gen_through = booking_in.start.date()
     else:
         # Standalone: setting _gen_through = start.date() makes the loop run exactly once,
@@ -388,17 +405,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             Booking.end > occ,                  # [occ, occ+duration) overlaps [start, end) iff start < occ+dur AND end > occ
         ).first():
             raise HTTPException(status_code=409, detail="One or more occurrences conflict with an existing booking")
-        occ = (occ.astimezone(BUSINESS_TZ) + timedelta(days=7)).astimezone(UTC)
-
-    # Compute recur_until_date before building the calendar event so we can include UNTIL in the RRULE
-    recur_until_date = None
-    if db_booking_link.recurring:
-        if db_booking_link.expires_on is not None:
-            recur_until_date = db_booking_link.expires_on
-        elif db_booking_link.booker_can_set_recur_until and booking_in.recur_until is not None:
-            recur_until_date = booking_in.recur_until
-        elif db_booking_link.recur_weeks is not None:
-            recur_until_date = booking_in.start.date() + timedelta(weeks=db_booking_link.recur_weeks - 1)
+        occ = (occ.astimezone(BUSINESS_TZ) + _step).astimezone(UTC)
 
     new_public_id = str(uuid4())
     manage_path = "manage-series" if db_booking_link.recurring else "manage-occurrence"
@@ -411,10 +418,8 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             "end": {"dateTime": booking_in.end.isoformat(), "timeZone": settings.business_timezone},
         }
     if db_booking_link.recurring:
-        rrule = "RRULE:FREQ=WEEKLY"
-        if recur_until_date is not None:
-            rrule += f";UNTIL={recur_until_date.strftime('%Y%m%d')}"
-        new_event["recurrence"] = [rrule]
+        new_event["recurrence"] = [build_rrule(db_booking_link.freq, db_booking_link.interval,
+                                               recur_until_date, recur_count, tz=BUSINESS_TZ)]
 
     service = get_calendar_service(SCOPES)
     try:
@@ -429,17 +434,20 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             local_end = booking_in.end.astimezone(BUSINESS_TZ)
             series = BookingSeries(
                 public_id=new_public_id,
-                **booking_in.model_dump(exclude={"start", "end", "timezone", "recur_until"}),
+                **booking_in.model_dump(exclude={"start", "end", "timezone", "recur_until", "recur_count"}),
                 dtstart=local_start.replace(tzinfo=None),
                 dtend=local_end.replace(tzinfo=None),
+                freq=db_booking_link.freq,
+                interval=db_booking_link.interval,
                 until=recur_until_date,
+                count=recur_count,
                 booking_type_id=db_booking_link.booking_type_id,
                 google_event_id=google_event["id"],
             )
             db.add(series)
             db.flush()
 
-            base_fields = booking_in.model_dump(exclude={"recur_until", "start", "end"})
+            base_fields = booking_in.model_dump(exclude={"recur_until", "recur_count", "start", "end"})
             occ_start = booking_in.start
             first_booking = None
             while occ_start.date() <= _gen_through:
@@ -456,14 +464,14 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                 db.add(booking)
                 if first_booking is None:
                     first_booking = booking
-                occ_start = (occ_start.astimezone(BUSINESS_TZ) + timedelta(days=7)).astimezone(UTC)
+                occ_start = (occ_start.astimezone(BUSINESS_TZ) + _step).astimezone(UTC)
             db.commit()
             db.refresh(first_booking)
             return first_booking
 
         new_booking = Booking(
             public_id=new_public_id,
-            **booking_in.model_dump(exclude={"recur_until"}),
+            **booking_in.model_dump(exclude={"recur_until", "recur_count"}),
             booking_type_id=db_booking_link.booking_type_id,
             google_event_id=google_event["id"],
             status="confirmed",
@@ -486,6 +494,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     before calling this. Helper assumes the booking is valid to reschedule."""
     # Guarded here rather than per-route, so all callers are covered (admin, manage-occurrence, request approval).
     require_link_not_archived(db_booking.booking_link)
+    require_slot_in_schedule(db, db_booking.booking_link, booking_in.tutor_id, booking_in.start, booking_in.end)
 
     db_tutor = db.query(Tutor).filter(Tutor.id == booking_in.tutor_id).first()
     if not db_tutor:
@@ -665,7 +674,8 @@ def reschedule_booking_series(id: str, booking_in: BookingReschedule, db: Sessio
     db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
-    today = datetime.now(ZoneInfo(settings.business_timezone)).date()
+    business_tz = ZoneInfo(settings.business_timezone)
+    today = datetime.now(business_tz).date()
     if db_series.status in ('cancelled', 'rescheduled'):
         raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
     service = get_calendar_service(SCOPES)
@@ -852,15 +862,12 @@ def _batch_delete_instances(service, calendar_id: str, instance_ids: list[str], 
         batch.execute()
 
 
-def _cancel_series(db_series: BookingSeries, today: date, db: Session, service) -> BookingSeries:
+def _cancel_series(db_series: BookingSeries, today: date, tz: ZoneInfo, db: Session, service) -> BookingSeries:
     """Cancel series saga — truncates RRULE to today, deletes future occurrence rows, soft-deletes series.
     Caller is responsible for all policy checks (is_active, etc.) before calling this."""
     calendar_id = db_series.tutor.calendar_id
     event_id = db_series.google_event_id
-    today_str = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    old_rrule = "RRULE:FREQ=WEEKLY"
-    if db_series.until:
-        old_rrule += f";UNTIL={db_series.until.strftime('%Y%m%dT235959Z')}"
+    old_rrule = build_rrule(db_series.freq, db_series.interval, db_series.until, db_series.count, tz=tz)
     # Fetch all future instances upfront — needed for both deletion and compensation on DB failure.
     # Google soft-deletes instances so they can be restored by patching status back to "confirmed".
     future_instances = [
@@ -876,13 +883,15 @@ def _cancel_series(db_series: BookingSeries, today: date, db: Session, service) 
         service.events().patch(
             calendarId=calendar_id,
             eventId=event_id,
-            body={"recurrence": [f"RRULE:FREQ=WEEKLY;UNTIL={today_str}"]}
+            body={"recurrence": [build_rrule(db_series.freq, db_series.interval, until=datetime.now(UTC))]}
         ).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to cancel future instances of the series on calendar") from e
     db.query(Booking).filter(Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC)).delete(synchronize_session=False)
     db_series.status = 'cancelled'
+    # Truncating turns any rule into one that ends on a date — count and until can't coexist.
     db_series.until = today
+    db_series.count = None
     try:
         db.commit()
     except Exception as e:
@@ -921,6 +930,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     if not db_booking_link:
         raise HTTPException(status_code=404, detail="Booking link not found")
     require_link_not_archived(db_booking_link)
+    require_slot_in_schedule(db, db_booking_link, booking_in.tutor_id, booking_in.start, booking_in.end)
     BUSINESS_TZ = ZoneInfo(settings.business_timezone)
     today = datetime.now(BUSINESS_TZ).date()
 
@@ -938,13 +948,28 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     ):
         raise HTTPException(status_code=400, detail="New schedule is identical to the current series schedule")
 
-    today_str = datetime.now(UTC).strftime("%Y%m%d")
     old_calendar_id = db_series.tutor.calendar_id
     old_google_event_id = db_series.google_event_id
-    old_rrule = "RRULE:FREQ=WEEKLY"
-    if db_series.until:
-        old_rrule += f";UNTIL={db_series.until.strftime('%Y%m%d')}"
-    # Save future exceptions upfront — Google doesn't auto-remove them when RRULE is truncated
+    old_rrule = build_rrule(db_series.freq, db_series.interval, db_series.until, db_series.count, tz=BUSINESS_TZ)
+
+    # How the new series ends. Google's split: the old rule is truncated to today and the remainder
+    # moves to a new rule. A date carries over untouched; a quota is reduced by what's already been
+    # consumed (cancelled occurrences included — they filled their slot).
+    new_until = db_series.until
+    new_count = None
+    if db_series.count is not None:
+        # Cancelled occurrences count as consumed - they filled their slot. Rescheduled ones don't:
+        # the slot moved to their replacement row, so counting the original too would spend it twice.
+        consumed = db.query(Booking).filter(
+            Booking.series_id == db_series.id,
+            Booking.start < datetime.now(UTC),
+            Booking.status != "rescheduled",
+        ).count()
+        new_count = max(1, db_series.count - consumed)
+
+    # Exceptions after the pivot don't survive a this-and-following change (verified against Google's
+    # own behavior). Deleted explicitly rather than relying on the truncate to do it. Saved upfront
+    # so they can be restored if the DB commit fails.
     future_exceptions = [
         (b.google_event_id, b.start, b.end)
         for b in db.query(Booking).filter(
@@ -964,15 +989,13 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         service.events().patch(
             calendarId=old_calendar_id,
             eventId=old_google_event_id,
-            body={"recurrence": [f"RRULE:FREQ=WEEKLY;UNTIL={today_str}"]}
+            body={"recurrence": [build_rrule(db_series.freq, db_series.interval, until=today, tz=BUSINESS_TZ)]}
         ).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to truncate old calendar series") from e
 
     # Step 2: create new RRULE event on new tutor's calendar
-    rrule = "RRULE:FREQ=WEEKLY"
-    if db_series.until:
-        rrule += f";UNTIL={db_series.until.strftime('%Y%m%d')}"
+    rrule = build_rrule(db_series.freq, db_series.interval, new_until, new_count, tz=BUSINESS_TZ)
     series_manage_url = f"{FRONTEND_URL}/manage-series/{db_series.public_id}"
     series_description_parts = [p for p in [db_booking_link.description, f"Manage your booking: {series_manage_url}"] if p]
     new_event = {
@@ -1001,12 +1024,17 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         logging.error(f"Failed to create calendar event: {e}")
         raise HTTPException(status_code=500, detail="Failed to create new calendar series") from e
 
-    # Step 3: drop future occurrence rows from the OLD series, insert a NEW series row for the new
-    # pattern, close the old one, regenerate occurrence 1 under the new series.
+    # Step 3: drop future occurrence rows from the OLD series (individually-rescheduled ones
+    # included — nothing after the pivot survives), insert a NEW series row for the new pattern,
+    # close the old one, materialize under the new series. A past row whose replacement is dropped
+    # here keeps status='rescheduled' with rescheduled_to SET NULL — the move still happened.
     db.query(Booking).filter(
         Booking.series_id == db_series.id,
         Booking.start >= datetime.now(UTC)
-    ).delete(synchronize_session=False)
+    # "fetch" rather than False: this delete is immediately followed by inserts, and a bulk delete
+    # that doesn't sync leaves the deleted rows in the session's identity map. A new row reusing a
+    # freed PK then collides with a stale entry for it.
+    ).delete(synchronize_session="fetch")
     local_start = booking_in.start.astimezone(BUSINESS_TZ)
     local_end = booking_in.end.astimezone(BUSINESS_TZ)
 
@@ -1017,7 +1045,10 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         booking_type_id=db_series.booking_type_id,
         dtstart=local_start.replace(tzinfo=None),
         dtend=local_end.replace(tzinfo=None),
-        until=db_series.until,  # carried forward unchanged - precise recompute needs `count` (not added yet)
+        freq=db_series.freq,
+        interval=db_series.interval,
+        until=new_until,
+        count=new_count,
         google_event_id=new_google_event["id"],
         student_id=db_series.student_id,
         student_first=db_series.student_first,
@@ -1031,28 +1062,40 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     db.flush()
 
     db_series.status = 'rescheduled'
+    # Truncating ends the old rule on a date whatever it was before — count and until can't coexist.
     db_series.until = today
+    db_series.count = None
     db_series.rescheduled_to = new_series.id
 
-    db.add(Booking(
-        public_id=f"{new_series.public_id}:{int(booking_in.start.timestamp())}",
-        series_id=new_series.id,
-        tutor_id=booking_in.tutor_id,
-        booking_link_id=db_series.booking_link_id,
-        booking_type_id=new_series.booking_type_id,
-        timezone=booking_in.timezone,
-        status="confirmed",
-        student_id=db_series.student_id,
-        student_first=db_series.student_first,
-        student_last=db_series.student_last,
-        student_email=db_series.student_email,
-        student_phone=db_series.student_phone,
-        parent_email=db_series.parent_email,
-        parent_phone=db_series.parent_phone,
-        google_event_id=new_google_event["id"],
-        start=booking_in.start,
-        end=booking_in.end,
-    ))
+    # Materialize the new series: a bounded one gets every occurrence up front (same as creation —
+    # only indefinite series are kept sparse for the extender to fill in), so just occurrence 1 there.
+    _duration = booking_in.end - booking_in.start
+    _step = series_step(new_series)
+    gen_through = series_last_date(new_series)
+    if gen_through is None:
+        gen_through = booking_in.start.date()
+    occ_start = booking_in.start
+    while occ_start.date() <= gen_through:
+        db.add(Booking(
+            public_id=f"{new_series.public_id}:{int(occ_start.timestamp())}",
+            series_id=new_series.id,
+            tutor_id=booking_in.tutor_id,
+            booking_link_id=db_series.booking_link_id,
+            booking_type_id=new_series.booking_type_id,
+            timezone=booking_in.timezone,
+            status="confirmed",
+            student_id=db_series.student_id,
+            student_first=db_series.student_first,
+            student_last=db_series.student_last,
+            student_email=db_series.student_email,
+            student_phone=db_series.student_phone,
+            parent_email=db_series.parent_email,
+            parent_phone=db_series.parent_phone,
+            google_event_id=new_google_event["id"],
+            start=occ_start,
+            end=occ_start + _duration,
+        ))
+        occ_start = (occ_start.astimezone(BUSINESS_TZ) + _step).astimezone(UTC)
 
     try:
         db.commit()
@@ -1087,11 +1130,12 @@ def delete_booking_series(id: str, db: Session = Depends(get_db), settings=Depen
     db_series = db.query(BookingSeries).filter(BookingSeries.public_id == id).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
-    today = datetime.now(ZoneInfo(settings.business_timezone)).date()
+    business_tz = ZoneInfo(settings.business_timezone)
+    today = datetime.now(business_tz).date()
     if db_series.status in ('cancelled', 'rescheduled'):
         raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
     service = get_calendar_service(SCOPES)
-    result = _cancel_series(db_series, today, db, service)
+    result = _cancel_series(db_series, today, business_tz, db, service)
     return _series_response(result, today)
 
 
@@ -1285,7 +1329,8 @@ def cancel_series_by_ref(ref: str, db: Session = Depends(get_db), settings=Depen
     db_series = db.query(BookingSeries).filter(BookingSeries.public_id == ref).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
-    today = datetime.now(ZoneInfo(settings.business_timezone)).date()
+    business_tz = ZoneInfo(settings.business_timezone)
+    today = datetime.now(business_tz).date()
     if not is_series_active(db_series, today):
         raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
     next_booking = (
@@ -1309,7 +1354,7 @@ def cancel_series_by_ref(ref: str, db: Session = Depends(get_db), settings=Depen
             raise HTTPException(status_code=500, detail="Failed to submit cancellation request") from e
         return _series_response(db_series, today)
     service = get_calendar_service(SCOPES)
-    result = _cancel_series(db_series, today, db, service)
+    result = _cancel_series(db_series, today, business_tz, db, service)
     return _series_response(result, today)
 
 
@@ -1318,7 +1363,8 @@ def reschedule_series_by_ref(ref: str, booking_in: BookingReschedule, db: Sessio
     db_series = db.query(BookingSeries).filter(BookingSeries.public_id == ref).first()
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
-    today = datetime.now(ZoneInfo(settings.business_timezone)).date()
+    business_tz = ZoneInfo(settings.business_timezone)
+    today = datetime.now(business_tz).date()
     if not is_series_active(db_series, today):
         raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
     next_booking = (
@@ -1377,8 +1423,9 @@ def approve_pending_request(request_id: int, db: Session = Depends(get_db), sett
         )
         return _reschedule_booking(db_request.booking, booking_in, db, service)
     elif db_request.type == 'cancel_series':
-        today = datetime.now(ZoneInfo(settings.business_timezone)).date()
-        return _cancel_series(db_request.series, today, db, service)
+        business_tz = ZoneInfo(settings.business_timezone)
+        today = datetime.now(business_tz).date()
+        return _cancel_series(db_request.series, today, business_tz, db, service)
     elif db_request.type == 'reschedule_series':
         booking_in = BookingReschedule(
             tutor_id=db_request.requested_tutor_id,

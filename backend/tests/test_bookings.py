@@ -101,11 +101,15 @@ def mock_calendar_service():
     return svc
 
 
+# Wide open, every day. create_booking/reschedule now require the slot to sit inside the tutor's
+# schedule, and these tests are about booking mechanics, not availability — a narrow schedule would
+# make most of them fail for a reason they aren't testing. Schedule enforcement has its own tests
+# below; slot generation is covered in test_available_slots.py.
 _schedule = {
     "name": "Default",
     "is_default": True,
     "timezone": "America/New_York",
-    "days": [{"day_of_week": 0, "start_time": "09:00:00", "end_time": "17:00:00"}],
+    "days": [{"day_of_week": d, "start_time": "00:00:00", "end_time": "23:59:00"} for d in range(7)],
 }
 
 
@@ -194,7 +198,7 @@ def test_create_booking_mode_b_locked(client):
         "slug": "8-week-course",
         "duration_minutes": 60,
         "recurring": True,
-        "recur_weeks": 8,
+        "count": 8,
         "booker_can_set_recur_until": False,
         "availability": availability,
     }).json()
@@ -211,15 +215,15 @@ def test_create_booking_mode_b_booker_set(client):
         "slug": "flexible-course",
         "duration_minutes": 60,
         "recurring": True,
-        "recur_weeks": 8,
-        "booker_can_set_recur_until": True,
+        "count": 8,
+        "booker_can_set_count": True,
         "availability": availability,
     }).json()
     payload = {
         **booking_payload,
         "tutor_id": tutor["id"],
         "booking_link_id": booking_link["id"],
-        "recur_until": "2099-07-08",  # Jun 10 + 4 weeks = Jul 8
+        "recur_count": 5,  # booker shortens the 8-week default to 5 sessions
     }
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         response = client.post("/bookings/", json=payload)
@@ -1428,7 +1432,14 @@ def test_get_booking_series_excludes_naturally_expired_series(client):
 
     db = TestingSessionLocal()
     series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+    # A series that ran its course: `until` has passed AND no occurrence is still upcoming. Both
+    # matter — "still running" is derived from the occurrences, not from `until` alone, so that an
+    # occurrence rescheduled past `until` keeps its series alive instead of stranding it.
     series.until = date.today() - timedelta(days=1)
+    finished = datetime.now(UTC) - timedelta(days=30)
+    for b in series.bookings:
+        b.start = finished
+        b.end = finished + timedelta(hours=1)
     db.commit()
     db.close()
 
@@ -2071,3 +2082,225 @@ def test_available_slots_withholds_series_own_pattern(client):
         client, tutor["id"], booking_link["id"], exclude_series_ref=created["series_id"])]
     assert f"{_MONDAY}T10:00:00Z" in freed, "series band freed for overlapping moves"
     assert f"{_MONDAY}T10:30:00Z" not in freed, "its own pattern stays withheld"
+
+
+# ── SERIES RESCHEDULE: COUNT ARITHMETIC + EXCEPTION HANDLING ────────────────
+
+def _count_link(client, count: int) -> tuple[dict, dict]:
+    """A recurring link that ends on a quota rather than a date."""
+    tutor, availability = make_tutor_with_schedule(client)
+    booking_link = client.post("/booking_links/", json={
+        **booking_link_recurring, "count": count, "availability": availability,
+    }).json()
+    return tutor, booking_link
+
+
+def test_reschedule_series_materializes_every_occurrence_of_a_bounded_series(client):
+    """A bounded series has ALL its occurrences as rows — the invariant _virtual_occurrences
+    asserts on. Reschedule used to regenerate only occurrence 1, leaving 2..N unmaterialized
+    with nothing to ever generate them (extend_all_series only picks up indefinite series)."""
+    tutor, booking_link = _count_link(client, 8)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        assert len(_all_bookings()) == 8
+        rescheduled = client.post(
+            f"/bookings/booking-series/{created['series_id']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        ).json()
+
+    with TestingSessionLocal() as db:
+        new_series = db.query(BookingSeries).filter(BookingSeries.public_id == rescheduled["id"]).first()
+        assert new_series.count == 8, "nothing consumed yet — the whole quota moves"
+        assert new_series.until is None, "a count series stays a count series"
+        assert db.query(Booking).filter(Booking.series_id == new_series.id).count() == 8
+
+
+def test_reschedule_series_count_excludes_rescheduled_originals(client):
+    """5 delivered, #6 moved into the future, then the series is rescheduled. The moved
+    occurrence's ORIGINAL row is past and status='rescheduled'; its replacement is future and
+    gets dropped with everything else. Counting the original as consumed would spend that slot
+    twice and hand the client 4 sessions instead of the 5 they're owed."""
+    tutor, booking_link = _count_link(client, 10)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        occurrences = sorted(_all_bookings(), key=lambda b: b["start"])
+        # move #6 to well after the last scheduled occurrence
+        client.post(f"/bookings/{occurrences[5]['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-12-08T16:00:00", "end": "2099-12-08T17:30:00",
+            "timezone": booking_payload["timezone"],
+        })
+
+    # deliver the first six slots: 1-5 confirmed, plus #6's soft-deleted original
+    with TestingSessionLocal() as db:
+        series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+        rows = db.query(Booking).filter(Booking.series_id == series.id).order_by(Booking.start).all()
+        for i, b in enumerate(rows[:6]):
+            past = datetime.now(UTC) - timedelta(days=7 * (6 - i))
+            b.start, b.end = past, past + timedelta(minutes=90)
+        db.commit()
+
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        rescheduled = client.post(
+            f"/bookings/booking-series/{created['series_id']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        ).json()
+
+    with TestingSessionLocal() as db:
+        new_series = db.query(BookingSeries).filter(BookingSeries.public_id == rescheduled["id"]).first()
+        assert new_series.count == 5, "moved-#6 plus #7-10 are still owed"
+        assert db.query(Booking).filter(Booking.series_id == new_series.id).count() == 5
+
+
+def test_reschedule_series_drops_future_exceptions_but_keeps_past_ones(client):
+    """Matches Google: changing all following instances resets exceptions after the pivot, and
+    leaves earlier ones alone. The pivot is always now."""
+    tutor, booking_link = _count_link(client, 6)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        occurrences = sorted(_all_bookings(), key=lambda b: b["start"])
+        # 6 weekly occurrences run 6/10–7/15, so 7/22 is the same weekday and past the last one
+        moved = client.post(f"/bookings/{occurrences[1]['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-07-22T16:00:00", "end": "2099-07-22T17:30:00",
+            "timezone": booking_payload["timezone"],
+        }).json()
+
+    # push occurrence 1 into the past so there's a pre-pivot row to survive
+    with TestingSessionLocal() as db:
+        series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+        first = db.query(Booking).filter(Booking.series_id == series.id).order_by(Booking.start).first()
+        past = datetime.now(UTC) - timedelta(days=30)
+        first.start, first.end = past, past + timedelta(minutes=90)
+        db.commit()
+        survivor_id = first.public_id
+
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        client.post(
+            f"/bookings/booking-series/{created['series_id']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        )
+
+    with TestingSessionLocal() as db:
+        assert db.query(Booking).filter(Booking.public_id == survivor_id).first() is not None, \
+            "a past occurrence predates the pivot and is untouched"
+        assert db.query(Booking).filter(Booking.public_id == moved["id"]).first() is None, \
+            "a future exception is reset along with every other future occurrence"
+
+
+def test_reschedule_series_count_when_an_occurrence_moved_inside_the_window(client):
+    """The move that isn't past the series end: #5 lands between #6 and #7, still future, still
+    inside the window. Its original row is future too, so unlike the past-original case it never
+    reaches the consumed tally from either side — the client is owed everything undelivered."""
+    tutor, booking_link = _count_link(client, 10)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        occurrences = sorted(_all_bookings(), key=lambda b: b["start"])  # 6/10 .. 8/12, weekly
+        # #5 (7/8) -> 7/19, which sits between #6 (7/15) and #7 (7/22)
+        moved = client.post(f"/bookings/{occurrences[4]['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-07-19T16:00:00", "end": "2099-07-19T17:30:00",
+            "timezone": booking_payload["timezone"],
+        }).json()
+
+    # deliver the first three only
+    with TestingSessionLocal() as db:
+        series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+        rows = db.query(Booking).filter(Booking.series_id == series.id).order_by(Booking.start).all()
+        for i, b in enumerate(rows[:3]):
+            past = datetime.now(UTC) - timedelta(days=7 * (3 - i))
+            b.start, b.end = past, past + timedelta(minutes=90)
+        db.commit()
+
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        rescheduled = client.post(
+            f"/bookings/booking-series/{created['series_id']}/reschedule",
+            json={**reschedule_payload, "tutor_id": tutor["id"]},
+        ).json()
+
+    with TestingSessionLocal() as db:
+        new_series = db.query(BookingSeries).filter(BookingSeries.public_id == rescheduled["id"]).first()
+        assert new_series.count == 7, "3 delivered of 10 — the moved one is still owed"
+        assert db.query(Booking).filter(Booking.series_id == new_series.id).count() == 7
+        assert db.query(Booking).filter(Booking.public_id == moved["id"]).first() is None, \
+            "an in-window exception is reset like any other future occurrence"
+
+
+# ── SCHEDULE ENFORCEMENT ON THE WRITE PATH ─────────────────────────────────
+
+def _narrow_schedule_link(client):
+    """Tutor works Wednesdays 09:00-17:00 ET only — booking_payload's 16:00-17:30 runs past the end."""
+    tutor = client.post("/tutors/", json=tutor_payload).json()
+    schedule = client.post("/schedules/", json={
+        "name": "Narrow", "is_default": True, "timezone": "America/New_York", "tutor_id": tutor["id"],
+        "days": [{"day_of_week": 2, "start_time": "09:00:00", "end_time": "17:00:00"}],
+    }).json()
+    availability = [{"tutor_id": tutor["id"], "schedule_id": schedule["id"]}]
+    booking_link = client.post("/booking_links/", json={
+        **booking_link_standalone, "availability": availability,
+    }).json()
+    return tutor, booking_link
+
+
+def test_create_booking_rejects_a_slot_outside_the_schedule(client):
+    """/available-slots runs before the write and can simply be skipped, so the rules have to hold
+    at the write too — otherwise a direct POST books a tutor on a day they don't work."""
+    tutor, booking_link = _narrow_schedule_link(client)
+    # 2099-06-13 is a Saturday; the tutor only works Wednesdays
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"],
+               "start": "2099-06-13T10:00:00", "end": "2099-06-13T11:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 400
+    assert "availability" in response.json()["detail"]
+    assert _all_bookings() == []
+
+
+def test_create_booking_rejects_a_slot_that_runs_past_the_schedule_end(client):
+    """Right weekday, starts inside the window, but ends after it — containment, not just overlap."""
+    tutor, booking_link = _narrow_schedule_link(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"],
+               "start": "2099-06-10T16:00:00", "end": "2099-06-10T17:30:00"}  # Wed, 17:30 > 17:00
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 400
+
+
+def test_create_booking_accepts_a_slot_inside_the_schedule(client):
+    tutor, booking_link = _narrow_schedule_link(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"],
+               "start": "2099-06-10T14:00:00", "end": "2099-06-10T15:30:00"}  # Wed, inside 09:00-17:00
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 201
+
+
+def test_reschedule_rejects_a_slot_outside_the_schedule(client):
+    """Same hole on the move path — rescheduling to 3am bypasses availability exactly like creating there."""
+    tutor, booking_link = _narrow_schedule_link(client)
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"],
+               "start": "2099-06-10T14:00:00", "end": "2099-06-10T15:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+        response = client.post(f"/bookings/{created['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-06-17T03:00:00", "end": "2099-06-17T04:30:00",  # Wed, but before hours
+            "timezone": booking_payload["timezone"],
+        })
+    assert response.status_code == 400
+
+
+def test_create_booking_rejects_a_tutor_who_does_not_host_the_link(client):
+    """No availability row means no schedule to check against — that's a rejection, not a pass."""
+    tutor, booking_link = _narrow_schedule_link(client)
+    other = client.post("/tutors/", json={**tutor_payload, "first_name": "Other"}).json()
+    payload = {**booking_payload, "tutor_id": other["id"], "booking_link_id": booking_link["id"],
+               "start": "2099-06-10T14:00:00", "end": "2099-06-10T15:30:00"}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        response = client.post("/bookings/", json=payload)
+    assert response.status_code == 400
+    assert "does not host" in response.json()["detail"]

@@ -109,6 +109,7 @@ const BookingPage = () => {
     const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone)
     const [selectedTutorId, setSelectedTutorId] = useState<string | null>(null)
     const [recurUntil, setRecurUntil] = useState<string | null>(null)
+    const [recurCount, setRecurCount] = useState<number | null>(null)
     const [currentDate, setCurrentDate] = useState(new Date())
     const [selectedDate, setSelectedDate] = useState<string | null>(null)
     const [selectedSlot, setSelectedSlot] = useState<AvailableSlot | null>(null)
@@ -240,6 +241,7 @@ const BookingPage = () => {
         end: selectedSlot!.end,
         timezone: timezone,
         recur_until: recurUntil || null,
+        recur_count: recurCount,
         student_first: contact.studentFirst,
         student_last: contact.studentLast,
         student_email: contact.studentEmail || null,
@@ -930,6 +932,22 @@ const BookingPage = () => {
                                             className="border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-400"
                                         />
                                         <p className="text-xs text-gray-400">Leave blank for an indefinite weekly series</p>
+                                    </div>
+                                )}
+
+                                {bookingLink?.booker_can_set_count && (
+                                    <div className="flex flex-col gap-1">
+                                        <label className="text-sm font-medium text-gray-700">
+                                            Number of sessions <span className="text-gray-400 font-normal">(optional)</span>
+                                        </label>
+                                        <input
+                                            type="number"
+                                            min={2}
+                                            value={recurCount ?? ''}
+                                            onChange={e => setRecurCount(e.target.value === '' ? null : Number(e.target.value))}
+                                            className="border border-gray-300 rounded-lg px-3 py-2 text-sm text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                                        />
+                                        <p className="text-xs text-gray-400">Leave blank to use the default for this link</p>
                                     </div>
                                 )}
 

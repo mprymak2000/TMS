@@ -289,13 +289,19 @@ _WINDOW_MODES = ('auto_window_block', 'auto_window_request', 'request_window')
 #     reschedule_notice_minutes: int | None = None
 
 
-def _validate_recurrence(recur_weeks, expires_on, booker_can_set_recur_until):
-    if recur_weeks is not None and expires_on is not None:
-        raise ValueError("recur_weeks and expires_on are mutually exclusive")
+def _validate_recurrence(count, expires_on, booker_can_set_recur_until, booker_can_set_count):
+    if count is not None and expires_on is not None:
+        raise ValueError("count and expires_on are mutually exclusive")
+    if booker_can_set_recur_until and booker_can_set_count:
+        raise ValueError("booker_can_set_recur_until and booker_can_set_count are mutually exclusive")
     if expires_on is not None and booker_can_set_recur_until:
         raise ValueError("booker_can_set_recur_until must be False when expires_on is set")
-    if recur_weeks is not None and recur_weeks < 2:
-        raise ValueError("recur_weeks must be at least 2")
+    if expires_on is not None and booker_can_set_count:
+        raise ValueError("booker_can_set_count must be False when expires_on is set")
+    if count is not None and booker_can_set_recur_until:
+        raise ValueError("booker_can_set_recur_until must be False when count is set — that link ends on a count, not a date")
+    if count is not None and count < 2:
+        raise ValueError("count must be at least 2")
     if expires_on is not None and expires_on <= date.today():
         raise ValueError("expires_on must be in the future")
 
@@ -305,12 +311,17 @@ class BookingLinkCreate(BaseModel):
     booking_type_id: int | None = None
     description: str | None = Field(default=None, max_length=DESCRIPTION_MAX_LENGTH)
     recurring: bool = True
+    # Narrowed to what generation is tested for — the DB CHECKs say the same thing, this just makes
+    # it a 422 instead of an IntegrityError. Widen alongside models.FREQ_DAYS/SUPPORTED_INTERVALS.
+    freq: Literal["WEEKLY"] = "WEEKLY"
+    interval: Literal[1] = 1
     duration_minutes: int
     min_duration_minutes: int | None = None
     max_duration_minutes: int | None = None
-    recur_weeks: int | None = None
+    count: int | None = None
     expires_on: date | None = None
     booker_can_set_recur_until: bool = False
+    booker_can_set_count: bool = False
 
     price: float | None = None
     cancel_mode: str | None = None
@@ -332,7 +343,7 @@ class BookingLinkCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_recurrence(self):
-        _validate_recurrence(self.recur_weeks, self.expires_on, self.booker_can_set_recur_until)
+        _validate_recurrence(self.count, self.expires_on, self.booker_can_set_recur_until, self.booker_can_set_count)
         if self.cancel_mode is not None and self.cancel_mode not in _VALID_MODES:
             raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
         if self.reschedule_mode is not None and self.reschedule_mode not in _VALID_MODES:
@@ -350,12 +361,17 @@ class BookingLinkUpdate(BaseModel):
     booking_type_id: int | None = None
     description: str | None = Field(default=None, max_length=DESCRIPTION_MAX_LENGTH)
     recurring: bool = True
+    # Narrowed to what generation is tested for — the DB CHECKs say the same thing, this just makes
+    # it a 422 instead of an IntegrityError. Widen alongside models.FREQ_DAYS/SUPPORTED_INTERVALS.
+    freq: Literal["WEEKLY"] = "WEEKLY"
+    interval: Literal[1] = 1
     duration_minutes: int
     min_duration_minutes: int | None = None
     max_duration_minutes: int | None = None
-    recur_weeks: int | None = None
+    count: int | None = None
     expires_on: date | None = None
     booker_can_set_recur_until: bool = False
+    booker_can_set_count: bool = False
 
     price: float | None = None
     cancel_mode: str | None = None
@@ -377,7 +393,7 @@ class BookingLinkUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_recurrence(self):
-        _validate_recurrence(self.recur_weeks, self.expires_on, self.booker_can_set_recur_until)
+        _validate_recurrence(self.count, self.expires_on, self.booker_can_set_recur_until, self.booker_can_set_count)
         if self.cancel_mode is not None and self.cancel_mode not in _VALID_MODES:
             raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
         if self.reschedule_mode is not None and self.reschedule_mode not in _VALID_MODES:
@@ -399,11 +415,13 @@ class BookingLinkResponse(BaseModel):
     archived_at: datetime | None = None
     description: str | None = None
     recurring: bool
+    freq: str
+    interval: int
 
     duration_minutes: int
     min_duration_minutes: int | None = None
     max_duration_minutes: int | None = None
-    recur_weeks: int | None = None
+    count: int | None = None
     expires_on: date | None = None
     booker_can_set_recur_until: bool
 
@@ -559,6 +577,7 @@ class BookingCreate(BaseModel):
     end: datetime
     timezone: str
     recur_until: date | None = None  # only honoured when booking_link.booker_can_set_recur_until=True
+    recur_count: int | None = Field(default=None, ge=2)  # only honoured when booking_link.booker_can_set_count=True
 
     student_first: str
     student_last: str

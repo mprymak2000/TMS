@@ -1,6 +1,7 @@
 import requests
 import psycopg2
 from datetime import date, datetime, time, timedelta
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 API = "http://localhost:8000"
@@ -22,7 +23,7 @@ cur.execute("""
     TRUNCATE TABLE
         booking_requests, bookings, booking_series,
         lessons, booking_link_availability, schedule_days,
-        schedules, booking_links, students, tutors
+        schedules, booking_links, booking_types, students, tutors
     RESTART IDENTITY CASCADE;
 """)
 conn.commit()
@@ -148,6 +149,17 @@ else:
 # on them will fail — those endpoints all call get_calendar_service(), which needs a
 # real GOOGLE_SERVICE_ACCOUNT_JSON in .env. That's expected in this demo environment,
 # not a bug — see CLAUDE.md's Google Calendar Integration section for the real setup.
+#
+# TRAP when editing the INSERTs below: several NOT NULL columns get their value from a
+# PYTHON-side default (Column(..., default=...)), which SQLAlchemy applies on ORM writes but
+# raw SQL bypasses completely. Miss one and this script dies on a NOT NULL violation — there's
+# no static check that catches it. As of now that set is:
+#   bookings        public_id, timezone, status, is_no_show
+#   booking_series  public_id, freq, interval
+# Add a NOT NULL column with a Python-side default to either model and it must be added here too.
+# To list the current set: for each NOT NULL, non-PK column, flag any with .default set and
+# .server_default None. TODO: server_default would make these safe for raw SQL and delete this
+# whole footgun — needs Alembic first (see the tms-roadmap skill).
 tz = ZoneInfo("America/New_York")
 
 
@@ -170,11 +182,11 @@ cur = conn.cursor()
 def insert_standalone_booking(event_date, start_time, end_time, booking_link_id, student_id, first, last, email, phone, google_event_id):
     cur.execute("""
         INSERT INTO bookings (
-            tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
+            public_id, tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
             is_no_show, student_id, student_first, student_last, student_email, student_phone
-        ) VALUES (%s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
     """, (
-        tutor_id, booking_link_id,
+        str(uuid4()), tutor_id, booking_link_id,
         to_utc(event_date, start_time), to_utc(event_date, end_time), "America/New_York",
         google_event_id, student_id, first, last, email, phone,
     ))
@@ -218,29 +230,36 @@ series_start = next_weekday(2)  # Wednesday
 series_dtstart = datetime.combine(series_start, time(17, 0))
 series_dtend = datetime.combine(series_start, time(18, 30))
 series_until = series_start + timedelta(weeks=7)
+series_public_id = str(uuid4())
 cur.execute("""
     INSERT INTO booking_series (
-        tutor_id, booking_link_id, dtstart, dtend, until, google_event_id,
+        public_id, tutor_id, booking_link_id, dtstart, dtend, freq, interval, until, google_event_id,
         student_id, student_first, student_last, student_email, student_phone
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     RETURNING id
 """, (
-    tutor_id, booking_link_recurring["id"], series_dtstart, series_dtend, series_until,
+    series_public_id, tutor_id, booking_link_recurring["id"], series_dtstart, series_dtend,
+    "WEEKLY", 1, series_until,
     "demo-series-fake-event-id",
     john_id, "John", "Smith", "john.smith@example.com", "555-0101",
 ))
 series_id = cur.fetchone()[0]
 
+# A bounded series has EVERY occurrence materialized at creation — only indefinite series are kept
+# sparse for the extender to fill in. Occurrence public_ids use the composite
+# "{series.public_id}:{unix_timestamp}" form that _ensure_occurrence writes in production.
 for week in range(8):
     occ_date = series_start + timedelta(weeks=week)
+    occ_start = to_utc(occ_date, "17:00")
     cur.execute("""
         INSERT INTO bookings (
-            series_id, tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
+            public_id, series_id, tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
             is_no_show, student_id, student_first, student_last, student_email, student_phone
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
     """, (
+        f"{series_public_id}:{int(occ_start.timestamp())}",
         series_id, tutor_id, booking_link_recurring["id"],
-        to_utc(occ_date, "17:00"), to_utc(occ_date, "18:30"), "America/New_York",
+        occ_start, to_utc(occ_date, "18:30"), "America/New_York",
         "demo-series-fake-event-id",
         john_id, "John", "Smith", "john.smith@example.com", "555-0101",
     ))

@@ -229,11 +229,11 @@ def test_standalone_multi_day_schedule(client):
 
 # ── Finite ────────────────────────────────────────────────────────────────────
 
-def test_finite_slot_clear_across_all_recur_weeks(client):
-    """recur_weeks=3, no conflicts → slots returned for the starting day."""
+def test_finite_slot_clear_across_all_occurrences(client):
+    """count=3, no conflicts → slots returned for the starting day."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, count=3)
 
     slots = client.get("/available-slots/", params=_params(tutor["id"], et["id"], MON, MON)).json()
     assert len(slots) > 0
@@ -245,7 +245,7 @@ def test_finite_slot_blocked_by_conflict_in_week_2(client, db):
     The 09:00 slot is gone; 10:30 (which is free in all 3 weeks) survives."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, count=3)
     _insert_booking(db, tutor["id"], et["id"],
                     _dt(MON + timedelta(weeks=1), 9),
                     _dt(MON + timedelta(weeks=1), 10, 30))
@@ -260,7 +260,7 @@ def test_finite_slot_blocked_by_conflict_in_week_3(client, db):
     """Conflict only in week 3 (the last checked week) still eliminates the slot."""
     tutor = _tutor(client)
     sched = _mon_9_17(client, tutor["id"])
-    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, recur_weeks=3)
+    et = _booking_link(client, _avail(tutor["id"], sched["id"]), recurring=True, count=3)
     _insert_booking(db, tutor["id"], et["id"],
                     _dt(MON + timedelta(weeks=2), 9),
                     _dt(MON + timedelta(weeks=2), 10, 30))
