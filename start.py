@@ -14,9 +14,14 @@ for Docker Desktop or WSL2, start that yourself first if `docker info` isn't res
 """
 
 import argparse
+import contextlib
+import os
 import platform
 import shutil
+import signal
+import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -26,6 +31,29 @@ FRONTEND_DIR = ROOT / "frontend"
 BACKEND_CMD = "poetry run uvicorn main:app --reload --host 0.0.0.0"
 FRONTEND_CMD = "npm run dev"
 DATABASE_CMD = "docker compose up"
+PORTS = {"backend": 8000, "frontend": 5173}
+
+
+def port_in_use(port: int) -> bool:
+    """Connect rather than bind. A leftover server bound to 127.0.0.1:8000 doesn't stop a new one
+    binding 0.0.0.0:8000 — both succeed, and loopback wins, so the browser silently keeps talking to
+    the old process while the new one looks healthy. Connecting is what actually detects that."""
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def check_ports_free() -> bool:
+    busy = {name: port for name, port in PORTS.items() if port_in_use(port)}
+    if not busy:
+        return True
+    print("\nSomething is already listening on:")
+    for name, port in busy.items():
+        print(f"  {name}: port {port}")
+    print("\nStarting anyway would leave you talking to the old process. Free them first:")
+    print(f"  kill $(lsof -ti :{','.join(str(p) for p in busy.values())})" if platform.system() != "Windows"
+          else f"  Get-NetTCPConnection -LocalPort {list(busy.values())[0]} | Select OwningProcess")
+    return False
 
 
 def ensure_docker_runtime():
@@ -80,6 +108,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if not check_ports_free():
+        sys.exit(1)
+
     ensure_docker_runtime()
 
     if args.separate:
@@ -93,11 +124,43 @@ def main():
         return
 
     print("Starting database, backend, and frontend inline (Ctrl+C stops all)...")
+    # start_new_session puts each child in its own process group, so kill_group can take down the
+    # shell *and* the uvicorn/vite underneath it. terminate() alone only kills the shell, which is
+    # how servers used to survive and squat on their ports.
     procs = {
-        "database": subprocess.Popen(DATABASE_CMD, shell=True, cwd=ROOT),
-        "backend": subprocess.Popen(BACKEND_CMD, shell=True, cwd=BACKEND_DIR),
-        "frontend": subprocess.Popen(FRONTEND_CMD, shell=True, cwd=FRONTEND_DIR),
+        "database": subprocess.Popen(DATABASE_CMD, shell=True, cwd=ROOT, start_new_session=True),
+        "backend": subprocess.Popen(BACKEND_CMD, shell=True, cwd=BACKEND_DIR, start_new_session=True),
+        "frontend": subprocess.Popen(FRONTEND_CMD, shell=True, cwd=FRONTEND_DIR, start_new_session=True),
     }
+
+    def kill_group(proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            proc.terminate()
+
+    def shutdown() -> None:
+        print("\nStopping database, backend, and frontend...")
+        for name, proc in procs.items():
+            if name != "database":
+                kill_group(proc)
+        for name, proc in procs.items():
+            if name == "database":
+                continue
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print(f"{name} didn't stop, killing it")
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        stop_database()
+
+    # Closing the terminal sends SIGHUP; without this the children outlive the script.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: (shutdown(), sys.exit(0)))
+
     try:
         while True:
             for name, proc in procs.items():
@@ -105,17 +168,13 @@ def main():
                 if code is not None:
                     print(f"\n{name} exited unexpectedly (code {code}) — stopping everything else...")
                     for other_name, other_proc in procs.items():
-                        if other_name != name and other_proc.poll() is None:
-                            other_proc.terminate()
+                        if other_name != name:
+                            kill_group(other_proc)
                     stop_database()
                     return
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping database, backend, and frontend...")
-        for name, proc in procs.items():
-            if name != "database" and proc.poll() is None:
-                proc.terminate()
-        stop_database()
+        shutdown()
 
 
 if __name__ == "__main__":

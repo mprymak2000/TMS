@@ -15,6 +15,7 @@ Treat this as a project under active development, not a finished product.
 
 ## Prerequisites
 
+- Python >= 3.13
 - [Poetry](https://python-poetry.org/) (backend dependency management)
 - Node.js + npm (frontend)
 - A Docker runtime — [Colima](https://github.com/abiosoft/colima) (macOS), Docker Desktop, or Docker Desktop's WSL2 backend (Windows)

@@ -2,7 +2,7 @@
 name = "tms-backend"
 version = "0.1.0"
 description = ""
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "fastapi (==0.135.1)",
     "uvicorn (==0.41.0)",
