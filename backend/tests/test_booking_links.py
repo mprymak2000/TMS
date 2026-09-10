@@ -1,7 +1,17 @@
+# The policy modes are optional on create but required on PUT (full replace), and these payloads
+# get spread into both.
+_MODES = {
+    "cancel_mode": "auto",
+    "reschedule_mode": "auto",
+    "series_cancel_mode": "auto",
+    "series_reschedule_mode": "auto",
+}
+
 booking_link_tutoring = {
     "slug": "tutoring-session",
     "duration_minutes": 90,
     "recurring": True,
+    **_MODES,
 }
 
 booking_link_custom_duration = {
@@ -12,10 +22,15 @@ booking_link_custom_duration = {
     "recurring": False,
 }
 
+# PUT is a full replace, so the policy modes are required — omitting one would silently reset it.
 booking_link_updated = {
     "slug": "tutoring-session-updated",
     "duration_minutes": 60,
     "recurring": True,
+    "cancel_mode": "auto",
+    "reschedule_mode": "auto",
+    "series_cancel_mode": "auto",
+    "series_reschedule_mode": "auto",
 }
 
 _schedule = {

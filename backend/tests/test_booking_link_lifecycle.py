@@ -190,6 +190,8 @@ def _reassign(client, booking, booking_link_id):
     """Repointing a booking is a field on the plain PUT, not its own endpoint — so it carries the
     whole row, same as any other full-replacement update."""
     return client.put(f"/bookings/{booking['id']}", json={
+        "cancel_mode": "auto",
+        "reschedule_mode": "auto",
         "booking_link_id": booking_link_id,
         "booking_type_id": booking.get("booking_type_id"),
         "student_first": booking["student_first"],

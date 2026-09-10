@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react'
 import { Modal, Button, Menu, TextInput, Select } from '@mantine/core'
-import { IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink } from '@tabler/icons-react'
+import { IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink, IconShieldCog } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingLink, BookingType } from './types'
-import { formatDate, extractError, contactPayload } from './utils'
+import { formatDate, extractError, contactPayload, occurrencePolicyPayload } from './utils'
+import type { OccurrencePolicyFields } from './utils'
+import { CANCEL_MODE_OPTIONS, WINDOW_MODES } from './policyOptions'
 
 interface ContactForm {
     studentEmail: string
@@ -54,6 +56,8 @@ export const useBookingActions = ({
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [reassigning, setReassigning] = useState(false)
     const [reassignTarget, setReassignTarget] = useState<string | null>(null)
+    const [editingPolicy, setEditingPolicy] = useState(false)
+    const [policy, setPolicy] = useState<OccurrencePolicyFields>(() => occurrencePolicyPayload(booking))
 
     // The roster includes archived links so existing rows can resolve their source — but an
     // archived link is never a valid target to move a booking onto.
@@ -62,6 +66,34 @@ export const useBookingActions = ({
     const openReassign = () => {
         setReassignTarget(null)
         setReassigning(true)
+    }
+
+    const openPolicy = () => {
+        setPolicy(occurrencePolicyPayload(booking))
+        setEditingPolicy(true)
+    }
+
+    // Editing a virtual occurrence materializes it first (resolve_ref), so this row becomes a real
+    // exception with its own terms while the rest of the series keeps the series' template.
+    const handlePolicySave = async () => {
+        setIsSubmitting(true)
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ...buildPayload(), ...policy }),
+            })
+            if (!res.ok) {
+                onError(extractError(await res.json(), 'Failed to update policy'))
+                return
+            }
+            setEditingPolicy(false)
+            onRefresh('Policy updated')
+        } catch {
+            onError('An unknown error occurred while updating policy')
+        } finally {
+            setIsSubmitting(false)
+        }
     }
 
     const handleReassign = async () => {
@@ -185,6 +217,7 @@ export const useBookingActions = ({
     const buildPayload = () => ({
         booking_link_id: booking.booking_link_id,
         booking_type_id: booking.booking_type_id,
+        ...occurrencePolicyPayload(booking),
         // Names come off the row (immutable here); the four editable fields come off the form.
         ...contactPayload({
             ...booking,
@@ -315,6 +348,9 @@ export const useBookingActions = ({
             <Menu.Item leftSection={<IconPencil size={14} />} disabled={booking.status !== 'confirmed'} onClick={() => setEditingContact(true)}>
                 Modify contact
             </Menu.Item>
+            <Menu.Item leftSection={<IconShieldCog size={14} />} disabled={booking.status !== 'confirmed'} onClick={openPolicy}>
+                Change policy
+            </Menu.Item>
             <Menu.Item leftSection={<IconUserOff size={14} />} color="orange" disabled={booking.status !== 'confirmed'} onClick={handleNoShow}>
                 Mark as no-show
             </Menu.Item>
@@ -356,6 +392,48 @@ export const useBookingActions = ({
                 <div className="flex justify-end gap-2 mt-4">
                     <Button variant="default" onClick={() => setReassigning(false)}>Cancel</Button>
                     <Button loading={isSubmitting} disabled={!reassignTarget} onClick={handleReassign}>Reassign</Button>
+                </div>
+            </Modal>
+
+            <Modal opened={editingPolicy} onClose={() => setEditingPolicy(false)}
+                title="Change policy for this booking" centered size="sm">
+                <p className="text-sm text-gray-600 mb-4">
+                    Applies to this booking only. It was frozen when the booking was made, so editing
+                    the link never changes it and changing it here never affects anything else.
+                </p>
+                <div className="space-y-3">
+                    <Select
+                        label="Cancellation"
+                        data={CANCEL_MODE_OPTIONS}
+                        value={policy.cancel_mode}
+                        onChange={val => val && setPolicy(p => ({ ...p, cancel_mode: val, cancel_notice_minutes: null }))}
+                    />
+                    {WINDOW_MODES.includes(policy.cancel_mode) && (
+                        <TextInput
+                            label="Notice required (minutes)"
+                            type="number"
+                            value={policy.cancel_notice_minutes ?? ''}
+                            onChange={e => setPolicy(p => ({ ...p, cancel_notice_minutes: e.target.value === '' ? null : Number(e.target.value) }))}
+                        />
+                    )}
+                    <Select
+                        label="Rescheduling"
+                        data={CANCEL_MODE_OPTIONS}
+                        value={policy.reschedule_mode}
+                        onChange={val => val && setPolicy(p => ({ ...p, reschedule_mode: val, reschedule_notice_minutes: null }))}
+                    />
+                    {WINDOW_MODES.includes(policy.reschedule_mode) && (
+                        <TextInput
+                            label="Notice required (minutes)"
+                            type="number"
+                            value={policy.reschedule_notice_minutes ?? ''}
+                            onChange={e => setPolicy(p => ({ ...p, reschedule_notice_minutes: e.target.value === '' ? null : Number(e.target.value) }))}
+                        />
+                    )}
+                </div>
+                <div className="flex justify-end gap-2 mt-4">
+                    <Button variant="default" onClick={() => setEditingPolicy(false)}>Cancel</Button>
+                    <Button loading={isSubmitting} onClick={handlePolicySave}>Save</Button>
                 </div>
             </Modal>
 

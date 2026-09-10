@@ -16,7 +16,7 @@ import Toast from './Toast'
 
 const modeLabel = (mode: string | null) => {
     switch (mode) {
-        case 'not_allowed': return 'Not allowed'
+        case 'blocked': return 'Not allowed'
         case 'request': return 'Request only'
         case 'auto_window_block': return 'Window — allow or block'
         case 'auto_window_request': return 'Window — allow or request'
@@ -312,12 +312,13 @@ const Links = () => {
                         )}
 
                         {/* policy line */}
-                        {(e.cancel_mode || e.reschedule_mode) && (
-                            <div className="flex gap-5 border-t border-gray-100 pt-3 mt-1">
-                                <span className="text-xs text-gray-400">Cancel <span className="text-gray-600 font-medium">{modeLabel(e.cancel_mode)}</span></span>
-                                <span className="text-xs text-gray-400">Reschedule <span className="text-gray-600 font-medium">{modeLabel(e.reschedule_mode)}</span></span>
-                            </div>
-                        )}
+                        <div className="flex gap-5 border-t border-gray-100 pt-3 mt-1">
+                            <span className="text-xs text-gray-400">Cancel <span className="text-gray-600 font-medium">{modeLabel(e.cancel_mode)}</span></span>
+                            <span className="text-xs text-gray-400">Reschedule <span className="text-gray-600 font-medium">{modeLabel(e.reschedule_mode)}</span></span>
+                            {e.recurring && (
+                                <span className="text-xs text-gray-400">Series <span className="text-gray-600 font-medium">{modeLabel(e.series_cancel_mode)}</span></span>
+                            )}
+                        </div>
                     </div>
                 ))}
             </div>

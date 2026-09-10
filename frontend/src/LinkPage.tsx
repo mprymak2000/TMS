@@ -7,6 +7,7 @@ import { extractError } from './utils'
 import { useToast } from './useToast'
 import Toast from './Toast'
 import BookingTypePicker from './BookingTypePicker'
+import { CANCEL_MODE_OPTIONS, SERIES_MODE_OPTIONS, WINDOW_MODES } from './policyOptions'
 
 type NoticeUnit = 'minutes' | 'hours' | 'days'
 const NOTICE_UNITS = [
@@ -28,15 +29,6 @@ const BOOK_URL_PREFIX = `${window.location.host}/book/`
 // An unrecognised ?tab= matches no panel and renders blank, so it falls back to details.
 const TABS = ['details', 'duration', 'recurrence', 'hosts', 'cancellation', 'limits', 'booking'] as const
 
-const WINDOW_MODES = ['auto_window_block', 'auto_window_request', 'request_window']
-const CANCEL_MODE_OPTIONS = [
-    { value: 'auto', label: 'Always allowed' },
-    { value: 'not_allowed', label: 'Not allowed' },
-    { value: 'request', label: 'Request only' },
-    { value: 'auto_window_block', label: 'Window — allow or block' },
-    { value: 'auto_window_request', label: 'Window — allow or request' },
-    { value: 'request_window', label: 'Window — request or block' },
-]
 
 interface FormState {
     slug: string
@@ -53,10 +45,12 @@ interface FormState {
     bufferMinutes: number | null
     intervalMinutes: number | null
     price: number | null
-    cancelMode: string | null
+    cancelMode: string
     cancelNoticeMinutes: number | null
-    rescheduleMode: string | null
+    rescheduleMode: string
     rescheduleNoticeMinutes: number | null
+    seriesCancelMode: string
+    seriesRescheduleMode: string
     limitPerDay: number | null
     limitPerWeek: number | null
     limitPerMonth: number | null
@@ -103,10 +97,12 @@ const buildInitial = (link: BookingLink | null): FormState => ({
     bufferMinutes: link?.buffer_minutes ?? null,
     intervalMinutes: link?.interval_minutes ?? null,
     price: link?.price ?? null,
-    cancelMode: link?.cancel_mode ?? null,
+    cancelMode: link?.cancel_mode ?? 'auto',
     cancelNoticeMinutes: link?.cancel_notice_minutes ?? null,
-    rescheduleMode: link?.reschedule_mode ?? null,
+    rescheduleMode: link?.reschedule_mode ?? 'auto',
     rescheduleNoticeMinutes: link?.reschedule_notice_minutes ?? null,
+    seriesCancelMode: link?.series_cancel_mode ?? 'auto',
+    seriesRescheduleMode: link?.series_reschedule_mode ?? 'auto',
     limitPerDay: link?.limit_per_day ?? null,
     limitPerWeek: link?.limit_per_week ?? null,
     limitPerMonth: link?.limit_per_month ?? null,
@@ -253,6 +249,8 @@ const LinkPage = () => {
         cancel_notice_minutes: form.cancelNoticeMinutes,
         reschedule_mode: form.rescheduleMode,
         reschedule_notice_minutes: form.rescheduleNoticeMinutes,
+        series_cancel_mode: form.seriesCancelMode,
+        series_reschedule_mode: form.seriesRescheduleMode,
         limit_per_day: form.limitPerDay,
         limit_per_week: form.limitPerWeek,
         limit_per_month: form.limitPerMonth,
@@ -714,8 +712,8 @@ const LinkPage = () => {
                                         label="Cancellation"
                                         size="sm"
                                         data={CANCEL_MODE_OPTIONS}
-                                        value={form.cancelMode ?? 'auto'}
-                                        onChange={val => setForm(prev => ({ ...prev, cancelMode: val, cancelNoticeMinutes: null }))}
+                                        value={form.cancelMode}
+                                        onChange={val => val && setForm(prev => ({ ...prev, cancelMode: val, cancelNoticeMinutes: null }))}
                                     />
                                     {form.cancelMode && WINDOW_MODES.includes(form.cancelMode) && (
                                         <div className="flex gap-2 items-end">
@@ -742,8 +740,8 @@ const LinkPage = () => {
                                         label="Rescheduling"
                                         size="sm"
                                         data={CANCEL_MODE_OPTIONS}
-                                        value={form.rescheduleMode ?? 'auto'}
-                                        onChange={val => setForm(prev => ({ ...prev, rescheduleMode: val, rescheduleNoticeMinutes: null }))}
+                                        value={form.rescheduleMode}
+                                        onChange={val => val && setForm(prev => ({ ...prev, rescheduleMode: val, rescheduleNoticeMinutes: null }))}
                                     />
                                     {form.rescheduleMode && WINDOW_MODES.includes(form.rescheduleMode) && (
                                         <div className="flex gap-2 items-end">
@@ -764,6 +762,34 @@ const LinkPage = () => {
                                             <Select data={NOTICE_UNITS} value={rescheduleUnit} size="sm" onChange={val => val && setRescheduleUnit(val as NoticeUnit)} className="w-24" />
                                         </div>
                                     )}
+                                </div>
+                            </Group>
+                        )}
+
+                        {/* CANCELLATION, whole series */}
+                        {activeTab === 'cancellation' && form.recurring && (
+                            <Group title="Ending a whole series">
+                                <div className="px-4 pt-3">
+                                    <p className="text-xs text-gray-400">
+                                        Applies to cancelling or moving an entire series rather than one session.
+                                        No notice window, since there's no single session to measure it against.
+                                    </p>
+                                </div>
+                                <div className="p-4 space-y-3">
+                                    <Select
+                                        label="Cancel the series"
+                                        size="sm"
+                                        data={SERIES_MODE_OPTIONS}
+                                        value={form.seriesCancelMode}
+                                        onChange={val => val && setForm(prev => ({ ...prev, seriesCancelMode: val }))}
+                                    />
+                                    <Select
+                                        label="Reschedule the series"
+                                        size="sm"
+                                        data={SERIES_MODE_OPTIONS}
+                                        value={form.seriesRescheduleMode}
+                                        onChange={val => val && setForm(prev => ({ ...prev, seriesRescheduleMode: val }))}
+                                    />
                                 </div>
                             </Group>
                         )}

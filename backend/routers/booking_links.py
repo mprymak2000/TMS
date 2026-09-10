@@ -181,6 +181,6 @@ def get_archive_impact(booking_link_id: int, include_archived: bool = False, db:
     # say (an active series has status IS NULL). Reuse the shared filter rather than re-deriving it.
     series = db.query(BookingSeries).filter(
         BookingSeries.booking_link_id == booking_link_id,
-        active_series_filter(now.date()),
+        active_series_filter(),
     ).count()
     return {"upcoming_bookings": upcoming, "active_series": series}

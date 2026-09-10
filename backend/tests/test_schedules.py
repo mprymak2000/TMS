@@ -192,3 +192,23 @@ def test_delete_schedule_blocked_when_linked_to_booking_link(client):
     response = client.delete(f"/schedules/{non_default['id']}")
     assert response.status_code == 409
     assert client.get(f"/schedules/{non_default['id']}").status_code == 200
+
+
+def test_delete_schedule_allowed_once_the_only_link_is_archived(client):
+    """Archive is terminal, so counting an archived link's availability rows would make any schedule
+    it ever used permanently undeletable — and they guard nothing, since its rules are inert."""
+    tutor = create_tutor(client)
+    client.post("/schedules/", json={**schedule_regular, "tutor_id": tutor["id"]})
+    non_default = client.post("/schedules/", json={**schedule_summer, "tutor_id": tutor["id"]}).json()
+    booking_link = client.post("/booking_links/", json={
+        "slug": "tutoring",
+        "duration_minutes": 60,
+        "recurring": False,
+        "availability": [{"tutor_id": tutor["id"], "schedule_id": non_default["id"]}],
+    }).json()
+
+    assert client.delete(f"/schedules/{non_default['id']}").status_code == 409
+
+    assert client.delete(f"/booking_links/{booking_link['id']}").status_code == 200
+    assert client.delete(f"/schedules/{non_default['id']}").status_code == 200
+    assert client.get(f"/schedules/{non_default['id']}").status_code == 404

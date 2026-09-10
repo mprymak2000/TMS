@@ -46,7 +46,7 @@ def extend_all_series(timestamp: int):
             raise RuntimeError("Settings row not found")
         today = datetime.now(ZoneInfo(settings.business_timezone)).date()
         series_list = db.query(BookingSeries).filter(
-            active_series_filter(today),
+            active_series_filter(),
             indefinite_series_filter(),
         ).all()
         for series in series_list:
@@ -81,7 +81,7 @@ def extend_single_series(series_id: int):
         # return cleanly rather than let _ensure_occurrence's ValueError trigger a retry loop
         # that would just hit the same permanent state forever.
         today = datetime.now(tz).date()
-        if not is_series_active(series, today):
+        if not is_series_active(series, db):
             return
         # Same race as above, different cause: the series' tutor may have gone inactive since this
         # job was enqueued. Don't attach new future occurrences to a tutor no longer taking them.

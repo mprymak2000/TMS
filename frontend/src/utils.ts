@@ -62,6 +62,33 @@ export const contactPayload = (r: ContactFields): ContactFields => ({
     parent_phone:  r.parent_phone,
 })
 
+// Policy is frozen on the row and required on every PUT, so edits carry the row's current values
+// forward unchanged. The occurrence four are on both Booking and BookingSeries; the series two
+// only on BookingSeries.
+export interface OccurrencePolicyFields {
+    cancel_mode: string
+    cancel_notice_minutes: number | null
+    reschedule_mode: string
+    reschedule_notice_minutes: number | null
+}
+
+export interface SeriesPolicyFields {
+    series_cancel_mode: string
+    series_reschedule_mode: string
+}
+
+export const occurrencePolicyPayload = (r: OccurrencePolicyFields): OccurrencePolicyFields => ({
+    cancel_mode: r.cancel_mode,
+    cancel_notice_minutes: r.cancel_notice_minutes,
+    reschedule_mode: r.reschedule_mode,
+    reschedule_notice_minutes: r.reschedule_notice_minutes,
+})
+
+export const seriesPolicyPayload = (r: SeriesPolicyFields): SeriesPolicyFields => ({
+    series_cancel_mode: r.series_cancel_mode,
+    series_reschedule_mode: r.series_reschedule_mode,
+})
+
 export const tutorInitials = (t: { first_name: string; last_name: string }) =>
     `${t.first_name[0]}${t.last_name[0]}`.toUpperCase()
 

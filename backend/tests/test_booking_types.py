@@ -195,6 +195,10 @@ def test_relabelling_a_series_carries_to_all_its_occurrences(client):
         client.delete(f"/bookings/{_next_occurrence_ref(first)}")
 
     client.put(f"/bookings/booking-series/{first['series_id']}", json={
+        "cancel_mode": "auto",
+        "reschedule_mode": "auto",
+        "series_cancel_mode": "auto",
+        "series_reschedule_mode": "auto",
         "booking_link_id": link["id"],
         "booking_type_id": replacement["id"],
         "student_first": booking_payload["student_first"],
@@ -242,6 +246,8 @@ def test_virtual_and_materialized_occurrences_agree_field_for_field(client):
 
     # Materialize it via a contact-info PUT — a write that changes nothing else about the row.
     client.put(f"/bookings/{ref}", json={
+        "cancel_mode": "auto",
+        "reschedule_mode": "auto",
         "booking_link_id": link["id"],
         "booking_type_id": t["id"],
         "student_first": booking_payload["student_first"],
@@ -326,6 +332,8 @@ def test_reclassifying_one_booking_moves_only_that_row(client):
     second = _book(client, tutor, link, start="2099-06-11T16:00:00", end="2099-06-11T17:00:00")
 
     client.put(f"/bookings/{first['id']}", json={
+        "cancel_mode": "auto",
+        "reschedule_mode": "auto",
         "booking_link_id": link["id"],
         "booking_type_id": consult["id"],
         "student_first": booking_payload["student_first"],

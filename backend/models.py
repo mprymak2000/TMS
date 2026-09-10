@@ -3,13 +3,6 @@ from sqlalchemy.orm import relationship, backref
 from database import Base
 from datetime import datetime, timedelta, UTC
 from uuid import uuid4
-from policy import get_cancel_action, get_reschedule_action
-
-
-def _minutes_until(start: datetime) -> float:
-    """Defensive against naive datetimes (SQLite in tests doesn't preserve tz-awareness)."""
-    start_tz = start if start.tzinfo else start.replace(tzinfo=UTC)
-    return (start_tz - datetime.now(UTC)).total_seconds() / 60
 
 class Student(Base):
     __tablename__ = "students"
@@ -103,7 +96,9 @@ class Schedule(Base):
 #todo: consider making duration variable (1hr, 1.5hr, 2hr) instead of fixed 1hr, which would allow for more flexible scheduling
 
 _WINDOW_MODES_SQL = "('auto_window_block', 'auto_window_request', 'request_window')"
-_ALL_MODES_SQL = "('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')"
+_ALL_MODES_SQL = "('blocked', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')"
+# Series-level actions: no notice window — there's no instant to measure it against.
+_SERIES_MODES_SQL = "('blocked', 'auto', 'request')"
 # active   — bookable; calendar rules live and editable
 # paused   — not bookable; rules stay live and editable, existing bookings still reschedule. Reversible.
 # archived — not bookable; rules inert, row read-only. Terminal, no restore.
@@ -150,12 +145,20 @@ class BookingLink(Base):
     __tablename__ = "booking_links"
     __table_args__ = (
         CheckConstraint(
-            f"cancel_mode IS NULL OR cancel_mode IN {_ALL_MODES_SQL}",
+            f"cancel_mode IN {_ALL_MODES_SQL}",
             name="chk_booking_link_cancel_mode"
         ),
         CheckConstraint(
-            f"reschedule_mode IS NULL OR reschedule_mode IN {_ALL_MODES_SQL}",
+            f"reschedule_mode IN {_ALL_MODES_SQL}",
             name="chk_booking_link_reschedule_mode"
+        ),
+        CheckConstraint(
+            f"series_cancel_mode IN {_SERIES_MODES_SQL}",
+            name="chk_booking_link_series_cancel_mode"
+        ),
+        CheckConstraint(
+            f"series_reschedule_mode IN {_SERIES_MODES_SQL}",
+            name="chk_booking_link_series_reschedule_mode"
         ),
         CheckConstraint(
             f"cancel_mode NOT IN {_WINDOW_MODES_SQL} OR (cancel_notice_minutes IS NOT NULL AND cancel_notice_minutes > 0)",
@@ -193,10 +196,14 @@ class BookingLink(Base):
     id = Column(Integer, primary_key=True, index=True)
     status = Column(String, nullable=False, default="active")
     archived_at = Column(DateTime(timezone=True), nullable=True)  # audit metadata; nothing branches on it
-    cancel_mode = Column(String, nullable=True)  # not_allowed, auto, auto_window_block, auto_window_request, request, request_window; null = auto
-    cancel_notice_minutes = Column(Integer, nullable=True)
-    reschedule_mode = Column(String, nullable=True)  # same options; null = auto
+    # Governs one occurrence. Copied onto each Booking/BookingSeries at creation, never propagated after.
+    cancel_mode = Column(String, nullable=False, server_default="auto")  # see _ALL_MODES_SQL
+    cancel_notice_minutes = Column(Integer, nullable=True)  # only set for the window modes
+    reschedule_mode = Column(String, nullable=False, server_default="auto")
     reschedule_notice_minutes = Column(Integer, nullable=True)
+    # Governs acting on a whole series. No notice window — see _SERIES_MODES_SQL.
+    series_cancel_mode = Column(String, nullable=False, server_default="auto")
+    series_reschedule_mode = Column(String, nullable=False, server_default="auto")
     #basic info
     slug = Column(String, nullable=False)  # public URL only; uniqueness enforced by the partial index above
     # The kind this link stamps onto what it generates. Live — editing it reaches future bookings
@@ -254,11 +261,11 @@ class BookingLinkAvailability(Base):
 #     __tablename__ = "cancellation_policies"
 #   __table_args__ = (
 #     CheckConstraint(
-#            "cancel_mode IN ('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')",
+#            "cancel_mode IN ('blocked', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')",
 #            name="chk_cancellation_policy_cancel_mode"
 #        ),
 #        CheckConstraint(
-#            "reschedule_mode IN ('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')",
+#            "reschedule_mode IN ('blocked', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')",
 #            name="chk_cancellation_policy_reschedule_mode"
 #        )
 #    )
@@ -286,6 +293,18 @@ class BookingSeries(Base):
         ),
         # RFC5545: a rule carries one or the other, never both.
         CheckConstraint("until IS NULL OR count IS NULL", name="chk_booking_series_not_both_until_and_count"),
+        CheckConstraint(f"cancel_mode IN {_ALL_MODES_SQL}", name="chk_booking_series_cancel_mode"),
+        CheckConstraint(f"reschedule_mode IN {_ALL_MODES_SQL}", name="chk_booking_series_reschedule_mode"),
+        CheckConstraint(
+            f"cancel_mode NOT IN {_WINDOW_MODES_SQL} OR (cancel_notice_minutes IS NOT NULL AND cancel_notice_minutes > 0)",
+            name="chk_booking_series_cancel_notice_required",
+        ),
+        CheckConstraint(
+            f"reschedule_mode NOT IN {_WINDOW_MODES_SQL} OR (reschedule_notice_minutes IS NOT NULL AND reschedule_notice_minutes > 0)",
+            name="chk_booking_series_reschedule_notice_required",
+        ),
+        CheckConstraint(f"series_cancel_mode IN {_SERIES_MODES_SQL}", name="chk_booking_series_series_cancel_mode"),
+        CheckConstraint(f"series_reschedule_mode IN {_SERIES_MODES_SQL}", name="chk_booking_series_series_reschedule_mode"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -307,6 +326,14 @@ class BookingSeries(Base):
     interval = Column(Integer, nullable=False, default=1)        # every N periods; 1 today, biweekly and beyond planned — see SUPPORTED_INTERVALS
     until = Column(Date, nullable=True)
     count = Column(Integer, nullable=True)
+    # Frozen from the link at creation. The cancel_*/reschedule_* pair is the template each
+    # occurrence copies; the series_* pair governs acting on the series itself.
+    cancel_mode = Column(String, nullable=False, server_default="auto")
+    cancel_notice_minutes = Column(Integer, nullable=True)
+    reschedule_mode = Column(String, nullable=False, server_default="auto")
+    reschedule_notice_minutes = Column(Integer, nullable=True)
+    series_cancel_mode = Column(String, nullable=False, server_default="auto")
+    series_reschedule_mode = Column(String, nullable=False, server_default="auto")
     # byday: omitted, derivable from dtstart.weekday() until multi-day-per-series is supported.
     # Real support needs an array column, not a scalar, so a placeholder now would just be replaced.
     # wkst: omitted, only defines week boundaries when grouping multi-day recurrence — moot without byday.
@@ -349,20 +376,6 @@ class BookingSeries(Base):
         return self.dtend - self.dtstart
 
 
-    @property
-    def _next_upcoming_minutes_until(self) -> float:
-        now = datetime.now(UTC)
-        starts = (b.start if b.start.tzinfo else b.start.replace(tzinfo=UTC) for b in self.bookings if b.status == "confirmed")
-        upcoming = [s for s in starts if s >= now]
-        return (min(upcoming) - now).total_seconds() / 60 if upcoming else float('inf')
-
-    @property
-    def cancel_action(self) -> str:
-        return get_cancel_action(self.booking_link,self._next_upcoming_minutes_until)
-
-    @property
-    def reschedule_action(self) -> str:
-        return get_reschedule_action(self.booking_link,self._next_upcoming_minutes_until)
 
 
 class Booking(Base):
@@ -378,6 +391,16 @@ class Booking(Base):
             name="chk_booking_phone"
         ),
         UniqueConstraint("series_id", "start", name="uq_booking_series_occurence"),
+        CheckConstraint(f"cancel_mode IN {_ALL_MODES_SQL}", name="chk_booking_cancel_mode"),
+        CheckConstraint(f"reschedule_mode IN {_ALL_MODES_SQL}", name="chk_booking_reschedule_mode"),
+        CheckConstraint(
+            f"cancel_mode NOT IN {_WINDOW_MODES_SQL} OR (cancel_notice_minutes IS NOT NULL AND cancel_notice_minutes > 0)",
+            name="chk_booking_cancel_notice_required",
+        ),
+        CheckConstraint(
+            f"reschedule_mode NOT IN {_WINDOW_MODES_SQL} OR (reschedule_notice_minutes IS NOT NULL AND reschedule_notice_minutes > 0)",
+            name="chk_booking_reschedule_notice_required",
+        ),
         # Matches how every list query reads: filter a time window, order by (start, public_id), seek
         # from the cursor's tuple. Composite so the ORDER BY needs no sort step at all — with a page
         # size of 50 the planner walks 50 index entries instead of sorting the table. Leftmost-prefix
@@ -398,6 +421,11 @@ class Booking(Base):
     google_event_id = Column(String, nullable=False) #derived after google creates the event, not passed in
     status = Column(String, nullable=False, default="confirmed")
     is_no_show = Column(Boolean, nullable=False, default=False)
+    # Frozen at creation — off the series for an occurrence, off the link otherwise. Never propagated after.
+    cancel_mode = Column(String, nullable=False, server_default="auto")
+    cancel_notice_minutes = Column(Integer, nullable=True)
+    reschedule_mode = Column(String, nullable=False, server_default="auto")
+    reschedule_notice_minutes = Column(Integer, nullable=True)
     # ondelete="SET NULL": cascade hard-delete in permanently_delete_booking walks the predecessor chain and
     # deletes rows in order [immediate_predecessor, ..., furthest_predecessor, primary]. When the immediate
     # predecessor is deleted first, the next row still has rescheduled_to pointing at it — FK RESTRICT would
@@ -445,13 +473,6 @@ class Booking(Base):
     def rescheduled_from_public_id(self) -> str | None:
         return self.rescheduled_from_booking.public_id if self.rescheduled_from_booking else None
 
-    @property
-    def cancel_action(self) -> str:
-        return get_cancel_action(self.booking_link,_minutes_until(self.start))
-
-    @property
-    def reschedule_action(self) -> str:
-        return get_reschedule_action(self.booking_link,_minutes_until(self.start))
 
 
 class Settings(Base):

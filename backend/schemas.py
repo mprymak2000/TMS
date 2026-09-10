@@ -1,7 +1,9 @@
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 from datetime import date, time, datetime, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo
+
+from policy import get_cancel_action, get_reschedule_action, minutes_until
 
 #todo: consider patch instead of put for updates, as it allows for partial updates and is more flexible but more complex to implement. put requires the entire object to be sent, which can be simpler but less efficient for updates that only change a few fields.
 #todo: change student rate Field(gt=0) to Field(ge=0) in StudentCreate and StudentUpdate — rate=0 should be allowed (e.g. a family member). Also check tutor_payout logic for division by zero when student.rate=0.
@@ -242,8 +244,10 @@ _SLUG_PATTERN = r'^[a-z0-9]+(?:-[a-z0-9]+)*$'
 # calendar invites; 500 is the common ceiling for a short description field (Stripe uses the same).
 DESCRIPTION_MAX_LENGTH = 500
 
-_VALID_MODES = ('not_allowed', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')
+_VALID_MODES = ('blocked', 'auto', 'auto_window_block', 'auto_window_request', 'request', 'request_window')
 _WINDOW_MODES = ('auto_window_block', 'auto_window_request', 'request_window')
+# Series-level actions have no notice window, so the mode is already the verdict.
+_SERIES_MODES = ('blocked', 'auto', 'request')
 
 # policy fields moved directly onto BookingLink — CancellationPolicy schemas kept for reference
 # class CancellationPolicyCreate(BaseModel):
@@ -324,10 +328,13 @@ class BookingLinkCreate(BaseModel):
     booker_can_set_count: bool = False
 
     price: float | None = None
-    cancel_mode: str | None = None
+    # 'auto' rather than None — the columns are NOT NULL, so there's no "unset" to fall back to.
+    cancel_mode: str = 'auto'
     cancel_notice_minutes: int | None = None
-    reschedule_mode: str | None = None
+    reschedule_mode: str = 'auto'
     reschedule_notice_minutes: int | None = None
+    series_cancel_mode: str = 'auto'
+    series_reschedule_mode: str = 'auto'
 
     buffer_minutes: int | None = None
     interval_minutes: int | None = None
@@ -344,10 +351,14 @@ class BookingLinkCreate(BaseModel):
     @model_validator(mode="after")
     def validate_recurrence(self):
         _validate_recurrence(self.count, self.expires_on, self.booker_can_set_recur_until, self.booker_can_set_count)
-        if self.cancel_mode is not None and self.cancel_mode not in _VALID_MODES:
+        if self.cancel_mode not in _VALID_MODES:
             raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
-        if self.reschedule_mode is not None and self.reschedule_mode not in _VALID_MODES:
+        if self.reschedule_mode not in _VALID_MODES:
             raise ValueError(f"reschedule_mode must be one of {_VALID_MODES}")
+        if self.series_cancel_mode not in _SERIES_MODES:
+            raise ValueError(f"series_cancel_mode must be one of {_SERIES_MODES}")
+        if self.series_reschedule_mode not in _SERIES_MODES:
+            raise ValueError(f"series_reschedule_mode must be one of {_SERIES_MODES}")
         if self.cancel_mode in _WINDOW_MODES and not (self.cancel_notice_minutes and self.cancel_notice_minutes > 0):
             raise ValueError("cancel_notice_minutes must be > 0 when cancel_mode is a window mode")
         if self.reschedule_mode in _WINDOW_MODES and not (self.reschedule_notice_minutes and self.reschedule_notice_minutes > 0):
@@ -374,10 +385,12 @@ class BookingLinkUpdate(BaseModel):
     booker_can_set_count: bool = False
 
     price: float | None = None
-    cancel_mode: str | None = None
+    cancel_mode: str
     cancel_notice_minutes: int | None = None
-    reschedule_mode: str | None = None
+    reschedule_mode: str
     reschedule_notice_minutes: int | None = None
+    series_cancel_mode: str
+    series_reschedule_mode: str
 
     buffer_minutes: int | None = None
     interval_minutes: int | None = None
@@ -394,10 +407,14 @@ class BookingLinkUpdate(BaseModel):
     @model_validator(mode="after")
     def validate_recurrence(self):
         _validate_recurrence(self.count, self.expires_on, self.booker_can_set_recur_until, self.booker_can_set_count)
-        if self.cancel_mode is not None and self.cancel_mode not in _VALID_MODES:
+        if self.cancel_mode not in _VALID_MODES:
             raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
-        if self.reschedule_mode is not None and self.reschedule_mode not in _VALID_MODES:
+        if self.reschedule_mode not in _VALID_MODES:
             raise ValueError(f"reschedule_mode must be one of {_VALID_MODES}")
+        if self.series_cancel_mode not in _SERIES_MODES:
+            raise ValueError(f"series_cancel_mode must be one of {_SERIES_MODES}")
+        if self.series_reschedule_mode not in _SERIES_MODES:
+            raise ValueError(f"series_reschedule_mode must be one of {_SERIES_MODES}")
         if self.cancel_mode in _WINDOW_MODES and not (self.cancel_notice_minutes and self.cancel_notice_minutes > 0):
             raise ValueError("cancel_notice_minutes must be > 0 when cancel_mode is a window mode")
         if self.reschedule_mode in _WINDOW_MODES and not (self.reschedule_notice_minutes and self.reschedule_notice_minutes > 0):
@@ -426,10 +443,12 @@ class BookingLinkResponse(BaseModel):
     booker_can_set_recur_until: bool
 
     price: float | None = None
-    cancel_mode: str | None = None
+    cancel_mode: str
     cancel_notice_minutes: int | None = None
-    reschedule_mode: str | None = None
+    reschedule_mode: str
     reschedule_notice_minutes: int | None = None
+    series_cancel_mode: str
+    series_reschedule_mode: str
 
     buffer_minutes: int | None = None
     interval_minutes: int | None = None
@@ -518,8 +537,22 @@ class BookingResponse(BaseModel):
     rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
     rescheduled_from: str | None = Field(default=None, validation_alias="rescheduled_from_public_id")
     google_event_id: str
-    cancel_action: str
-    reschedule_action: str
+    cancel_mode: str
+    cancel_notice_minutes: int | None = None
+    reschedule_mode: str
+    reschedule_notice_minutes: int | None = None
+
+    # On the schema, not the model, so virtual occurrences get it too — they're built in memory and
+    # never have a row to read a property off.
+    @computed_field
+    @property
+    def cancel_action(self) -> str:
+        return get_cancel_action(self, minutes_until(self.start))
+
+    @computed_field
+    @property
+    def reschedule_action(self) -> str:
+        return get_reschedule_action(self, minutes_until(self.start))
 
     student_first: str
     student_last: str
@@ -547,12 +580,14 @@ class BookingSeriesResponse(BaseModel):
     rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
     rescheduled_from: str | None = Field(default=None, validation_alias="rescheduled_from_public_id")
     # Not read from the ORM object (no such attribute exists there) - always set explicitly by the
-    # router via is_series_active(series, today), since it needs business-local "today" to compute
-    # correctly. See routers/bookings.py response-construction sites.
+    # router via is_series_active(series, db), which queries the series' occurrences.
+    # See routers/bookings.py response-construction sites.
     is_active: bool | None = None
     google_event_id: str | None = None
-    cancel_action: str
-    reschedule_action: str
+    # Series modes carry no notice window, so the mode IS the verdict — aliased rather than computed,
+    # so the frontend reads the same field name on a series as on a booking.
+    cancel_action: str = Field(validation_alias="series_cancel_mode")
+    reschedule_action: str = Field(validation_alias="series_reschedule_mode")
 
     student_first: str
     student_last: str
@@ -609,6 +644,11 @@ class BookingCreate(BaseModel):
 class BookingUpdate(BaseModel):
     booking_link_id: int         # which link's rules govern future reschedules; rejects archived
     booking_type_id: int | None = None  # null clears the kind label — it's optional
+    # Frozen at creation, so this PUT is the only way they ever change.
+    cancel_mode: str
+    cancel_notice_minutes: int | None = None
+    reschedule_mode: str
+    reschedule_notice_minutes: int | None = None
     student_first: str
     student_last: str
     student_email: str | None = None
@@ -616,6 +656,18 @@ class BookingUpdate(BaseModel):
     parent_email: str | None = None
     parent_phone: str | None = None
     is_no_show: bool = False
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        if self.cancel_mode not in _VALID_MODES:
+            raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
+        if self.reschedule_mode not in _VALID_MODES:
+            raise ValueError(f"reschedule_mode must be one of {_VALID_MODES}")
+        if self.cancel_mode in _WINDOW_MODES and not (self.cancel_notice_minutes and self.cancel_notice_minutes > 0):
+            raise ValueError("cancel_notice_minutes must be > 0 when cancel_mode is a window mode")
+        if self.reschedule_mode in _WINDOW_MODES and not (self.reschedule_notice_minutes and self.reschedule_notice_minutes > 0):
+            raise ValueError("reschedule_notice_minutes must be > 0 when reschedule_mode is a window mode")
+        return self
 
     @model_validator(mode="after")
     def validate_contact(self):
@@ -632,12 +684,36 @@ class BookingSeriesUpdate(BaseModel):
     moving a series creates a new row, so it can't be a PUT."""
     booking_link_id: int
     booking_type_id: int | None = None
+    # The occurrence pair is the template each future occurrence copies; the series pair governs
+    # acting on the series itself. Both frozen at creation, so this PUT is the only way they change.
+    cancel_mode: str
+    cancel_notice_minutes: int | None = None
+    reschedule_mode: str
+    reschedule_notice_minutes: int | None = None
+    series_cancel_mode: str
+    series_reschedule_mode: str
     student_first: str
     student_last: str
     student_email: str | None = None
     student_phone: str | None = None
     parent_email: str | None = None
     parent_phone: str | None = None
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        if self.cancel_mode not in _VALID_MODES:
+            raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
+        if self.reschedule_mode not in _VALID_MODES:
+            raise ValueError(f"reschedule_mode must be one of {_VALID_MODES}")
+        if self.series_cancel_mode not in _SERIES_MODES:
+            raise ValueError(f"series_cancel_mode must be one of {_SERIES_MODES}")
+        if self.series_reschedule_mode not in _SERIES_MODES:
+            raise ValueError(f"series_reschedule_mode must be one of {_SERIES_MODES}")
+        if self.cancel_mode in _WINDOW_MODES and not (self.cancel_notice_minutes and self.cancel_notice_minutes > 0):
+            raise ValueError("cancel_notice_minutes must be > 0 when cancel_mode is a window mode")
+        if self.reschedule_mode in _WINDOW_MODES and not (self.reschedule_notice_minutes and self.reschedule_notice_minutes > 0):
+            raise ValueError("reschedule_notice_minutes must be > 0 when reschedule_mode is a window mode")
+        return self
 
     @model_validator(mode="after")
     def validate_contact(self):

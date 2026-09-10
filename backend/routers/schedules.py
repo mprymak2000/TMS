@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import BookingLinkAvailability, Schedule, ScheduleDay, Tutor
+from models import BookingLink, BookingLinkAvailability, Schedule, ScheduleDay, Tutor
 from schemas import ScheduleCreate, ScheduleUpdate, ScheduleResponse
 
 router = APIRouter(prefix="/schedules", tags=["schedules"])
@@ -95,7 +95,16 @@ def delete_schedule(schedule_id: int, db: Session = Depends(get_db)):
     if db_schedule.is_default:
         raise HTTPException(status_code=400, detail="Cannot delete the default schedule. Set another schedule as default first.")
 
-    if db.query(BookingLinkAvailability).filter(BookingLinkAvailability.schedule_id == schedule_id).first():
+    # Archived links excluded: their calendar rules are inert, so their availability rows guard
+    # nothing — and since archive is terminal, counting them would make any schedule ever used by a
+    # since-archived link permanently undeletable.
+    in_use = (
+        db.query(BookingLinkAvailability)
+        .join(BookingLink, BookingLink.id == BookingLinkAvailability.booking_link_id)
+        .filter(BookingLinkAvailability.schedule_id == schedule_id, BookingLink.status != "archived")
+        .first()
+    )
+    if in_use:
         raise HTTPException(status_code=409, detail="Cannot delete a schedule still in use by a booking link. Reassign those booking links to a different schedule first.")
 
     # Build the response before deleting — passive_deletes=True (needed so DB-level CASCADE from a

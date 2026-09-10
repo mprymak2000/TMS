@@ -720,10 +720,9 @@ def get_available_slots(
     # candidates in one pass can span multiple weekdays anyway). Holes come from any
     # of the series' own occurrences that were cancelled/rescheduled.
     inf_rules = {t.id: [] for t in db_tutors}
-    today = datetime.now(business_tz).date()
     series_q = db.query(BookingSeries).filter(
         BookingSeries.tutor_id.in_(tutor_ids),
-        active_series_filter(today),
+        active_series_filter(),
         indefinite_series_filter(),
     )
     if exclude_series_id is not None:

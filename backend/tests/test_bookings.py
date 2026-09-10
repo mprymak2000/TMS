@@ -1,8 +1,10 @@
 from datetime import date, datetime, timedelta, UTC
+from uuid import uuid4
 import time
 from unittest.mock import patch, MagicMock
 from conftest import TestingSessionLocal
-from models import Booking, BookingSeries
+from booking_utils import _ensure_occurrence
+from models import Booking, BookingSeries, Settings
 from schemas import BookingResponse
 from routers.bookings import PAGE_SIZE, DEFAULT_PAGE_SIZE
 
@@ -18,10 +20,15 @@ def _all_bookings():
 tutor_payload = {"first_name": "Tutor", "last_name": "Test", "pay_rate": 0, "calendar_id": "tutor@calendar.com"}
 
 # Standalone — each POST creates exactly 1 Booking row
+# Optional on create, required on PUT (full replace) — this gets spread into both.
 booking_link_standalone = {
     "slug": "one-off-session",
     "duration_minutes": 90,
     "recurring": False,
+    "cancel_mode": "auto",
+    "reschedule_mode": "auto",
+    "series_cancel_mode": "auto",
+    "series_reschedule_mode": "auto",
 }
 
 # Recurring indefinite (Mode C) — each POST creates 27 rows (week 0..26)
@@ -29,6 +36,10 @@ booking_link_recurring = {
     "slug": "tutoring-session",
     "duration_minutes": 90,
     "recurring": True,
+    "cancel_mode": "auto",
+    "reschedule_mode": "auto",
+    "series_cancel_mode": "auto",
+    "series_reschedule_mode": "auto",
 }
 
 booking_link_strict_notice = {
@@ -393,12 +404,12 @@ def test_cancel_booking(client):
     assert client.get(f"/bookings/{created['id']}").json()["status"] == "cancelled"
 
 
-def test_admin_cancel_ignores_not_allowed_policy(client):
+def test_admin_cancel_ignores_blocked_policy(client):
     """Admin's DELETE /{ref} deliberately ignores event-type cancel_mode policy — only the
     booking's own confirmed status is enforced. Policy (and the past-time floor) are booker-
     facing rules that don't apply to admin, who needs to be able to override both."""
     tutor, availability = make_tutor_with_schedule(client)
-    booking_link = client.post("/booking_links/", json={"slug": "no-cancel-et", "duration_minutes": 60, "recurring": False, "cancel_mode": "not_allowed", "availability": availability}).json()
+    booking_link = client.post("/booking_links/", json={"slug": "no-cancel-et", "duration_minutes": 60, "recurring": False, "cancel_mode": "blocked", "availability": availability}).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
@@ -517,6 +528,8 @@ def test_update_contact(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     response = client.put(f"/bookings/{created['id']}", json={
+        "cancel_mode": "auto",
+        "reschedule_mode": "auto",
         "booking_link_id": booking_link["id"],
         "student_first": "Test",
         "student_last": "Smith",
@@ -533,6 +546,8 @@ def test_mark_no_show(client):
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
     response = client.put(f"/bookings/{created['id']}", json={
+        "cancel_mode": "auto",
+        "reschedule_mode": "auto",
         "booking_link_id": booking_link["id"],
         "student_first": created["student_first"],
         "student_last": created["student_last"],
@@ -596,11 +611,11 @@ def test_reschedule_series_inactive_tutor_rejected(client):
     assert response.status_code == 400
 
 
-def test_admin_reschedule_ignores_not_allowed_policy(client):
+def test_admin_reschedule_ignores_blocked_policy(client):
     """Admin's POST /{ref}/reschedule deliberately ignores event-type reschedule_mode policy —
-    same reasoning as test_admin_cancel_ignores_not_allowed_policy above."""
+    same reasoning as test_admin_cancel_ignores_blocked_policy above."""
     tutor, availability = make_tutor_with_schedule(client)
-    booking_link = client.post("/booking_links/", json={"slug": "no-reschedule-et", "duration_minutes": 60, "recurring": False, "reschedule_mode": "not_allowed", "availability": availability}).json()
+    booking_link = client.post("/booking_links/", json={"slug": "no-reschedule-et", "duration_minutes": 60, "recurring": False, "reschedule_mode": "blocked", "availability": availability}).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         original = client.post("/bookings/", json=payload).json()
@@ -685,10 +700,10 @@ def test_manage_occurrence_cancel_direct(client):
     assert response.json()["status"] == "cancelled"
 
 
-def test_manage_occurrence_cancel_not_allowed_policy(client):
-    """cancel_mode=not_allowed → 400."""
+def test_manage_occurrence_cancel_blocked_policy(client):
+    """cancel_mode=blocked → 400."""
     tutor, availability = make_tutor_with_schedule(client)
-    booking_link = client.post("/booking_links/", json={"slug": "no-cancel-token-et", "duration_minutes": 60, "recurring": False, "cancel_mode": "not_allowed", "availability": availability}).json()
+    booking_link = client.post("/booking_links/", json={"slug": "no-cancel-token-et", "duration_minutes": 60, "recurring": False, "cancel_mode": "blocked", "availability": availability}).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
@@ -1079,7 +1094,7 @@ def test_booking_response_exposes_blocked_policy(client):
     tutor, availability = make_tutor_with_schedule(client)
     booking_link = client.post("/booking_links/", json={
         "slug": "no-cancel-or-reschedule-et", "duration_minutes": 60, "recurring": False,
-        "cancel_mode": "not_allowed", "reschedule_mode": "not_allowed", "availability": availability,
+        "cancel_mode": "blocked", "reschedule_mode": "blocked", "availability": availability,
     }).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
@@ -1135,10 +1150,10 @@ def test_manage_series_cancel_direct(client):
     assert response.json()["is_active"] is False
 
 
-def test_manage_series_cancel_not_allowed_policy(client):
-    """cancel_mode=not_allowed → 400."""
+def test_manage_series_cancel_blocked_policy(client):
+    """cancel_mode=blocked → 400."""
     tutor, availability = make_tutor_with_schedule(client)
-    booking_link = client.post("/booking_links/", json={"slug": "no-cancel-series-et", "duration_minutes": 60, "recurring": True, "cancel_mode": "not_allowed", "availability": availability}).json()
+    booking_link = client.post("/booking_links/", json={"slug": "no-cancel-series-et", "duration_minutes": 60, "recurring": True, "cancel_mode": "blocked", "availability": availability}).json()
     payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": booking_link["id"]}
     with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
         created = client.post("/bookings/", json=payload).json()
@@ -2304,3 +2319,109 @@ def test_create_booking_rejects_a_tutor_who_does_not_host_the_link(client):
         response = client.post("/bookings/", json=payload)
     assert response.status_code == 400
     assert "does not host" in response.json()["detail"]
+
+
+# ── POLICY FREEZE ──────────────────────────────────────────────────────────
+
+def _link_with_policy(client, **modes):
+    tutor, availability = make_tutor_with_schedule(client)
+    link = client.post("/booking_links/", json={
+        **booking_link_standalone, "slug": f"policy-{uuid4().hex[:6]}",
+        **modes, "availability": availability,
+    }).json()
+    return tutor, link, availability
+
+
+def test_editing_a_links_policy_leaves_existing_bookings_alone(client):
+    """The whole point of the pass: policy is a promise made to one client at one moment, so
+    tightening the link later must not restate the terms of a booking already sold."""
+    tutor, link, availability = _link_with_policy(client, cancel_mode="auto")
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+    assert created["cancel_action"] == "auto"
+
+    assert client.put(f"/booking_links/{link['id']}", json={
+        **booking_link_standalone, "slug": link["slug"], "cancel_mode": "blocked",
+        "availability": availability,
+    }).status_code == 200
+
+    assert client.get(f"/bookings/{created['id']}").json()["cancel_action"] == "auto", \
+        "an existing booking keeps the terms it was created under"
+
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        later = client.post("/bookings/", json={
+            **payload, "start": "2099-06-17T16:00:00", "end": "2099-06-17T17:30:00",
+        }).json()
+    assert later["cancel_action"] == "blocked", "a new booking picks up the edited policy"
+
+
+def test_editing_a_links_policy_does_not_reach_future_occurrences_of_a_series(client):
+    """The sharpest edge: _ensure_occurrence copies off the SERIES, so a series missing frozen
+    policy would silently hand every occurrence Procrastinate generates the link's current terms."""
+    tutor, availability = make_tutor_with_schedule(client)
+    link = client.post("/booking_links/", json={
+        **booking_link_recurring, "cancel_mode": "auto", "availability": availability,
+    }).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    assert client.put(f"/booking_links/{link['id']}", json={
+        **booking_link_recurring, "slug": link["slug"], "cancel_mode": "blocked",
+        "availability": availability,
+    }).status_code == 200
+
+    with TestingSessionLocal() as db:
+        series = db.query(BookingSeries).filter(BookingSeries.public_id == created["series_id"]).first()
+        assert series.cancel_mode == "auto", "the series froze its own template"
+
+        # An occurrence materialized AFTER the link was edited — this is the path Procrastinate
+        # takes, and the one that silently reverts if _ensure_occurrence reads the link.
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+        later_start = series.bookings[0].start.replace(tzinfo=UTC) + timedelta(days=7)
+        materialized = _ensure_occurrence(series, later_start, db, settings)
+        assert materialized.cancel_mode == "auto"
+
+    # ...and the same occurrence while still virtual, via the list endpoint
+    virtual = [b for b in client.get(
+        f"/bookings/booking-series/{created['series_id']}/occurrences?page_size=5"
+    ).json()["items"] if b["id"] != created["id"]]
+    assert virtual and all(b["cancel_action"] == "auto" for b in virtual)
+
+
+def test_reschedule_carries_the_bookings_own_policy_forward(client):
+    """Not a fresh read off the link — moving a session must not restate its terms."""
+    tutor, link, availability = _link_with_policy(client, cancel_mode="auto")
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    assert client.put(f"/booking_links/{link['id']}", json={
+        **booking_link_standalone, "slug": link["slug"], "cancel_mode": "blocked",
+        "availability": availability,
+    }).status_code == 200
+
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        moved = client.post(f"/bookings/{created['id']}/reschedule", json={
+            "tutor_id": tutor["id"],
+            "start": "2099-06-17T16:00:00", "end": "2099-06-17T17:30:00",
+            "timezone": booking_payload["timezone"],
+        }).json()
+    assert moved["cancel_action"] == "auto", "the moved booking keeps its original terms"
+
+
+def test_series_level_policy_is_independent_of_occurrence_policy(client):
+    """Ending an engagement and dropping one session are different promises."""
+    tutor, availability = make_tutor_with_schedule(client)
+    link = client.post("/booking_links/", json={
+        **booking_link_recurring, "cancel_mode": "auto", "series_cancel_mode": "request",
+        "availability": availability,
+    }).json()
+    payload = {**booking_payload, "tutor_id": tutor["id"], "booking_link_id": link["id"]}
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json=payload).json()
+
+    assert created["cancel_action"] == "auto", "one session is freely cancellable"
+    series = client.get(f"/bookings/manage-series/{created['series_id']}").json()
+    assert series["cancel_action"] == "request", "the whole series needs approval"

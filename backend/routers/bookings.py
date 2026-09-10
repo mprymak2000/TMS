@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import tuple_
 
-from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_step
+from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -44,11 +44,11 @@ DEFAULT_PAGE_SIZE = 250  # GET /bookings/'s default page_size, overridable by ca
 router = APIRouter(prefix="/bookings", tags=["bookings"])
 
 
-def _series_response(series: BookingSeries, today: date) -> BookingSeriesResponse:
-    """Build a BookingSeriesResponse with is_active set explicitly - it's not a plain ORM
-    attribute (needs business-local today), so from_attributes alone can't populate it."""
+def _series_response(series: BookingSeries, db: Session) -> BookingSeriesResponse:
+    """Build a BookingSeriesResponse with is_active set explicitly - it's derived from the series'
+    occurrences, not a plain ORM attribute, so from_attributes alone can't populate it."""
     response = BookingSeriesResponse.model_validate(series)
-    response.is_active = is_series_active(series, today)
+    response.is_active = is_series_active(series, db)
     return response
 
 
@@ -67,7 +67,7 @@ def get_booking_series(
     student_pairs = [tuple(s.split("|", 1)) for s in student] # split string "john|doe" into tuple (john, doe)
 
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
-    base_query = db.query(BookingSeries).filter(active_series_filter(today))
+    base_query = db.query(BookingSeries).filter(active_series_filter())
     if email:
         base_query = base_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
@@ -174,7 +174,7 @@ def get_bookings(
     # email scope is shared by both branches below - apply it once, up front (though series gets ignored for pending-only branch)
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
     materialized_query = db.query(Booking)
-    series_query = db.query(BookingSeries).filter(active_series_filter(today))
+    series_query = db.query(BookingSeries).filter(active_series_filter())
     if email:
         materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
         series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
@@ -288,7 +288,7 @@ def list_bookings(
     # Get booking rows that already exist in db (materialized occurrences) and get series rows that represent weekly ocurrences.
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
     materialized_query = db.query(Booking)
-    series_query = db.query(BookingSeries).filter(active_series_filter(today))
+    series_query = db.query(BookingSeries).filter(active_series_filter())
 
     # apply filters shared by both data types.
     if email:
@@ -442,6 +442,8 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                 until=recur_until_date,
                 count=recur_count,
                 booking_type_id=db_booking_link.booking_type_id,
+                **occurrence_policy(db_booking_link),
+                **series_policy(db_booking_link),
                 google_event_id=google_event["id"],
             )
             db.add(series)
@@ -456,6 +458,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                     **base_fields,
                     series_id=series.id,
                     booking_type_id=series.booking_type_id,
+                    **occurrence_policy(series),
                     google_event_id=google_event["id"],
                     start=occ_start,
                     end=occ_start + _duration,
@@ -473,6 +476,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             public_id=new_public_id,
             **booking_in.model_dump(exclude={"recur_until", "recur_count"}),
             booking_type_id=db_booking_link.booking_type_id,
+            **occurrence_policy(db_booking_link),
             google_event_id=google_event["id"],
             status="confirmed",
         )
@@ -582,6 +586,8 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         "student_id": db_booking.student_id,
         "booking_link_id": db_booking.booking_link_id,
         "booking_type_id": db_booking.booking_type_id,
+        # Off the old row, not the link — moving a session must not restate its terms.
+        **occurrence_policy(db_booking),
         "student_first": db_booking.student_first,
         "student_last": db_booking.student_last,
         "student_email": db_booking.student_email,
@@ -677,10 +683,10 @@ def reschedule_booking_series(id: str, booking_in: BookingReschedule, db: Sessio
     business_tz = ZoneInfo(settings.business_timezone)
     today = datetime.now(business_tz).date()
     if db_series.status in ('cancelled', 'rescheduled'):
-        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
+        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series))
     service = get_calendar_service(SCOPES)
     new_series = _reschedule_series(db_series, booking_in, db, service, settings)
-    return _series_response(new_series, today)
+    return _series_response(new_series, db)
 
 
 def _validate_link_and_type(booking_link_id: int, booking_type_id: int | None, db: Session) -> None:
@@ -726,7 +732,7 @@ def update_booking_series(id: str, booking_in: BookingSeriesUpdate, db: Session 
     db.commit()
     db.refresh(db_series)
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
-    return _series_response(db_series, today)
+    return _series_response(db_series, db)
 
 
 @router.put("/{ref}", response_model=BookingResponse)
@@ -1049,6 +1055,9 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         interval=db_series.interval,
         until=new_until,
         count=new_count,
+        # Off the old series, not the link — moving a series must not restate its terms.
+        **occurrence_policy(db_series),
+        **series_policy(db_series),
         google_event_id=new_google_event["id"],
         student_id=db_series.student_id,
         student_first=db_series.student_first,
@@ -1082,6 +1091,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
             tutor_id=booking_in.tutor_id,
             booking_link_id=db_series.booking_link_id,
             booking_type_id=new_series.booking_type_id,
+            **occurrence_policy(new_series),
             timezone=booking_in.timezone,
             status="confirmed",
             student_id=db_series.student_id,
@@ -1133,10 +1143,10 @@ def delete_booking_series(id: str, db: Session = Depends(get_db), settings=Depen
     business_tz = ZoneInfo(settings.business_timezone)
     today = datetime.now(business_tz).date()
     if db_series.status in ('cancelled', 'rescheduled'):
-        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
+        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series))
     service = get_calendar_service(SCOPES)
     result = _cancel_series(db_series, today, business_tz, db, service)
-    return _series_response(result, today)
+    return _series_response(result, db)
 
 
 @router.delete("/booking-series/{id}/permanent", status_code=204)
@@ -1321,7 +1331,7 @@ def get_series_by_ref(ref: str, db: Session = Depends(get_db), settings=Depends(
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
-    return _series_response(db_series, today)
+    return _series_response(db_series, db)
 
 
 @router.post("/manage-series/{ref}/cancel", response_model=BookingSeriesResponse)
@@ -1330,9 +1340,8 @@ def cancel_series_by_ref(ref: str, db: Session = Depends(get_db), settings=Depen
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     business_tz = ZoneInfo(settings.business_timezone)
-    today = datetime.now(business_tz).date()
-    if not is_series_active(db_series, today):
-        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
+    if not is_series_active(db_series, db):
+        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series))
     next_booking = (
         db.query(Booking)
         .filter(Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC), Booking.status == "confirmed")
@@ -1352,10 +1361,10 @@ def cancel_series_by_ref(ref: str, db: Session = Depends(get_db), settings=Depen
             db.commit()
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to submit cancellation request") from e
-        return _series_response(db_series, today)
+        return _series_response(db_series, db)
     service = get_calendar_service(SCOPES)
-    result = _cancel_series(db_series, today, business_tz, db, service)
-    return _series_response(result, today)
+    result = _cancel_series(db_series, datetime.now(business_tz).date(), business_tz, db, service)
+    return _series_response(result, db)
 
 
 @router.post("/manage-series/{ref}/reschedule", response_model=BookingSeriesResponse)
@@ -1364,9 +1373,8 @@ def reschedule_series_by_ref(ref: str, booking_in: BookingReschedule, db: Sessio
     if not db_series:
         raise HTTPException(status_code=404, detail="Booking series not found")
     business_tz = ZoneInfo(settings.business_timezone)
-    today = datetime.now(business_tz).date()
-    if not is_series_active(db_series, today):
-        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series, today))
+    if not is_series_active(db_series, db):
+        raise HTTPException(status_code=400, detail=series_inactive_reason(db_series))
     next_booking = (
         db.query(Booking)
         .filter(Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC), Booking.status == "confirmed")
@@ -1393,10 +1401,10 @@ def reschedule_series_by_ref(ref: str, booking_in: BookingReschedule, db: Sessio
             db.commit()
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to submit reschedule request") from e
-        return _series_response(db_series, today)
+        return _series_response(db_series, db)
     service = get_calendar_service(SCOPES)
     new_series = _reschedule_series(db_series, booking_in, db, service, settings)
-    return _series_response(new_series, today)
+    return _series_response(new_series, db)
 
 
 @router.post("/booking-request/{request_id}/approve")

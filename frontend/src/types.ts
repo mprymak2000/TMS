@@ -93,10 +93,13 @@ export interface BookingLink {
   price: number | null
   buffer_minutes: number | null
   interval_minutes: number | null
-  cancel_mode: string | null
+  cancel_mode: string
   cancel_notice_minutes: number | null
-  reschedule_mode: string | null
+  reschedule_mode: string
   reschedule_notice_minutes: number | null
+  // Acting on a whole series — no notice window, so the mode is the verdict.
+  series_cancel_mode: string
+  series_reschedule_mode: string
   limit_duration_minutes: number | null
   limit_per_day: number | null
   limit_per_week: number | null
@@ -128,6 +131,11 @@ export interface Booking {
   rescheduled_to: string | null
   rescheduled_from: string | null
   google_event_id: string
+  // Frozen at creation; cancel_action is the verdict computed from these plus time-until.
+  cancel_mode: string
+  cancel_notice_minutes: number | null
+  reschedule_mode: string
+  reschedule_notice_minutes: number | null
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'
   student_first: string
@@ -155,6 +163,14 @@ export interface BookingSeries {
   rescheduled_from: string | null
   is_active: boolean
   google_event_id: string | null
+  // The occurrence four are the template each occurrence copies; the series two govern acting on
+  // the series itself, and cancel_action here is just series_cancel_mode (no notice window).
+  cancel_mode: string
+  cancel_notice_minutes: number | null
+  reschedule_mode: string
+  reschedule_notice_minutes: number | null
+  series_cancel_mode: string
+  series_reschedule_mode: string
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'
   student_first: string

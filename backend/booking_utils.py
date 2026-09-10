@@ -7,7 +7,6 @@ from sqlalchemy import and_, func, or_, select, tuple_
 from sqlalchemy.orm import Session
 from models import Booking, BookingSeries, BookingLink, BookingLinkAvailability, BookingType, Tutor, FREQ_DAYS
 from schemas import BookingFacets, BookingResponse, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption, TutorFacetOption
-from policy import get_cancel_action, get_reschedule_action
 from fastapi import HTTPException
      
 
@@ -74,6 +73,24 @@ def build_rrule(freq: str, interval: int, until: date | datetime | None = None,
     return rrule
 
 
+def occurrence_policy(source) -> dict:
+    """The four occurrence-level policy columns, copied off a link, series or booking."""
+    return {
+        "cancel_mode": source.cancel_mode,
+        "cancel_notice_minutes": source.cancel_notice_minutes,
+        "reschedule_mode": source.reschedule_mode,
+        "reschedule_notice_minutes": source.reschedule_notice_minutes,
+    }
+
+
+def series_policy(source) -> dict:
+    """The two series-level policy columns, copied off a link or another series."""
+    return {
+        "series_cancel_mode": source.series_cancel_mode,
+        "series_reschedule_mode": source.series_reschedule_mode,
+    }
+
+
 def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, settings) -> Booking:
     """Ensure a specific occurrence of a series exists. Returns existing or newly created Booking.
 
@@ -117,6 +134,7 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         parent_email=series.parent_email,
         parent_phone=series.parent_phone,
         google_event_id=series.google_event_id,
+        **occurrence_policy(series),
         start=start_utc,
         end=end_utc,
         status="confirmed",
@@ -198,18 +216,19 @@ def indefinite_series_filter():
     return and_(BookingSeries.until == None, BookingSeries.count == None)
 
 
-def active_series_filter(today: date):
+def active_series_filter():
     """SQL filter expression - a series is active unless explicitly cancelled/rescheduled, or it has
     run out of occurrences. Full (customer-facing) definition - admin routes use a narrower
     status-only check instead, see routers/bookings.py.
 
-    A finite series is running while any of its occurrences hasn't passed, asked of the bookings
+    A finite series is running while any of its occurrences hasn't ended, asked of the bookings
     rather than of until/count. Every finite occurrence exists from creation, so this is exact - and
     unlike the rule, it follows an occurrence that was rescheduled past where the rule ends.
+    Compares instants, not calendar days: an in-progress session still counts as running.
 
     Deliberately says nothing about the series' BookingLink: a series is its own booking template
     and keeps running whatever its link's status is."""
-    today_start = datetime(today.year, today.month, today.day, tzinfo=UTC)
+    now = datetime.now(UTC)
     return and_(
         # NULL NOT IN (...) evaluates to NULL in SQL, not True - a fresh series (status IS NULL)
         # would otherwise get silently filtered out. Handle NULL explicitly instead of relying on notin_.
@@ -218,24 +237,30 @@ def active_series_filter(today: date):
             indefinite_series_filter(),
             select(Booking.id).where(and_(
                 Booking.series_id == BookingSeries.id,
-                Booking.start >= today_start,
+                Booking.end > now,
             )).exists(),
         ),
     )
 
 
-def is_series_active(series: BookingSeries, today: date) -> bool:
-    """Python-side equivalent of active_series_filter, for a single already-loaded series."""
+def is_series_active(series: BookingSeries, db: Session) -> bool:
+    """Python-side equivalent of active_series_filter, for a single already-loaded series.
+
+    Queries rather than walking series.bookings — that relationship lazy-loads every occurrence just
+    to find out whether one is still ahead."""
     if series.status in ('cancelled', 'rescheduled'):
         return False
     if series.until is None and series.count is None:
         return True
-    return any(_to_local_date(b.start, ZoneInfo("UTC")) >= today for b in series.bookings)
+    return db.query(Booking.id).filter(
+        Booking.series_id == series.id,
+        Booking.end > datetime.now(UTC),
+    ).first() is not None
 
 
-def series_inactive_reason(series: BookingSeries, today: date) -> str:
+def series_inactive_reason(series: BookingSeries) -> str:
     """Human-readable reason a series is no longer active. Verifies its claim rather than assuming -
-    only meaningful once is_series_active(series, today) is already known False."""
+    only meaningful once is_series_active(series, db) is already known False."""
     if series.status == 'cancelled':
         return "This series has been cancelled"
     if series.status == 'rescheduled':
@@ -279,9 +304,8 @@ def resolve_ref(ref: str, db: Session, settings) -> Booking:
     if not series:
         raise HTTPException(status_code=404, detail="Booking not found")
     tz = ZoneInfo(settings.business_timezone)
-    today = datetime.now(tz).date()
-    if not is_series_active(series, today):
-        raise HTTPException(status_code=400, detail=series_inactive_reason(series, today))
+    if not is_series_active(series, db):
+        raise HTTPException(status_code=400, detail=series_inactive_reason(series))
     last_date = series_last_date(series)
     if last_date is not None and _to_local_date(start_utc, tz) > last_date:
         raise HTTPException(status_code=400, detail="Occurrence is past the end of this series")
@@ -352,9 +376,6 @@ def _virtual_occurrences(
 
         if not already_materialized and not at_or_before_cursor:
             end_utc = _occurrence_end(series, current_date, tz)
-            minutes_until = (start_utc - datetime.now(UTC)).total_seconds() / 60
-            cancel_action = get_cancel_action(series.booking_link, minutes_until)
-            reschedule_action = get_reschedule_action(series.booking_link, minutes_until)
             occurrences.append(
                 BookingResponse(
                     public_id=public_id,
@@ -370,8 +391,7 @@ def _virtual_occurrences(
                     status="confirmed",
                     is_no_show=False,
                     google_event_id=series.google_event_id,
-                    cancel_action=cancel_action,
-                    reschedule_action=reschedule_action,
+                    **occurrence_policy(series),
                     student_first=series.student_first,
                     student_last=series.student_last,
                     student_email=series.student_email,
