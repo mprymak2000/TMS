@@ -584,6 +584,14 @@ class BookingSeriesResponse(BaseModel):
     # See routers/bookings.py response-construction sites.
     is_active: bool | None = None
     google_event_id: str | None = None
+    # The frozen policy itself, so an admin can edit it. The occurrence four are the template each
+    # future occurrence copies; the series two govern acting on the series.
+    cancel_mode: str
+    cancel_notice_minutes: int | None = None
+    reschedule_mode: str
+    reschedule_notice_minutes: int | None = None
+    series_cancel_mode: str
+    series_reschedule_mode: str
     # Series modes carry no notice window, so the mode IS the verdict — aliased rather than computed,
     # so the frontend reads the same field name on a series as on a booking.
     cancel_action: str = Field(validation_alias="series_cancel_mode")

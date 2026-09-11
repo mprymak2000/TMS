@@ -1,5 +1,5 @@
 import { Menu } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical, IconRepeat } from '@tabler/icons-react'
+import { IconDotsVertical, IconRepeat } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, Tutor, BookingLink, BookingType } from './types'
 import { formatTime, tutorBubbleClass, tutorInitials } from './utils'
@@ -20,7 +20,7 @@ interface BookingRowProps {
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onReviewRequest?: (booking: Booking) => void
-    onBookingPatched?: (booking: Booking) => void
+    onBookingUpdated?: (booking: Booking) => void
     isCustomer?: boolean
     compact?: boolean
 }
@@ -39,11 +39,11 @@ export const statusConfig = (b: Booking, isPast: boolean) => {
     return { dot: 'bg-emerald-400', text: 'text-emerald-600', name: 'text-gray-800', label: null, chip: '' }
 }
 
-const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, reloadBookingTypes, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, onBookingPatched, isCustomer = false, compact = false }: BookingRowProps) => {
+const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, reloadBookingTypes, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, onBookingUpdated, isCustomer = false, compact = false }: BookingRowProps) => {
     const navigate = useNavigate()
     const { isPast, menuItems, modals, handleReclassify } = useBookingActions({
         booking, bookingLink, bookingLinks, bookingTypes, reloadBookingTypes,
-        onRefresh, onError, onReviewRequest, onBookingPatched,
+        onRefresh, onError, onReviewRequest, onBookingUpdated,
     })
     const status = statusConfig(booking, isPast)
     const startDate = new Date(booking.start)
@@ -64,12 +64,6 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
 
     const actions = (
         <>
-            <button
-                className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
-                onClick={onExpand}
-            >
-                {expanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
-            </button>
             {isCustomer ? (
                 booking.id && (
                     <button
@@ -90,7 +84,10 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                 // Minimal agenda-line style — dot, time range, one-line title. Actions only
                 // reveal on hover (or while expanded) to keep the resting state quiet; the
                 // day grouping itself lives one level up (SeriesRow's own date header).
-                <div className={`group flex items-center px-5 py-1.5 hover:bg-gray-50/60 transition-colors ${expanded ? 'bg-gray-50/60' : ''}`}>
+                <div
+                    className={`group flex items-center px-5 py-1.5 cursor-pointer hover:bg-gray-50/60 transition-colors ${expanded ? 'bg-gray-50/60' : ''}`}
+                    onClick={onExpand}
+                >
                     <div className={`w-2 h-2 rounded-full shrink-0 ${status.dot}`} />
                     <span className={`flex-1 min-w-0 truncate ml-6 text-sm tabular-nums ${status.text}`}>
                         {formatTime(booking.start)} – {formatTime(booking.end)}
@@ -135,12 +132,15 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
                         {bookingLink?.slug}
                     </span>
-                    <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+                    <div
+                        className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}
+                        onClick={e => e.stopPropagation()}
+                    >
                         {actions}
                     </div>
                 </div>
             ) : (
-                <div className="flex items-center gap-4 px-5 py-4">
+                <div className="flex items-center gap-4 px-5 py-4 cursor-pointer" onClick={onExpand}>
 
                     {/* status dot */}
                     <div className={`w-2 h-2 rounded-full shrink-0 ${status.dot}`} />
@@ -190,8 +190,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                         {tutor ? tutorInitials(tutor) : '?'}
                     </div>
 
-                    {/* expand + actions */}
-                    <div className="flex items-center gap-0.5 shrink-0">
+                    <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
                         {actions}
                     </div>
                 </div>

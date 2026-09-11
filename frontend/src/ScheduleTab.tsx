@@ -425,15 +425,19 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 return
             }
             const body = await response.json()
-            // data
-            setBookings(prev => append ? [...prev, ...body.items] : body.items)
+            // A silent revalidation sends no cursor, so this response is page 1 — keeping only its
+            // facets. Writing the list would drop every page already loaded, and writing the cursor
+            // would rewind pagination to page 1 while the list still holds later pages, so the next
+            // "Load more" would append duplicates.
+            if (!silent) {
+                setBookings(prev => append ? [...prev, ...body.items] : body.items)
+                setCursor(body.next_cursor)
+            }
             // filter options
             setTutorFacetOptions(body.facets.tutors)
             setBookingLinkFacetOptions(body.facets.booking_links)
             setBookingTypeFacetOptions(body.facets.booking_types)
             setStudentFacetOptions(body.facets.students)
-            // pagination
-            setCursor(body.next_cursor)
             // error state cleared on success
             setLoadErrors({})
         } catch (error) {
@@ -726,7 +730,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                 bookingType={bookingTypes.find(t => t.id === b.booking_type_id)}
                                                 bookingTypes={bookingTypes}
                                                 reloadBookingTypes={reloadBookingTypes}
-                                                onBookingPatched={updated => {
+                                                onBookingUpdated={updated => {
                                                     // Optimistic: the row updates instantly, then a
                                                     // silent refetch reconciles the facet options.
                                                     setBookings(prev => prev.map(x => x.id === updated.id ? updated : x))

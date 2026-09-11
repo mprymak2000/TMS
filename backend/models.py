@@ -460,7 +460,8 @@ class Booking(Base):
     )
 
     # allow pydantic to inherit parent's (booking's series) public_id field from the
-    # model's relationship by @property and getattr(model_obj, field_name).
+# model's relationship by @
+# ty and getattr(model_obj, field_name).
     @property
     def series_public_id(self) -> str | None:
         return self.series.public_id if self.series else None

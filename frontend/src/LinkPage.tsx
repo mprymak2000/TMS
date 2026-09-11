@@ -7,15 +7,8 @@ import { extractError } from './utils'
 import { useToast } from './useToast'
 import Toast from './Toast'
 import BookingTypePicker from './BookingTypePicker'
-import { CANCEL_MODE_OPTIONS, SERIES_MODE_OPTIONS, WINDOW_MODES } from './policyOptions'
+import PolicyModeField, { WINDOW_MODES } from './PolicyModeField'
 
-type NoticeUnit = 'minutes' | 'hours' | 'days'
-const NOTICE_UNITS = [
-    { value: 'minutes', label: 'min' },
-    { value: 'hours', label: 'hrs' },
-    { value: 'days', label: 'days' },
-]
-const unitToMinutes = (unit: NoticeUnit) => unit === 'minutes' ? 1 : unit === 'hours' ? 60 : 1440
 
 // Trailing hyphens survive typing ("my-" en route to "my-link") and are trimmed at save.
 // Mirrors DESCRIPTION_MAX_LENGTH in schemas.py and the String(500) column.
@@ -143,10 +136,30 @@ const SectionRow = ({ label, description, children }: { label: string, descripti
     </div>
 )
 
-const Group = ({ title, children }: { title: string, children: React.ReactNode }) => (
+// Safari's triple-click ends the range in the next block, so the highlight paints the gap below.
+// Select this element's contents instead, leaving click and drag selection native.
+const Hint = ({ children }: { children: React.ReactNode }) => (
+    <p
+        className="text-xs text-gray-400 w-fit"
+        onMouseDown={e => {
+            if (e.detail < 3) return
+            e.preventDefault()
+            const range = document.createRange()
+            range.selectNodeContents(e.currentTarget)
+            const sel = window.getSelection()
+            sel?.removeAllRanges()
+            sel?.addRange(range)
+        }}
+    >
+        {children}
+    </p>
+)
+
+const Group = ({ title, caption, children }: { title: string, caption?: string, children: React.ReactNode }) => (
     <div>
-        <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2.5">{title}</p>
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden divide-y divide-gray-100">
+        <p className={`text-xs font-semibold text-gray-400 uppercase tracking-wider ${caption ? 'mb-1' : 'mb-2.5'}`}>{title}</p>
+        {caption && <Hint>{caption}</Hint>}
+        <div className={`bg-white rounded-xl border border-gray-200 overflow-hidden divide-y divide-gray-100 ${caption ? 'mt-2.5' : ''}`}>
             {children}
         </div>
     </div>
@@ -175,8 +188,6 @@ const LinkPage = () => {
     const [errors, setErrors] = useState<FormErrors>({})
     const [touched, setTouched] = useState<FormTouched>({})
     const [copied, setCopied] = useState(false)
-    const [cancelUnit, setCancelUnit] = useState<NoticeUnit>('hours')
-    const [rescheduleUnit, setRescheduleUnit] = useState<NoticeUnit>('hours')
 
     useEffect(() => {
         const load = async () => {
@@ -324,7 +335,7 @@ const LinkPage = () => {
         { heading: 'Hosts' },
         { tab: 'hosts',        label: 'hosts',        icon: IconUsers,                  hasError: tabHasError.hosts },
         { heading: 'Policies' },
-        { tab: 'cancellation', label: 'cancellation', icon: IconBan,                    hasError: tabHasError.cancellation },
+        { tab: 'cancellation', label: 'reschedule & cancel', icon: IconBan,             hasError: tabHasError.cancellation },
         { tab: 'limits',       label: 'limits',       icon: IconAdjustmentsHorizontal },
         { heading: 'Booking' },
         { tab: 'booking',      label: 'booking',      icon: IconCreditCard },
@@ -393,7 +404,7 @@ const LinkPage = () => {
             <div className="flex flex-1 overflow-hidden">
 
                 {/* Left nav */}
-                <nav className="w-48 shrink-0 bg-white border-r border-gray-200 py-3 px-2">
+                <nav className="w-64 shrink-0 bg-white border-r border-gray-200 py-3 px-2">
                     {NAV_ITEMS.map((item, i) =>
                         'heading' in item ? (
                             <p key={i} className="px-3 pt-4 pb-1 text-xs font-semibold text-gray-500 uppercase tracking-widest first:pt-1">
@@ -409,9 +420,9 @@ const LinkPage = () => {
                                         : 'text-gray-500 hover:text-gray-800 hover:bg-gray-50'
                                 }`}
                             >
-                                    <span className="flex items-center gap-2">
-                                    <item.icon size={14} />
-                                    <span className="capitalize">{item.label}</span>
+                                <span className="flex items-center gap-2 min-w-0">
+                                    <item.icon size={14} className="shrink-0" />
+                                    <span className="capitalize whitespace-nowrap">{item.label}</span>
                                 </span>
                                 {'hasError' in item && item.hasError && <span className="w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />}
                             </button>
@@ -706,89 +717,41 @@ const LinkPage = () => {
 
                         {/* CANCELLATION */}
                         {activeTab === 'cancellation' && (
-                            <Group title="Cancellation & rescheduling">
-                                <div className="p-4 space-y-3">
-                                    <Select
-                                        label="Cancellation"
-                                        size="sm"
-                                        data={CANCEL_MODE_OPTIONS}
-                                        value={form.cancelMode}
-                                        onChange={val => val && setForm(prev => ({ ...prev, cancelMode: val, cancelNoticeMinutes: null }))}
+                            <Group title="Bookings" caption="Manage an attendee's permission to cancel and reschedule a specific booking.">
+                                <div className="p-4 space-y-5">
+                                    <PolicyModeField
+                                        label="Cancelling"
+                                        mode={form.cancelMode}
+                                        noticeMinutes={form.cancelNoticeMinutes}
+                                        onChange={(mode, notice) => setForm(prev => ({ ...prev, cancelMode: mode, cancelNoticeMinutes: notice }))}
                                     />
-                                    {form.cancelMode && WINDOW_MODES.includes(form.cancelMode) && (
-                                        <div className="flex gap-2 items-end">
-                                            <NumberInput
-                                                label="Notice required"
-                                                placeholder="e.g. 24"
-                                                size="sm"
-                                                value={form.cancelNoticeMinutes ? Math.round(form.cancelNoticeMinutes / unitToMinutes(cancelUnit)) : ''}
-                                                onChange={val => {
-                                                    const updated = { ...form, cancelNoticeMinutes: val === '' ? null : Number(val) * unitToMinutes(cancelUnit) }
-                                                    setForm(updated)
-                                                    if (touched.cancelNoticeMinutes) setErrors(validate(updated))
-                                                }}
-                                                onBlur={() => setTouched(prev => ({ ...prev, cancelNoticeMinutes: true }))}
-                                                error={touched.cancelNoticeMinutes ? errors.cancelNoticeMinutes : undefined}
-                                                min={1} className="w-28"
-                                            />
-                                            <Select data={NOTICE_UNITS} value={cancelUnit} size="sm" onChange={val => val && setCancelUnit(val as NoticeUnit)} className="w-24" />
-                                        </div>
-                                    )}
-                                </div>
-                                <div className="p-4 space-y-3">
-                                    <Select
+                                    <PolicyModeField
                                         label="Rescheduling"
-                                        size="sm"
-                                        data={CANCEL_MODE_OPTIONS}
-                                        value={form.rescheduleMode}
-                                        onChange={val => val && setForm(prev => ({ ...prev, rescheduleMode: val, rescheduleNoticeMinutes: null }))}
+                                        mode={form.rescheduleMode}
+                                        noticeMinutes={form.rescheduleNoticeMinutes}
+                                        onChange={(mode, notice) => setForm(prev => ({ ...prev, rescheduleMode: mode, rescheduleNoticeMinutes: notice }))}
                                     />
-                                    {form.rescheduleMode && WINDOW_MODES.includes(form.rescheduleMode) && (
-                                        <div className="flex gap-2 items-end">
-                                            <NumberInput
-                                                label="Notice required"
-                                                placeholder="e.g. 24"
-                                                size="sm"
-                                                value={form.rescheduleNoticeMinutes ? Math.round(form.rescheduleNoticeMinutes / unitToMinutes(rescheduleUnit)) : ''}
-                                                onChange={val => {
-                                                    const updated = { ...form, rescheduleNoticeMinutes: val === '' ? null : Number(val) * unitToMinutes(rescheduleUnit) }
-                                                    setForm(updated)
-                                                    if (touched.rescheduleNoticeMinutes) setErrors(validate(updated))
-                                                }}
-                                                onBlur={() => setTouched(prev => ({ ...prev, rescheduleNoticeMinutes: true }))}
-                                                error={touched.rescheduleNoticeMinutes ? errors.rescheduleNoticeMinutes : undefined}
-                                                min={1} className="w-28"
-                                            />
-                                            <Select data={NOTICE_UNITS} value={rescheduleUnit} size="sm" onChange={val => val && setRescheduleUnit(val as NoticeUnit)} className="w-24" />
-                                        </div>
-                                    )}
                                 </div>
                             </Group>
                         )}
 
                         {/* CANCELLATION, whole series */}
                         {activeTab === 'cancellation' && form.recurring && (
-                            <Group title="Ending a whole series">
-                                <div className="px-4 pt-3">
-                                    <p className="text-xs text-gray-400">
-                                        Applies to cancelling or moving an entire series rather than one session.
-                                        No notice window, since there's no single session to measure it against.
-                                    </p>
-                                </div>
-                                <div className="p-4 space-y-3">
-                                    <Select
-                                        label="Cancel the series"
-                                        size="sm"
-                                        data={SERIES_MODE_OPTIONS}
-                                        value={form.seriesCancelMode}
-                                        onChange={val => val && setForm(prev => ({ ...prev, seriesCancelMode: val }))}
+                            <Group title="Series" caption="Manage an attendee's permission to cancel and reschedule the remainder of a series.">
+                                <div className="p-4 space-y-5">
+                                    <PolicyModeField
+                                        simple
+                                        label="Cancelling"
+                                        mode={form.seriesCancelMode}
+                                        noticeMinutes={null}
+                                        onChange={mode => setForm(prev => ({ ...prev, seriesCancelMode: mode }))}
                                     />
-                                    <Select
-                                        label="Reschedule the series"
-                                        size="sm"
-                                        data={SERIES_MODE_OPTIONS}
-                                        value={form.seriesRescheduleMode}
-                                        onChange={val => val && setForm(prev => ({ ...prev, seriesRescheduleMode: val }))}
+                                    <PolicyModeField
+                                        simple
+                                        label="Rescheduling"
+                                        mode={form.seriesRescheduleMode}
+                                        noticeMinutes={null}
+                                        onChange={mode => setForm(prev => ({ ...prev, seriesRescheduleMode: mode }))}
                                     />
                                 </div>
                             </Group>

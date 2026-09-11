@@ -1,13 +1,13 @@
 import { useState, useRef, useEffect } from 'react'
-import { Loader, Menu, Modal, Button, Select, TextInput } from '@mantine/core'
-import { IconChevronDown, IconChevronUp, IconDotsVertical, IconCalendarStats, IconBan, IconTrash, IconArrowBackUp, IconPlus, IconMinus, IconShieldCog } from '@tabler/icons-react'
+import { Loader, Menu } from '@mantine/core'
+import { IconChevronDown, IconDotsVertical, IconCalendarStats, IconBan, IconTrash, IconArrowBackUp, IconPlus, IconMinus, IconShieldCog } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingSeries, Tutor, BookingLink, BookingType } from './types'
 import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf, contactPayload, occurrencePolicyPayload, seriesPolicyPayload } from './utils'
 import { statusConfig } from './BookingRow'
 import { useBookingActions } from './useBookingActions'
 import BookingTypePicker from './BookingTypePicker'
-import { CANCEL_MODE_OPTIONS, SERIES_MODE_OPTIONS, WINDOW_MODES } from './policyOptions'
+import PolicyModal from './PolicyModal'
 
 // Fallback page size before the container has been measured (first render, pre-layout).
 const DEFAULT_PAGE_SIZE = 4
@@ -27,6 +27,7 @@ const OccurrenceCard = ({
     isNext,
     onRefresh,
     onError,
+    onBookingUpdated,
 }: {
     booking: Booking
     bookingLink: BookingLink | undefined
@@ -37,9 +38,10 @@ const OccurrenceCard = ({
     isNext: boolean
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
+    onBookingUpdated: (booking: Booking) => void
 }) => {
     const navigate = useNavigate()
-    const { isPast, menuItems, modals } = useBookingActions({ booking, bookingLink, bookingLinks, onRefresh, onError })
+    const { isPast, menuItems, modals } = useBookingActions({ booking, bookingLink, bookingLinks, onRefresh, onError, onBookingUpdated })
     const cfg = statusConfig(booking, isPast)
     // Series-bound booking public_ids always encode their own start time as a trailing unix
     // timestamp (`{series_public_id}:{unix_timestamp}`, real or virtual — see CLAUDE.md) — so the
@@ -181,7 +183,7 @@ interface SeriesRowProps {
     bookingLink: BookingLink | undefined
     bookingTypes: BookingType[]              // roster, for the inline picker
     reloadBookingTypes: () => void
-    onSeriesPatched?: (series: BookingSeries) => void
+    onSeriesUpdated?: (series: BookingSeries) => void
     bookingLinks: BookingLink[]
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
@@ -196,7 +198,7 @@ interface SeriesRowProps {
     includeCancelled?: boolean
 }
 
-const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBookingTypes, onSeriesPatched, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
+const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBookingTypes, onSeriesUpdated, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
     const bookingType = bookingTypes.find(t => t.id === series.booking_type_id)
 
     // Relabelling a series carries to every occurrence, past included — the backend does the
@@ -228,7 +230,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
             }
             const updated = await res.json()
             setEditingPolicy(false)
-            if (onSeriesPatched) onSeriesPatched(updated)
+            if (onSeriesUpdated) onSeriesUpdated(updated)
             else onRefresh('Policy updated')
         } catch {
             onError('An unknown error occurred while updating policy')
@@ -255,7 +257,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                 return
             }
             const updated = await res.json()
-            if (onSeriesPatched) onSeriesPatched(updated)
+            if (onSeriesUpdated) onSeriesUpdated(updated)
             else onRefresh('Type updated')
         } catch (error) {
             console.error(error)
@@ -447,12 +449,6 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                             </Menu.Dropdown>
                         </Menu>
                     )}
-                    <button
-                        onClick={onToggleExpand}
-                        className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
-                    >
-                        {expanded ? <IconChevronUp size={16} /> : <IconChevronDown size={16} />}
-                    </button>
                 </div>
             </div>
 
@@ -480,6 +476,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                                     isNext={i === 0}
                                     onRefresh={onRefresh}
                                     onError={onError}
+                                    onBookingUpdated={updated => setOccurrences(prev => prev.map(x => x.id === updated.id ? updated : x))}
                                 />
                             ))}
                             {occurrences.length === 0 && (
@@ -506,60 +503,28 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                 </div>
             )}
 
-            <Modal opened={editingPolicy} onClose={() => setEditingPolicy(false)}
-                title="Change policy for this series" centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">
-                    Cancellation and rescheduling apply to future occurrences as they're created;
-                    ones that already exist keep the terms they were made with. The series settings
-                    apply to acting on the whole series.
-                </p>
-                <div className="space-y-3">
-                    <Select
-                        label="Cancel one session"
-                        data={CANCEL_MODE_OPTIONS}
-                        value={policy.cancel_mode}
-                        onChange={val => val && setPolicy(p => ({ ...p, cancel_mode: val, cancel_notice_minutes: null }))}
-                    />
-                    {WINDOW_MODES.includes(policy.cancel_mode) && (
-                        <TextInput
-                            label="Notice required (minutes)"
-                            type="number"
-                            value={policy.cancel_notice_minutes ?? ''}
-                            onChange={e => setPolicy(p => ({ ...p, cancel_notice_minutes: e.target.value === '' ? null : Number(e.target.value) }))}
-                        />
-                    )}
-                    <Select
-                        label="Reschedule one session"
-                        data={CANCEL_MODE_OPTIONS}
-                        value={policy.reschedule_mode}
-                        onChange={val => val && setPolicy(p => ({ ...p, reschedule_mode: val, reschedule_notice_minutes: null }))}
-                    />
-                    {WINDOW_MODES.includes(policy.reschedule_mode) && (
-                        <TextInput
-                            label="Notice required (minutes)"
-                            type="number"
-                            value={policy.reschedule_notice_minutes ?? ''}
-                            onChange={e => setPolicy(p => ({ ...p, reschedule_notice_minutes: e.target.value === '' ? null : Number(e.target.value) }))}
-                        />
-                    )}
-                    <Select
-                        label="Cancel the whole series"
-                        data={SERIES_MODE_OPTIONS}
-                        value={policy.series_cancel_mode}
-                        onChange={val => val && setPolicy(p => ({ ...p, series_cancel_mode: val }))}
-                    />
-                    <Select
-                        label="Reschedule the whole series"
-                        data={SERIES_MODE_OPTIONS}
-                        value={policy.series_reschedule_mode}
-                        onChange={val => val && setPolicy(p => ({ ...p, series_reschedule_mode: val }))}
-                    />
-                </div>
-                <div className="flex justify-end gap-2 mt-4">
-                    <Button variant="default" onClick={() => setEditingPolicy(false)}>Cancel</Button>
-                    <Button loading={savingPolicy} onClick={handlePolicySave}>Save</Button>
-                </div>
-            </Modal>
+            {/* Occurrence-level policy is deliberately not editable here. It's only a template for
+                occurrences not yet materialized, so on a finite series — every occurrence created
+                up front — editing it would silently change nothing. Per-booking policy is edited on
+                a booking, with a this/following/all scope prompt (backlog). */}
+            <PolicyModal
+                opened={editingPolicy}
+                onClose={() => setEditingPolicy(false)}
+                title="Series reschedule & cancel policy"
+                caption="Manage an attendee's permission to cancel and reschedule all future bookings of the series."
+                saving={savingPolicy}
+                onSave={handlePolicySave}
+                fields={[
+                    {
+                        label: 'Cancelling', simple: true, mode: policy.series_cancel_mode,
+                        onChange: mode => setPolicy(p => ({ ...p, series_cancel_mode: mode })),
+                    },
+                    {
+                        label: 'Rescheduling', simple: true, mode: policy.series_reschedule_mode,
+                        onChange: mode => setPolicy(p => ({ ...p, series_reschedule_mode: mode })),
+                    },
+                ]}
+            />
         </div>
     )
 }

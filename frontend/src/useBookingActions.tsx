@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingLink, BookingType } from './types'
 import { formatDate, extractError, contactPayload, occurrencePolicyPayload } from './utils'
 import type { OccurrencePolicyFields } from './utils'
-import { CANCEL_MODE_OPTIONS, WINDOW_MODES } from './policyOptions'
+import PolicyModal from './PolicyModal'
 
 interface ContactForm {
     studentEmail: string
@@ -26,7 +26,7 @@ interface UseBookingActionsOptions {
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onReviewRequest?: (booking: Booking) => void
-    onBookingPatched?: (booking: Booking) => void   // patch one row instead of refetching the list
+    onBookingUpdated?: (booking: Booking) => void   // replace one row instead of refetching the list
 }
 
 export const useBookingActions = ({
@@ -38,7 +38,7 @@ export const useBookingActions = ({
     onRefresh,
     onError,
     onReviewRequest,
-    onBookingPatched,
+    onBookingUpdated,
 }: UseBookingActionsOptions) => {
     const navigate = useNavigate()
     const [confirmingDelete, setConfirmingDelete] = useState(false)
@@ -87,8 +87,11 @@ export const useBookingActions = ({
                 onError(extractError(await res.json(), 'Failed to update policy'))
                 return
             }
+            const updated = await res.json()
             setEditingPolicy(false)
-            onRefresh('Policy updated')
+            // Update this row in place rather than refetching the list — nothing else changed.
+            if (onBookingUpdated) onBookingUpdated(updated)
+            else onRefresh('Policy updated')
         } catch {
             onError('An unknown error occurred while updating policy')
         } finally {
@@ -204,7 +207,7 @@ export const useBookingActions = ({
             // with a silent revalidation, so the facet options still reconcile — the list just
             // never gets replaced by a spinner on the way.
             const updated = await res.json()
-            if (onBookingPatched) onBookingPatched(updated)
+            if (onBookingUpdated) onBookingUpdated(updated)
             else onRefresh('Type updated')
         } catch (error) {
             console.error(error)
@@ -395,47 +398,28 @@ export const useBookingActions = ({
                 </div>
             </Modal>
 
-            <Modal opened={editingPolicy} onClose={() => setEditingPolicy(false)}
-                title="Change policy for this booking" centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">
-                    Applies to this booking only. It was frozen when the booking was made, so editing
-                    the link never changes it and changing it here never affects anything else.
-                </p>
-                <div className="space-y-3">
-                    <Select
-                        label="Cancellation"
-                        data={CANCEL_MODE_OPTIONS}
-                        value={policy.cancel_mode}
-                        onChange={val => val && setPolicy(p => ({ ...p, cancel_mode: val, cancel_notice_minutes: null }))}
-                    />
-                    {WINDOW_MODES.includes(policy.cancel_mode) && (
-                        <TextInput
-                            label="Notice required (minutes)"
-                            type="number"
-                            value={policy.cancel_notice_minutes ?? ''}
-                            onChange={e => setPolicy(p => ({ ...p, cancel_notice_minutes: e.target.value === '' ? null : Number(e.target.value) }))}
-                        />
-                    )}
-                    <Select
-                        label="Rescheduling"
-                        data={CANCEL_MODE_OPTIONS}
-                        value={policy.reschedule_mode}
-                        onChange={val => val && setPolicy(p => ({ ...p, reschedule_mode: val, reschedule_notice_minutes: null }))}
-                    />
-                    {WINDOW_MODES.includes(policy.reschedule_mode) && (
-                        <TextInput
-                            label="Notice required (minutes)"
-                            type="number"
-                            value={policy.reschedule_notice_minutes ?? ''}
-                            onChange={e => setPolicy(p => ({ ...p, reschedule_notice_minutes: e.target.value === '' ? null : Number(e.target.value) }))}
-                        />
-                    )}
-                </div>
-                <div className="flex justify-end gap-2 mt-4">
-                    <Button variant="default" onClick={() => setEditingPolicy(false)}>Cancel</Button>
-                    <Button loading={isSubmitting} onClick={handlePolicySave}>Save</Button>
-                </div>
-            </Modal>
+            <PolicyModal
+                opened={editingPolicy}
+                onClose={() => setEditingPolicy(false)}
+                title="Booking reschedule & cancel policy"
+                caption="Manage an attendee's permission to cancel and reschedule this booking."
+                saving={isSubmitting}
+                onSave={handlePolicySave}
+                fields={[
+                    {
+                        label: 'Cancelling',
+                        mode: policy.cancel_mode,
+                        noticeMinutes: policy.cancel_notice_minutes,
+                        onChange: (mode, notice) => setPolicy(p => ({ ...p, cancel_mode: mode, cancel_notice_minutes: notice })),
+                    },
+                    {
+                        label: 'Rescheduling',
+                        mode: policy.reschedule_mode,
+                        noticeMinutes: policy.reschedule_notice_minutes,
+                        onChange: (mode, notice) => setPolicy(p => ({ ...p, reschedule_mode: mode, reschedule_notice_minutes: notice })),
+                    },
+                ]}
+            />
 
             <Modal opened={confirmingDelete} onClose={() => setConfirmingDelete(false)}
                 title={`Cancel ${booking.student_first}'s booking on ${formatDate(booking.start)}?`} centered size="sm">

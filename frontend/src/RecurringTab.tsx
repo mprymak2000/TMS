@@ -19,7 +19,7 @@ const RecurringList = ({
     bookingLinks,
     bookingTypes,
     reloadBookingTypes,
-    onSeriesPatched,
+    onSeriesUpdated,
     isCustomer,
     includeCancelled,
     onRefresh,
@@ -27,12 +27,14 @@ const RecurringList = ({
     onCancelSeries,
     onPermanentDeleteSeries,
     emptyState,
+    expandedSeriesId,
+    onToggleExpand,
 }: {
     seriesByDay: { day: number; name: string; series: BookingSeries[] }[]
     tutors: Tutor[]
     bookingTypes: BookingType[]
     reloadBookingTypes: () => void
-    onSeriesPatched: (series: BookingSeries) => void
+    onSeriesUpdated: (series: BookingSeries) => void
     bookingLinks: BookingLink[]
     isCustomer: boolean
     includeCancelled: boolean
@@ -41,10 +43,9 @@ const RecurringList = ({
     onCancelSeries: (seriesId: string) => void
     onPermanentDeleteSeries: (seriesId: string) => void
     emptyState: ReactNode
+    expandedSeriesId: string | null
+    onToggleExpand: (seriesId: string) => void
 }) => {
-    // Only one series open at a time across the whole list — expanding one collapses whichever
-    // other row was open.
-    const [expandedSeriesId, setExpandedSeriesId] = useState<string | null>(null)
     if (seriesByDay.length === 0) return <>{emptyState}</>
     return (
         <div className="bg-white border border-gray-200 rounded-xl shadow-sm overflow-hidden">
@@ -62,14 +63,14 @@ const RecurringList = ({
                                 bookingLink={bookingLinks.find(e => e.id === s.booking_link_id)}
                                 bookingTypes={bookingTypes}
                                 reloadBookingTypes={reloadBookingTypes}
-                                onSeriesPatched={onSeriesPatched}
+                                onSeriesUpdated={onSeriesUpdated}
                                 bookingLinks={bookingLinks}
                                 onRefresh={onRefresh}
                                 onError={onError}
                                 onCancelSeries={onCancelSeries}
                                 onPermanentDeleteSeries={onPermanentDeleteSeries}
                                 expanded={expandedSeriesId === s.id}
-                                onToggleExpand={() => setExpandedSeriesId(prev => prev === s.id ? null : s.id)}
+                                onToggleExpand={() => onToggleExpand(s.id)}
                                 isCustomer={isCustomer}
                                 includeCancelled={includeCancelled}
                             />
@@ -86,6 +87,10 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
 
     const [email] = useState('')
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
+    // Only one series open at a time across the whole list — expanding one collapses whichever other
+    // row was open. Owned here rather than by RecurringList, which the loading branch below unmounts
+    // on every non-silent reload, taking the open row with it.
+    const [expandedSeriesId, setExpandedSeriesId] = useState<string | null>(null)
     const [isLoadingSeries, setIsLoadingSeries] = useState(false)
     const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
     const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
@@ -145,7 +150,10 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 return
             }
             const body = await response.json()
-            setSeriesList(body.items)
+            // A silent revalidation keeps only the facets. The caller has already patched the edited
+            // row from the PUT response, so writing the list here would overwrite that with the list
+            // endpoint's copy — which, if the edit changed a filtered field, no longer includes it.
+            if (!silent) setSeriesList(body.items)
             setTutorFacetOptions(body.facets.tutors)
             setBookingLinkFacetOptions(body.facets.booking_links)
             setBookingTypeFacetOptions(body.facets.booking_types)
@@ -348,7 +356,7 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         bookingLinks={bookingLinks}
                         bookingTypes={bookingTypes}
                         reloadBookingTypes={reloadBookingTypes}
-                        onSeriesPatched={updated => {
+                        onSeriesUpdated={updated => {
                             setSeriesList(prev => prev.map(x => x.id === updated.id ? updated : x))
                             loadBookingSeries({ emailFilter: isCustomer ? email : undefined, silent: true })
                         }}
@@ -359,6 +367,8 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         onCancelSeries={setCancellingSeriesId}
                         onPermanentDeleteSeries={setPermanentDeleteSeriesId}
                         emptyState={<p className="text-sm text-gray-400 text-center py-12">No recurring series.</p>}
+                        expandedSeriesId={expandedSeriesId}
+                        onToggleExpand={id => setExpandedSeriesId(prev => prev === id ? null : id)}
                     />
                 )}
             </div>
