@@ -1,8 +1,7 @@
 import { Menu } from '@mantine/core'
 import { IconDotsVertical, IconRepeat } from '@tabler/icons-react'
-import { useNavigate } from 'react-router-dom'
-import type { Booking, Tutor, BookingLink, BookingType } from './types'
-import { formatTime, tutorBubbleClass, tutorInitials } from './utils'
+import type { Booking, Contact, Tutor, BookingLink, BookingType } from './types'
+import { attendeeName, formatTime, tutorBubbleClass, tutorInitials } from './utils'
 import { useBookingActions } from './useBookingActions'
 import BookingTypePicker from './BookingTypePicker'
 
@@ -21,9 +20,21 @@ interface BookingRowProps {
     onError: (msg: string) => void
     onReviewRequest?: (booking: Booking) => void
     onBookingUpdated?: (booking: Booking) => void
-    isCustomer?: boolean
     compact?: boolean
 }
+
+// Name, email and phone on one line, separated by dots — an attendee often has no email, and a
+// missing field should close the gap rather than leave a labelled blank.
+const ContactLine = ({ label, contact }: { label: string; contact: Contact }) => (
+    <div className="flex items-baseline gap-2 text-sm">
+        <span className="w-20 shrink-0 text-gray-400">{label}</span>
+        <span className="text-gray-700">
+            {[`${contact.first_name} ${contact.last_name}`, contact.email, contact.phone]
+                .filter(Boolean)
+                .join(' · ')}
+        </span>
+    </div>
+)
 
 // isPast only dulls a status once its time has actually gone by — a rescheduled/cancelled row
 // whose original slot is still upcoming reads as "moved/removed" (full color), not "already
@@ -39,8 +50,7 @@ export const statusConfig = (b: Booking, isPast: boolean) => {
     return { dot: 'bg-emerald-400', text: 'text-emerald-600', name: 'text-gray-800', label: null, chip: '' }
 }
 
-const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, reloadBookingTypes, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, onBookingUpdated, isCustomer = false, compact = false }: BookingRowProps) => {
-    const navigate = useNavigate()
+const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, reloadBookingTypes, bookingLinks, expanded, onExpand, onRefresh, onError, onReviewRequest, onBookingUpdated, compact = false }: BookingRowProps) => {
     const { isPast, menuItems, modals, handleReclassify } = useBookingActions({
         booking, bookingLink, bookingLinks, bookingTypes, reloadBookingTypes,
         onRefresh, onError, onReviewRequest, onBookingUpdated,
@@ -62,20 +72,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
         </Menu>
     )
 
-    const actions = (
-        <>
-            {isCustomer ? (
-                booking.id && (
-                    <button
-                        onClick={() => navigate(`/manage-occurrence/${booking.id}`)}
-                        className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
-                    >
-                        Manage
-                    </button>
-                )
-            ) : rowMenu}
-        </>
-    )
+    const actions = rowMenu
 
     const inner = (
         <>
@@ -96,7 +93,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                         )}
                     </span>
                     <span className={`flex-1 min-w-0 truncate ml-6 text-sm ${status.name}`}>
-                        {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {booking.student_first} {booking.student_last}
+                        {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {attendeeName(booking)}
                     </span>
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs">
                         {status.label && <span className="text-gray-400">{status.label}</span>}
@@ -108,26 +105,14 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                     {/* Kind and source get their own columns. Kind is editable in place — bare
                         until the row is hovered, so the list doesn't read as a row of inputs. */}
                     <span className="flex-1 min-w-0 ml-6 text-xs text-gray-500">
-                        {isCustomer ? (
-                            bookingType && (
-                                <>
-                                    <span
-                                        className="inline-block w-2 h-2 rounded-full mr-1.5 align-middle shrink-0 border border-black/5"
-                                        style={{ background: bookingType.color ?? '#d1d5db' }}
-                                    />
-                                    {bookingType.label}
-                                </>
-                            )
-                        ) : (
-                            <BookingTypePicker
-                                variant="inline"
-                                value={booking.booking_type_id}
-                                onChange={handleReclassify}
-                                types={bookingTypes}
-                                onTypesChanged={reloadBookingTypes}
-                                onError={onError}
-                            />
-                        )}
+                        <BookingTypePicker
+                            variant="inline"
+                            value={booking.booking_type_id}
+                            onChange={handleReclassify}
+                            types={bookingTypes}
+                            onTypesChanged={reloadBookingTypes}
+                            onError={onError}
+                        />
                     </span>
                     <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
                         {bookingLink?.slug}
@@ -161,7 +146,7 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                     <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-1.5 flex-wrap">
                             <span className="font-medium text-gray-800">
-                                {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {booking.student_first} {booking.student_last}
+                                {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {attendeeName(booking)}
                             </span>
                             {status.label && (
                                 <span className={`text-xs px-2 py-0.5 rounded-full ${status.chip}`}>{status.label}</span>
@@ -196,34 +181,34 @@ const BookingRow = ({ booking, tutor, bookingLink, bookingType, bookingTypes, re
                 </div>
             )}
 
-            {/* expanded: contact info — plain aligned label/value rows, matching the compact
-                row's quiet typography rather than a boxed, uppercase-labeled grid. */}
+            {/* expanded: one line per person, matching the compact row's quiet typography rather
+                than a boxed, uppercase-labeled grid. Booking-for-self is one row under both
+                labels, so it collapses to a single "Client" line instead of repeating itself. */}
             {expanded && (
                 <div className="border-t border-gray-100 px-5 py-3 flex flex-col gap-1.5">
-                    {booking.student_email && (
-                        <div className="flex items-baseline gap-2 text-sm">
-                            <span className="w-32 shrink-0 text-gray-400">Student email</span>
-                            <span className="text-gray-700">{booking.student_email}</span>
-                        </div>
+                    {booking.payer.id === booking.attendee.id ? (
+                        <ContactLine label="Client" contact={booking.payer} />
+                    ) : (
+                        <>
+                            <ContactLine label="Payer" contact={booking.payer} />
+                            <ContactLine label="Attendee" contact={booking.attendee} />
+                        </>
                     )}
-                    {booking.student_phone && (
-                        <div className="flex items-baseline gap-2 text-sm">
-                            <span className="w-32 shrink-0 text-gray-400">Student phone</span>
-                            <span className="text-gray-700">{booking.student_phone}</span>
-                        </div>
-                    )}
-                    {booking.parent_email && (
-                        <div className="flex items-baseline gap-2 text-sm">
-                            <span className="w-32 shrink-0 text-gray-400">Parent email</span>
-                            <span className="text-gray-700">{booking.parent_email}</span>
-                        </div>
-                    )}
-                    {booking.parent_phone && (
-                        <div className="flex items-baseline gap-2 text-sm">
-                            <span className="w-32 shrink-0 text-gray-400">Parent phone</span>
-                            <span className="text-gray-700">{booking.parent_phone}</span>
-                        </div>
-                    )}
+                    {/* Belongs to the booking, not to either person: the opt-in was given for this
+                        booking, and guest_reminder_phone is frozen at booking time, so it can
+                        differ from whatever the payer's contact says now. Null once they register,
+                        at which point reminders read the contact's live number instead. */}
+                    <div className="flex items-baseline gap-2 text-sm">
+                        <span className="w-20 shrink-0 text-gray-400">Reminders</span>
+                        <span className="text-gray-700">
+                            {booking.sms_opt_in
+                                ? `SMS to ${booking.guest_reminder_phone ?? booking.payer.phone ?? '—'}`
+                                : 'SMS off'}
+                            {booking.guest_reminder_phone && (
+                                <span className="text-gray-400"> · given at booking</span>
+                            )}
+                        </span>
+                    </div>
                 </div>
             )}
 

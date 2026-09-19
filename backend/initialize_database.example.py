@@ -8,9 +8,13 @@ API = "http://localhost:8000"
 DB_URL = "postgresql://postgres:password@localhost:5432/tms"
 
 # Template only — replace with your real data in a local, gitignored initialize_database.py.
+# Identity and enrollment are separate rows: the name and email make a Contact, the rate and dates
+# make the Student that bills them.
 students = [
-    {"first_name": "Jane", "last_name": "Doe", "rate": 50, "start_date": "2026-01-01", "is_active": True},
-    {"first_name": "John", "last_name": "Smith", "rate": 50, "start_date": "2025-01-01", "is_active": True},
+    {"first_name": "Jane", "last_name": "Doe", "email": "jane.doe@example.com", "phone": "555-0100",
+     "rate": 50, "start_date": "2026-01-01", "is_active": True},
+    {"first_name": "John", "last_name": "Smith", "email": "john.smith@example.com", "phone": "555-0101",
+     "rate": 50, "start_date": "2025-01-01", "is_active": True},
 ]
 
 tutors = [
@@ -23,7 +27,8 @@ cur.execute("""
     TRUNCATE TABLE
         booking_requests, bookings, booking_series,
         lessons, booking_link_availability, schedule_days,
-        schedules, booking_links, booking_types, students, tutors
+        schedules, booking_links, booking_types,
+        contact_managers, students, contacts, tutors
     RESTART IDENTITY CASCADE;
 """)
 conn.commit()
@@ -36,8 +41,19 @@ conn.close()
 requests.get(f"{API}/settings/")
 
 for s in students:
-    r = requests.post(f"{API}/students", json=s)
-    print(r.status_code, r.json().get("first_name"), r.json().get("last_name"))
+    contact = requests.post(f"{API}/contacts/", json={
+        "first_name": s["first_name"],
+        "last_name": s["last_name"],
+        "email": s["email"],
+        "phone": s["phone"],
+    }).json()
+    r = requests.post(f"{API}/students", json={
+        "contact_id": contact["id"],
+        "rate": s["rate"],
+        "start_date": s["start_date"],
+        "is_active": s["is_active"],
+    })
+    print(r.status_code, s["first_name"], s["last_name"])
 
 print("\nAll students created\n")
 
@@ -105,8 +121,10 @@ print(f"Event type created: {booking_link_standalone['slug']} (id={booking_link_
 # Python -> xlsx -> Python round trip. The real initialize_database.py still imports
 # actual historical lessons from a real xlsx, since that's a genuine one-time data
 # migration need, not something worth mirroring in a demo template).
-jane_id = next(s["id"] for s in students_response if s["first_name"] == "Jane")
-john_id = next(s["id"] for s in students_response if s["first_name"] == "John")
+jane = next(s for s in students_response if s["contact"]["first_name"] == "Jane")
+john = next(s for s in students_response if s["contact"]["first_name"] == "John")
+jane_id, john_id = jane["id"], john["id"]              # enrollment ids, what Lesson points at
+jane_contact, john_contact = jane["contact_id"], john["contact_id"]  # what a Booking points at
 tutor_id = tutors_response[0]["id"]
 
 lesson_students = [
@@ -154,8 +172,8 @@ else:
 # PYTHON-side default (Column(..., default=...)), which SQLAlchemy applies on ORM writes but
 # raw SQL bypasses completely. Miss one and this script dies on a NOT NULL violation — there's
 # no static check that catches it. As of now that set is:
-#   bookings        public_id, timezone, status, is_no_show
-#   booking_series  public_id, freq, interval
+#   bookings        public_id, timezone, status, is_no_show, sms_opt_in
+#   booking_series  public_id, freq, interval, sms_opt_in
 # Add a NOT NULL column with a Python-side default to either model and it must be added here too.
 # To list the current set: for each NOT NULL, non-PK column, flag any with .default set and
 # .server_default None. TODO: server_default would make these safe for raw SQL and delete this
@@ -179,38 +197,39 @@ conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
 
-def insert_standalone_booking(event_date, start_time, end_time, booking_link_id, student_id, first, last, email, phone, google_event_id):
+def insert_standalone_booking(event_date, start_time, end_time, booking_link_id, contact_id, google_event_id):
+    """payer and attendee are the same contact here — these demo clients book for themselves."""
     cur.execute("""
         INSERT INTO bookings (
             public_id, tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
-            is_no_show, student_id, student_first, student_last, student_email, student_phone
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
+            is_no_show, sms_opt_in, payer_id, attendee_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'confirmed', false, false, %s, %s)
     """, (
         str(uuid4()), tutor_id, booking_link_id,
         to_utc(event_date, start_time), to_utc(event_date, end_time), "America/New_York",
-        google_event_id, student_id, first, last, email, phone,
+        google_event_id, contact_id, contact_id,
     ))
 
 
 # A few ordinary standalone bookings, spread across different days/times.
 insert_standalone_booking(
     next_weekday(1), "16:00", "17:00",  # next Tuesday
-    booking_link_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
+    booking_link_standalone["id"], jane_contact,
     "demo-standalone-fake-event-id-1",
 )
 insert_standalone_booking(
     next_weekday(4), "11:00", "12:00",  # next Friday
-    booking_link_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
+    booking_link_standalone["id"], jane_contact,
     "demo-standalone-fake-event-id-2",
 )
 insert_standalone_booking(
     next_weekday(4), "15:00", "16:00",  # next Friday
-    booking_link_standalone["id"], john_id, "John", "Smith", "john.smith@example.com", "555-0101",
+    booking_link_standalone["id"], john_contact,
     "demo-standalone-fake-event-id-3",
 )
 insert_standalone_booking(
     date.today() - timedelta(days=14), "13:00", "14:00",  # two weeks ago — exercises the "Past" view
-    booking_link_standalone["id"], jane_id, "Jane", "Doe", "jane.doe@example.com", "555-0100",
+    booking_link_standalone["id"], jane_contact,
     "demo-standalone-fake-event-id-4",
 )
 
@@ -221,7 +240,7 @@ insert_standalone_booking(
 conflict_date = next_weekday(3)  # next Thursday
 insert_standalone_booking(
     conflict_date, "10:30", "22:00",
-    booking_link_standalone["id"], john_id, "John", "Smith", "john.smith@example.com", "555-0101",
+    booking_link_standalone["id"], john_contact,
     "demo-fully-booked-day-fake-event-id",
 )
 
@@ -234,14 +253,14 @@ series_public_id = str(uuid4())
 cur.execute("""
     INSERT INTO booking_series (
         public_id, tutor_id, booking_link_id, dtstart, dtend, freq, interval, until, google_event_id,
-        student_id, student_first, student_last, student_email, student_phone
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        sms_opt_in, payer_id, attendee_id
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s, %s)
     RETURNING id
 """, (
     series_public_id, tutor_id, booking_link_recurring["id"], series_dtstart, series_dtend,
     "WEEKLY", 1, series_until,
     "demo-series-fake-event-id",
-    john_id, "John", "Smith", "john.smith@example.com", "555-0101",
+    john_contact, john_contact,
 ))
 series_id = cur.fetchone()[0]
 
@@ -254,14 +273,14 @@ for week in range(8):
     cur.execute("""
         INSERT INTO bookings (
             public_id, series_id, tutor_id, booking_link_id, start, "end", timezone, google_event_id, status,
-            is_no_show, student_id, student_first, student_last, student_email, student_phone
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', false, %s, %s, %s, %s, %s)
+            is_no_show, sms_opt_in, payer_id, attendee_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'confirmed', false, false, %s, %s)
     """, (
         f"{series_public_id}:{int(occ_start.timestamp())}",
         series_id, tutor_id, booking_link_recurring["id"],
         occ_start, to_utc(occ_date, "18:30"), "America/New_York",
         "demo-series-fake-event-id",
-        john_id, "John", "Smith", "john.smith@example.com", "555-0101",
+        john_contact, john_contact,
     ))
 
 conn.commit()

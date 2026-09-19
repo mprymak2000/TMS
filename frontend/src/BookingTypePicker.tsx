@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { Button, Modal, Popover, TextInput } from '@mantine/core'
+import { Button, Popover, TextInput } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import { IconCheck, IconPencil, IconPlus, IconTrash, IconX, IconChevronDown } from '@tabler/icons-react'
 import type { BookingType } from './types'
 import { extractError } from './utils'
@@ -241,24 +242,24 @@ const BookingTypePicker = ({ value, onChange, types, onTypesChanged, onError, di
                 </Popover.Dropdown>
             </Popover>
 
-            <Modal opened={deleting !== null} onClose={() => setDeleting(null)} title={`Delete "${deleting?.label}"?`} centered size="sm">
-                {usage && (usage.bookings + usage.series + usage.links) > 0 ? (
-                    <p className="text-sm text-gray-600 mb-5">
-                        {usage.bookings + usage.series > 0 && (
-                            <>{usage.bookings} booking{usage.bookings === 1 ? '' : 's'} and {usage.series} series will lose this label. </>
-                        )}
-                        {usage.links > 0 && (
-                            <>{usage.links} link{usage.links === 1 ? '' : 's'} will need a new type picked.</>
-                        )}
-                    </p>
-                ) : (
-                    <p className="text-sm text-gray-600 mb-5">Nothing is using this type yet.</p>
-                )}
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setDeleting(null)}>Cancel</Button>
+            <AppModal
+                opened={deleting !== null}
+                onClose={() => setDeleting(null)}
+                title={`Delete "${deleting?.label}"?`}
+                caption={usage && (usage.bookings + usage.series + usage.links) > 0
+                    ? [
+                        usage.bookings + usage.series > 0 &&
+                            `${usage.bookings} booking${usage.bookings === 1 ? '' : 's'} and ${usage.series} series will lose this label.`,
+                        usage.links > 0 &&
+                            `${usage.links} link${usage.links === 1 ? '' : 's'} will need a new type picked.`,
+                    ].filter(Boolean).join(' ')
+                    : 'Nothing is using this type yet.'}
+            >
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setDeleting(null)}>Cancel</Button>
                     <Button color="red" loading={busy} onClick={confirmDelete}>Delete</Button>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
         </>
     )
 }

@@ -3,10 +3,10 @@ from datetime import UTC, date, datetime, time, timedelta
 import hashlib
 import json
 from zoneinfo import ZoneInfo
-from sqlalchemy import and_, func, or_, select, tuple_
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
-from models import Booking, BookingSeries, BookingLink, BookingLinkAvailability, BookingType, Tutor, FREQ_DAYS
-from schemas import BookingFacets, BookingResponse, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption, TutorFacetOption
+from models import Booking, BookingSeries, BookingLink, BookingLinkAvailability, BookingType, Contact, ContactManager, Tutor, FREQ_DAYS
+from schemas import AttendeeFacetOption, BookingFacets, BookingResponse, BookingLinkFacetOption, BookingTypeFacetOption, TutorFacetOption
 from fastapi import HTTPException
      
 
@@ -91,6 +91,162 @@ def series_policy(source) -> dict:
     }
 
 
+## -------------- Contact resolution -------------- ##
+# A booking always lands on two contacts, whether or not anyone is logged in. Guest bookings create
+# them exactly like any other, which is what keeps the client list complete and makes registering
+# later a single write instead of a string-matched backfill.
+#
+# TODO: races. Every lookup here is find-then-insert, so two simultaneous bookings can duplicate an
+# emailless attendee, and on the payer the unique index turns the race into an IntegrityError 500
+# rather than a clean reuse. Fix is ON CONFLICT upserts on both, plus SELECT FOR UPDATE on the payer
+# row to cover the name-match path, always the payer and always first so nothing deadlocks.
+# Deferred: neither mechanism works on SQLite, so the tests wouldn't cover it.
+
+def normalize_email(email: str) -> str:
+    """Lowercase and strip. Plus-addressing is left alone, jane+x@ is a real, different address."""
+    return email.strip().lower()
+
+
+def _upsert_contact(db: Session, *, email: str, first: str, last: str, phone: str | None = None) -> Contact:
+    """Find or create a contact by email, refreshing the profile only if nobody has claimed it."""
+    normalized = normalize_email(email)
+    contact = db.query(Contact).filter(Contact.email == normalized).first()
+
+    # New address, so a new person.
+    if contact is None:
+        contact = Contact(email=normalized, first_name=first, last_name=last, phone=phone)
+        db.add(contact)
+        db.flush()
+        return contact
+
+    # Known address that nobody has proven they own. The newest booking is the better guess at whose
+    # it is, so it wins.
+    if contact.verified_at is None:
+        contact.first_name = first
+        contact.last_name = last
+        if phone:
+            contact.phone = phone
+        return contact
+
+    # Known address someone has proven they own. Attach the booking but leave the profile, or a
+    # public form would let anyone rewrite a real client's record by typing their email.
+    return contact
+
+
+def _ensure_manager_link(db: Session, manager: Contact, managed: Contact) -> None:
+    exists = db.query(ContactManager).filter(
+        ContactManager.manager_id == manager.id,
+        ContactManager.managed_id == managed.id,
+    ).first()
+    # Idempotent: every repeat booking for the same child comes back through here.
+    if not exists:
+        db.add(ContactManager(manager_id=manager.id, managed_id=managed.id))
+
+
+def resolve_payer(db: Session, *, email: str, first: str, last: str, phone: str | None = None) -> Contact:
+    """The contact who booked. Always has an email, it's what keys them."""
+    return _upsert_contact(db, email=email, first=first, last=last, phone=phone)
+
+
+def resolve_attendee(db: Session, *, payer: Contact, first: str, last: str, email: str | None = None, phone: str | None = None) -> Contact:
+    """The contact the session is for, plus the relationship link granting the payer standing to book them.
+
+    Self-booking is payer email == attendee email: returns the payer, no new row, no relationship
+    link. The router defaults a missing attendee block to the payer, and BookingCreate rejects an
+    attendee that restates the payer, so that's the only way it arrives.
+
+    Every other outcome:
+
+        email given
+            matches a contact       reuse it. Overwrite first/last/phone unless that row is
+                                    verified, in which case leave the profile alone. NO DUPE.
+                                    New relationship link if this payer hadn't booked them before:
+                                    two payers sharing one dependent, which is intended.
+            no email match
+                name match, and
+                  that row has an   new row + relationship link. DUPE: same name under the same
+                  email             payer, two different addresses. Never merge on a name when
+                                    emails disagree.
+                  that row has no   reuse it and backfill the email, which is how a dependent first
+                  email             booked without one gets keyed from then on. NO DUPE. No new
+                                    relationship link, since that link is how it was found.
+                no name match       new row + relationship link. DUPE possible under a DIFFERENT
+                                    payer, whose row for that person this lookup can't see.
+        no email
+            name match              reuse it, whatever its email state. No new relationship link.
+                                    NO DUPE under this payer; DUPE possible under a different one.
+            no name match           new row + relationship link. DUPE possible under a different
+                                    payer, and against a row that already carries an email — the
+                                    name lookup is per-payer and can't reach either.
+
+    Matching is exact on a lowercased name, so "Mike" and "Michael" are two rows. Every DUPE above
+    resolves by hand: merge repoints bookings and relationship links onto the survivor, deletes the
+    loser. The link step is idempotent, so it only creates a row when the attendee is new to this payer.
+    """
+    # 1. Self-booking. One contact in both roles, and no relationship row, since a person doesn't
+    #    manage themselves. Returns early — resolve_payer already handled the profile.
+    if email and normalize_email(email) == payer.email:
+        return payer
+
+    attendee = None
+
+    # 2. Match on email. Scoped on all contacts in the practice, NOT payer-scoped: an address belongs to one person regardless of who
+    #    is booking for them, so a dependent already known under another payer is reused and simply
+    #    gains a second manager. Intended — two payers, one dependent.
+    if email:
+        attendee = db.query(Contact).filter(Contact.email == normalize_email(email)).first()
+        if attendee is not None and attendee.verified_at is None:
+            attendee.first_name = first
+            attendee.last_name = last
+            if phone:
+                attendee.phone = phone
+
+    if attendee is None:
+        # 3. Match on name, scoped to the dependents this payer already books for. Unscoped would
+        #    merge two unrelated people who happen to share a name.
+        match = (
+            db.query(Contact)
+            .join(ContactManager, ContactManager.managed_id == Contact.id)
+            .filter(
+                ContactManager.manager_id == payer.id,
+                func.lower(Contact.first_name) == first.strip().lower(),
+                func.lower(Contact.last_name) == last.strip().lower(),
+            )
+            .first()
+        )
+        # 4. Reuse that match in the two cases where nothing contradicts it:
+        #      - no email was given, so there's nothing that could disagree
+        #      - the match has no email yet and this booking supplies one, which is how a dependent
+        #        first booked without an address gets keyed properly from then on
+        #    Both sides holding an email means they DISAGREE, since the lookup above already missed.
+        if match is not None and (not email or match.email is None):
+            attendee = match
+            if email:
+                attendee.email = normalize_email(email)
+            if phone:
+                attendee.phone = phone
+        else:
+            # 5. Nothing usable matched, so a new row. Three ways that duplicates someone who already
+            #    exists, all deliberate, all resolved by a manual merge:
+            #      - DUPE: same name, disagreeing emails. Never merge on a name when emails differ.
+            #      - DUPE: a second payer booking the same dependent with no email. The name scope is
+            #        per-payer, so nothing links the two rows.
+            #      - DUPE: a dependent who once booked as their own payer already has an email on
+            #        file, which the case above declines to touch.
+            attendee = Contact(
+                first_name=first,
+                last_name=last,
+                phone=phone,
+                email=normalize_email(email) if email else None,
+            )
+            db.add(attendee)
+            db.flush()
+
+    # 6. Grant the payer standing to book for them.
+    _ensure_manager_link(db, payer, attendee)
+    return attendee
+
+
 def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, settings) -> Booking:
     """Ensure a specific occurrence of a series exists. Returns existing or newly created Booking.
 
@@ -125,14 +281,10 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         tutor_id=series.tutor_id,
         booking_link_id=series.booking_link_id,
         booking_type_id=series.booking_type_id,
-        student_id=series.student_id,
-        student_first=series.student_first,
-        student_last=series.student_last,
-
-        student_email=series.student_email,
-        student_phone=series.student_phone,
-        parent_email=series.parent_email,
-        parent_phone=series.parent_phone,
+        payer_id=series.payer_id,
+        attendee_id=series.attendee_id,
+        sms_opt_in=series.sms_opt_in,
+        guest_reminder_phone=series.guest_reminder_phone,
         google_event_id=series.google_event_id,
         **occurrence_policy(series),
         start=start_utc,
@@ -384,7 +536,6 @@ def _virtual_occurrences(
                     tutor_id=series.tutor_id,
                     booking_link_id=series.booking_link_id,
                     booking_type_id=series.booking_type_id,
-                    student_id=series.student_id,
                     start=start_utc,
                     end=end_utc,
                     timezone=settings.business_timezone,
@@ -392,12 +543,10 @@ def _virtual_occurrences(
                     is_no_show=False,
                     google_event_id=series.google_event_id,
                     **occurrence_policy(series),
-                    student_first=series.student_first,
-                    student_last=series.student_last,
-                    student_email=series.student_email,
-                    student_phone=series.student_phone,
-                    parent_email=series.parent_email,
-                    parent_phone=series.parent_phone,
+                    payer=series.payer,
+                    attendee=series.attendee,
+                    sms_opt_in=series.sms_opt_in,
+                    guest_reminder_phone=series.guest_reminder_phone,
                     request=None,
                 )
             )
@@ -477,22 +626,20 @@ def apply_series_time_scope(query, time_min: datetime | None, time_max: datetime
     return query
 
 
-def apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, email=None, exclude=None):
+def apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude=None):
     """Take in a query and attach filters to it based on the provided scope parameters. Return the modified query."""
-    if email:
-        query = query.filter((model.student_email == email) | (model.parent_email == email))
     if tutor_ids and exclude != "tutor":
         query = query.filter(model.tutor_id.in_(tutor_ids))
     if booking_link_ids and exclude != "booking_link":
         query = query.filter(model.booking_link_id.in_(booking_link_ids))
     if booking_type_ids and exclude != "booking_type":
         query = query.filter(model.booking_type_id.in_(booking_type_ids))
-    if student_pairs and exclude != "student":
-        query = query.filter(tuple_(model.student_first, model.student_last).in_(student_pairs))
+    if attendee_ids and exclude != "attendee":
+        query = query.filter(model.attendee_id.in_(attendee_ids))
     return query
 
 
-def _build_facets(tutor_ids, booking_link_ids, booking_type_ids, student_pairs, db):
+def _build_facets(tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, db):
     """Given a set of scope parameters, return the corresponding filter/facet options for the respective fields.
 
     Links are looked up by id without a status filter — an archived link's bookings still group under
@@ -500,6 +647,7 @@ def _build_facets(tutor_ids, booking_link_ids, booking_type_ids, student_pairs, 
     tutors = db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all() if tutor_ids else []
     booking_links = db.query(BookingLink).filter(BookingLink.id.in_(booking_link_ids)).all() if booking_link_ids else []
     booking_types = db.query(BookingType).filter(BookingType.id.in_(booking_type_ids)).all() if booking_type_ids else []
+    attendees = db.query(Contact).filter(Contact.id.in_(attendee_ids)).all() if attendee_ids else []
 
     tutor_options = [TutorFacetOption(id=t.id, first_name=t.first_name, last_name=t.last_name) for t in tutors]
     tutor_options.sort(key=lambda t: (t.first_name.lower(), t.last_name.lower()))
@@ -510,18 +658,18 @@ def _build_facets(tutor_ids, booking_link_ids, booking_type_ids, student_pairs, 
     booking_type_options = [BookingTypeFacetOption(id=t.id, label=t.label, color=t.color) for t in booking_types]
     booking_type_options.sort(key=lambda t: t.label.lower())
 
-    student_options = [StudentFacetOption(first_name=first, last_name=last) for first, last in student_pairs]
-    student_options.sort(key=lambda s: (s.first_name.lower(), s.last_name.lower()))
+    attendee_options = [AttendeeFacetOption(id=c.id, first_name=c.first_name, last_name=c.last_name) for c in attendees]
+    attendee_options.sort(key=lambda a: (a.first_name.lower(), a.last_name.lower()))
 
     return BookingFacets(
         tutors=tutor_options,
         booking_links=booking_link_options,
         booking_types=booking_type_options,
-        students=student_options,
+        attendees=attendee_options,
     )
 
 
-def _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude) -> bool:
+def _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude) -> bool:
     """In-Python mirror of apply_scope_filters for a single series row, with the same self-exclusion
     semantics. Series are checked in Python rather than SQL because whether one contributes to a
     window depends on _virtual_occurrences, which the query can't express.
@@ -535,43 +683,43 @@ def _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, stud
         return False
     if exclude != "booking_type" and booking_type_ids and series.booking_type_id not in booking_type_ids:
         return False
-    if exclude != "student" and student_pairs and (series.student_first, series.student_last) not in student_pairs:
+    if exclude != "attendee" and attendee_ids and series.attendee_id not in attendee_ids:
         return False
     return True
 
 
-def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, settings, db):
+def compute_timeline_facets(materialized_base_query, series_base_query, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, settings, db):
     """ Duplicate the base query for each facet type. Apply the scope filters to each while excluding one facet at a time. Do this for regualar Bookings and BookingSeries and marge on each facet type. materialized_base_query must already be time/status-scoped, and series_base_query already time-scoped (apply_series_time_scope, a cheap pre-filter), by the caller. Return the unique set of facet options for each facet type. """
 
     # get tutor options filtered by the other filters (self-exclude tutor), then query to get their ids
-    tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="tutor")
+    tutor_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(Booking.tutor_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
     # get booking_link options filtered by the other filters (self-exclude booking_link), then query to get their ids
-    booking_link_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="booking_link")
+    booking_link_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="booking_link")
     booking_link_id_set = {row[0] for row in booking_link_query.with_entities(Booking.booking_link_id).distinct().all()} # [(1,), (2,), ...] -> {1, 2, ...}
     # same for the kind label; None is dropped since an untyped booking isn't a facet option
-    booking_type_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="booking_type")
+    booking_type_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="booking_type")
     booking_type_id_set = {row[0] for row in booking_type_query.with_entities(Booking.booking_type_id).distinct().all() if row[0] is not None}
-    # get student options filtered by the other filters (self-exclude student), then query to get their first/last names (from denormalized column names on bookimg, to be changed to student identity)
-    student_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="student")
-    student_pair_set = set(student_query.with_entities(Booking.student_first, Booking.student_last).distinct().all()) # [('John', 'Doe'), ('Jane', 'Smith'), ...] -> {('John', 'Doe'), ('Jane', 'Smith'), ...}
+    # attendee is an ordinary FK facet like the three above now that a booking points at a contact
+    attendee_query = apply_scope_filters(materialized_base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="attendee")
+    attendee_id_set = {row[0] for row in attendee_query.with_entities(Booking.attendee_id).distinct().all()}
 
     # apply_series_time_scope already dropped series that can't possibly overlap; here we confirm
     # each survivor actually has an occurrence in [time_min, time_max] (count=1 - existence only,
-    # not the full list, since every occurrence of a series shares the same tutor/booking_link/student).
+    # not the full list, since every occurrence of a series shares the same tutor/booking_link/attendee).
     # Indefinite only - a bounded series is fully materialized, so it already contributed above.
     if series_base_query is not None:
         for series in series_base_query.filter(indefinite_series_filter()).all():
             if not _virtual_occurrences(series, time_min, time_max, 1, settings):
                 continue
-            if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="tutor"):
+            if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="tutor"):
                 tutor_id_set.add(series.tutor_id)
-            if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="booking_link"):
+            if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="booking_link"):
                 booking_link_id_set.add(series.booking_link_id)
-            if series.booking_type_id is not None and _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="booking_type"):
+            if series.booking_type_id is not None and _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="booking_type"):
                 booking_type_id_set.add(series.booking_type_id)
-            if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="student"):
-                student_pair_set.add((series.student_first, series.student_last))
+            if _series_in_scope(series, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="attendee"):
+                attendee_id_set.add(series.attendee_id)
 
     # keep a selected value visible in its own facet even if other filters/the time window narrowed it out
     # ie tutor A selected but shifting dates yields no results. Tutor a selection still needs to be visible
@@ -579,33 +727,33 @@ def compute_timeline_facets(materialized_base_query, series_base_query, tutor_id
     tutor_id_set |= set(tutor_ids)
     booking_link_id_set |= set(booking_link_ids)
     booking_type_id_set |= set(booking_type_ids)
-    student_pair_set |= set(student_pairs)
+    attendee_id_set |= set(attendee_ids)
 
-    return _build_facets(tutor_id_set, booking_link_id_set, booking_type_id_set, student_pair_set, db)
+    return _build_facets(tutor_id_set, booking_link_id_set, booking_type_id_set, attendee_id_set, db)
 
 
-def compute_series_facets(base_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, db):
+def compute_series_facets(base_query, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, db):
     """ Given scope parameters, attach them to the base query for SERIES (not individual ocurrences) and ficlean upre it as many times as there are facets, while keeping one facet type unfiltered at a time. Return the unique set of facet options for each facet type. """
 
-    tutor_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="tutor")
+    tutor_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="tutor")
     tutor_id_set = {row[0] for row in tutor_query.with_entities(BookingSeries.tutor_id).distinct().all()}
 
-    booking_link_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="booking_link")
+    booking_link_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="booking_link")
     booking_link_id_set = {row[0] for row in booking_link_query.with_entities(BookingSeries.booking_link_id).distinct().all()}
 
-    booking_type_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="booking_type")
+    booking_type_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="booking_type")
     booking_type_id_set = {row[0] for row in booking_type_query.with_entities(BookingSeries.booking_type_id).distinct().all() if row[0] is not None}
 
-    student_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, exclude="student")
-    student_pair_set = set(student_query.with_entities(BookingSeries.student_first, BookingSeries.student_last).distinct().all())
+    attendee_query = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude="attendee")
+    attendee_id_set = {row[0] for row in attendee_query.with_entities(BookingSeries.attendee_id).distinct().all()}
 
     # keep a selected value visible in its own facet even if other filters narrowed it out
     tutor_id_set |= set(tutor_ids)
     booking_link_id_set |= set(booking_link_ids)
     booking_type_id_set |= set(booking_type_ids)
-    student_pair_set |= set(student_pairs)
+    attendee_id_set |= set(attendee_ids)
 
-    return _build_facets(tutor_id_set, booking_link_id_set, booking_type_id_set, student_pair_set, db)
+    return _build_facets(tutor_id_set, booking_link_id_set, booking_type_id_set, attendee_id_set, db)
 
 
 ## -------------- Cursor for Pagination -------------- ##
@@ -615,10 +763,9 @@ def _filters_fingerprint(
     tutor_ids,
     booking_link_ids,
     booking_type_ids,
-    student_pairs,
+    attendee_ids,
     time_min,
     time_max,
-    email,
     pending_only,
     include_cancelled,
     series_id: str | None = None,
@@ -635,10 +782,9 @@ def _filters_fingerprint(
         "tutor_ids": sorted(tutor_ids),
         "booking_link_ids": sorted(booking_link_ids),
         "booking_type_ids": sorted(booking_type_ids),
-        "student_pairs": sorted(student_pairs),
+        "attendee_ids": sorted(attendee_ids),
         "time_min": int(time_min_utc.timestamp()) if time_min_utc else None,
         "time_max": int(time_max_utc.timestamp()) if time_max_utc else None,
-        "email": email,
         "pending_only": pending_only,
         "include_cancelled": include_cancelled,
         "series_id": series_id,
@@ -652,10 +798,9 @@ def encode_cursor(
     tutor_ids: list[int],
     booking_link_ids: list[int],
     booking_type_ids: list[int],
-    student_pairs: list[tuple[int, int]],
+    attendee_ids: list[int],
     time_min: datetime | None,
     time_max: datetime | None,
-    email: str | None,
     pending_only: bool,
     include_cancelled: bool,
     series_id: str | None = None,
@@ -665,10 +810,9 @@ def encode_cursor(
         tutor_ids,
         booking_link_ids,
         booking_type_ids,
-        student_pairs,
+        attendee_ids,
         time_min,
         time_max,
-        email,
         pending_only,
         include_cancelled,
         series_id,
@@ -685,10 +829,9 @@ def decode_cursor(
     tutor_ids,
     booking_link_ids,
     booking_type_ids,
-    student_pairs,
+    attendee_ids,
     time_min,
     time_max,
-    email,
     pending_only,
     include_cancelled,
     series_id: str | None = None, # only used when getting occurrences of a series
@@ -705,10 +848,9 @@ def decode_cursor(
         tutor_ids,
         booking_link_ids,
         booking_type_ids,
-        student_pairs,
+        attendee_ids,
         time_min,
         time_max,
-        email,
         pending_only,
         include_cancelled,
         series_id,
@@ -716,9 +858,3 @@ def decode_cursor(
     if fingerprint != expected_fingerprint:
         raise HTTPException(status_code=400, detail="Cursor does not match current filters")
     return start, public_id
-
-
-
-# Once a guest/contact id exists on Booking/BookingSeries, student matching should switch from
-# (student_first, student_last) pairs to that id — same shape as tutor_id/booking_link_id already
-# use, dropping the pair/tuple_ special-casing throughout this file.

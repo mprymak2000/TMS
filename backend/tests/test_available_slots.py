@@ -21,7 +21,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Booking, BookingSeries, Settings
+from models import Booking, BookingSeries, Contact, Settings
 
 # ── Shared DB session (same file as conftest.py client fixture) ───────────────
 
@@ -102,20 +102,32 @@ def _mon_9_17(client, tutor_id: int) -> dict:
     return _schedule(client, tutor_id, [{"day_of_week": 0, "start_time": "09:00:00", "end_time": "17:00:00"}])
 
 
+def _contact(db) -> Contact:
+    """One shared contact for these fixtures — available_slots never reads it, it just has to exist
+    so the NOT NULL payer/attendee FKs resolve."""
+    existing = db.query(Contact).filter(Contact.email == "a@b.com").first()
+    if existing:
+        return existing
+    c = Contact(first_name="A", last_name="B", email="a@b.com", phone="555-0000")
+    db.add(c)
+    db.flush()
+    return c
+
+
 def _insert_series(db, tutor_id: int, booking_link_id: int, *,
                    start_dow: int, start_t: time,
                    end_dow: int, end_t: time,
                    until: date | None = None) -> BookingSeries:
     start_date = MON + timedelta(days=start_dow)  # value doesn't matter to available_slots
     end_date = start_date + timedelta(days=(end_dow - start_dow) % 7)  # wraps forward for midnight-crossing cases
+    contact = _contact(db)
     s = BookingSeries(
         tutor_id=tutor_id, booking_link_id=booking_link_id,
         dtstart=datetime.combine(start_date, start_t),
         dtend=datetime.combine(end_date, end_t),
         until=until,
         google_event_id=str(uuid4()),
-        student_first="A", student_last="B",
-        student_email="a@b.com", student_phone="555-0000",
+        payer_id=contact.id, attendee_id=contact.id,
     )
     db.add(s)
     db.flush()
@@ -126,14 +138,14 @@ def _insert_booking(db, tutor_id: int, booking_link_id: int,
                     start: datetime, end: datetime, *,
                     series: BookingSeries | None = None,
                     status: str = "confirmed") -> Booking:
+    contact = _contact(db)
     b = Booking(
         series_id=series.id if series else None,
         tutor_id=tutor_id, booking_link_id=booking_link_id,
         start=start, end=end,
         google_event_id=str(uuid4()), status=status,
         timezone="UTC",
-        student_first="A", student_last="B",
-        student_email="a@b.com", student_phone="555-0000",
+        payer_id=contact.id, attendee_id=contact.id,
     )
     db.add(b)
     db.commit()

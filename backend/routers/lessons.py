@@ -48,7 +48,7 @@ def export_lessons(
     for i, lesson in enumerate(lessons, start=2):
         student = student_map.get(lesson.student_id)
         tutor = tutor_map.get(lesson.tutor_id)
-        student_name = f'{student.first_name} {student.last_name[0]}' if student else ''
+        student_name = f'{student.contact.first_name} {student.contact.last_name[0]}' if student else ''
         tutor_name = f'{tutor.first_name} {tutor.last_name}' if tutor else ''
         ws.append([
             lesson.date,

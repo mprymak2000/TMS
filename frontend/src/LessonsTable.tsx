@@ -1,8 +1,9 @@
 // TODO: Summary card — make Total Payout tile clickable to expand payout breakdown per tutor
 // TODO: Google Calendar integration — fetch events, match title to student name, derive hrs from duration, pre-populate bulk add form for review before saving. Tutor defaults to owner or manual pick.
 
-import { Select, Input, Modal, Button, Group } from '@mantine/core'
-import { IconCircleX, IconTrash, IconSquareCheck, IconPlus, IconStack2, IconFileDownload } from '@tabler/icons-react'
+import { Select, Input, Button } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
+import { IconTrash, IconSquareCheck, IconPlus, IconStack2, IconFileDownload } from '@tabler/icons-react'
 import LessonAddModal from './LessonAddModal'
 import BulkAddCard from './BulkAddCard'
 import LessonRow from './LessonRow'
@@ -155,24 +156,18 @@ export default function LessonsTable() {
           onClose={() => setModalOpen(false)}
         />
 
-        <Modal
+        <AppModal
           opened={confirmingBulkDelete}
           onClose={() => { setConfirmingBulkDelete(false); setDeleteError(null) }}
-          title={<span className="flex items-center gap-2"><IconCircleX size={24} className="text-red-500" /> Delete lessons</span>}
-          centered
-          size="sm"
+          title="Delete lessons"
+          caption={`${selectedIds.size} lesson${selectedIds.size !== 1 ? 's' : ''} will be permanently deleted.`}
         >
-          <div className="flex flex-col gap-4">
-            <p className="text-sm text-gray-700">
-              <span className="font-semibold text-gray-900">{selectedIds.size} lesson{selectedIds.size !== 1 ? 's' : ''}</span> will be permanently deleted.
-            </p>
-            {deleteError && <p className="text-sm text-red-500">{deleteError}</p>}
-            <Group justify="flex-end">
-              <Button variant="default" onClick={() => { setConfirmingBulkDelete(false); setDeleteError(null) }}>Cancel</Button>
-              <Button color="red" onClick={handleBulkDelete}>Delete</Button>
-            </Group>
-          </div>
-        </Modal>
+          {deleteError && <p className="text-sm text-red-500">{deleteError}</p>}
+          <ModalFooter>
+            <Button variant="subtle" color="gray" onClick={() => { setConfirmingBulkDelete(false); setDeleteError(null) }}>Cancel</Button>
+            <Button color="red" onClick={handleBulkDelete}>Delete</Button>
+          </ModalFooter>
+        </AppModal>
 
         {(view === 'Week' || view === 'Month') && (() => {
           const periods = view === 'Week' ? weeks : months // get ordered list of week/month start dates (keys of our Record<date bucket string, lesson list>) 
@@ -277,7 +272,7 @@ export default function LessonsTable() {
                       <Select
                         size="xs"
                         placeholder="All Students"
-                        data={Object.values(students).map(s => ({ value: s.id.toString(), label: `${s.first_name} ${s.last_name}` }))}
+                        data={Object.values(students).map(s => ({ value: s.id.toString(), label: `${s.contact.first_name} ${s.contact.last_name}` }))}
                         onChange={v => setFilterStudent(v ? Number(v) : null)}
                         clearable
                         styles={{ input: { borderColor: '#e5e7eb', height: '40px', borderRadius: '8px', fontFamily: 'inherit', fontWeight: 'normal' } }}

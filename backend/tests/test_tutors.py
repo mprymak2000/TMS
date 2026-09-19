@@ -4,6 +4,10 @@ test_tutor = {
     "pay_rate": 40,
 }
 
+# Names are immutable and aren't in TutorUpdate, so a PUT can't carry them — input schemas reject
+# unknown fields rather than dropping them silently.
+tutor_update = {"pay_rate": 40, "is_active": True}
+
 
 # --- CREATE ---
 
@@ -67,7 +71,7 @@ def test_get_tutor_by_id_not_found(client):
 
 def test_update_tutor(client):
     created = client.post("/tutors/", json=test_tutor).json()
-    tutor_updated = {**test_tutor, "pay_rate": 35, "is_active": True} # ex tutor got raise
+    tutor_updated = {**tutor_update, "pay_rate": 35} # ex tutor got raise
     response = client.put(f"/tutors/{created['id']}", json=tutor_updated)
     assert response.status_code == 200
     assert response.json()["pay_rate"] == tutor_updated["pay_rate"]
@@ -76,17 +80,17 @@ def test_update_tutor(client):
 # deactivate a tutor (ex: tutor left)
 def test_update_tutor_deactivate(client):
     created = client.post("/tutors/", json=test_tutor).json()
-    response = client.put(f"/tutors/{created['id']}", json={**test_tutor, "is_active": False})
+    response = client.put(f"/tutors/{created['id']}", json={**tutor_update, "is_active": False})
     assert response.status_code == 200
     assert not response.json()["is_active"]
 
 def test_update_tutor_not_found(client):
-    response = client.put("/tutors/9999", json={**test_tutor, "pay_rate": 35, "is_active": True})
+    response = client.put("/tutors/9999", json={**tutor_update, "pay_rate": 35})
     assert response.status_code == 404
 
 def test_update_tutor_invalid_pay_rate(client):
     created = client.post("/tutors/", json=test_tutor).json()
-    bad = {**test_tutor, "pay_rate": -10, "is_active": True}
+    bad = {**tutor_update, "pay_rate": -10}
     response = client.put(f"/tutors/{created['id']}", json=bad)
     assert response.status_code == 422
 

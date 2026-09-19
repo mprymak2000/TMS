@@ -9,7 +9,18 @@ from policy import get_cancel_action, get_reschedule_action, minutes_until
 #todo: change student rate Field(gt=0) to Field(ge=0) in StudentCreate and StudentUpdate — rate=0 should be allowed (e.g. a family member). Also check tutor_payout logic for division by zero when student.rate=0.
 
 
-class SettingsUpdate(BaseModel):
+class _Input(BaseModel):
+    """Base for every request body. Rejects unknown fields instead of dropping them.
+
+    Pydantic's default is extra='ignore', so a client sending a field the server no longer accepts
+    gets a 200 and a silent no-op — a save that reports success and changes nothing. Tolerating that
+    only earns its keep when clients deploy independently (a public API, a mobile app in the wild).
+    Ours is one frontend shipped from this repo, so drift is a bug and should say so.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+
+class SettingsUpdate(_Input):
     business_timezone: str
 
 
@@ -20,7 +31,7 @@ class SettingsResponse(BaseModel):
     business_timezone: str
 
 
-class TutorCreate(BaseModel):
+class TutorCreate(_Input):
     first_name: str
     last_name: str
     pay_rate: float = Field(ge=0)
@@ -29,7 +40,7 @@ class TutorCreate(BaseModel):
     check_calendar_conflicts: bool = False
 
 
-class TutorUpdate(BaseModel):
+class TutorUpdate(_Input):
     pay_rate: float = Field(ge=0)
     is_active: bool
     calendar_id: str | None = None
@@ -47,41 +58,99 @@ class TutorResponse(BaseModel):
     calendar_id: str | None = None
     check_calendar_conflicts: bool = False
 
-class StudentCreate(BaseModel):
+class ContactCreate(_Input):
     first_name: str
     last_name: str
+    email: str | None = None
+    phone: str | None = None
+
+
+class ContactUpdate(_Input):
+    first_name: str
+    last_name: str
+    email: str | None = None
+    phone: str | None = None
+
+
+class ContactResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    first_name: str
+    last_name: str
+    email: str | None = None
+    phone: str | None = None
+    verified_at: datetime | None = None
+
+
+class ContactListResponse(ContactResponse):
+    """ContactResponse plus how the person has actually been used, for the roster's role badges.
+
+    Both counts are derived from the bookings at read time, never stored: a role is held on a
+    transaction, not on a person, and the same human is a payer on one booking and an attendee on
+    another. 0/0 is normal — an admin-created contact who hasn't booked yet.
+    """
+    created: datetime
+    bookings_as_payer: int = 0
+    bookings_as_attendee: int = 0
+
+
+class ContactPagedResponse(BaseModel):
+    """Page numbers, not a cursor: a name-ordered roster is jumped around and needs a total, which is
+    exactly the random access a cursor gives up."""
+    items: list[ContactListResponse]
+    total: int
+
+
+class _ContactBase(_Input):
+    first_name: str
+    last_name: str
+    phone: str | None = None
+
+
+class PayerInput(_ContactBase):
+    """Whoever is responsible for the booking. Email is required because it's the key the contact is
+    found by, not because of any intake rule."""
+    email: str
+
+
+class AttendeeInput(_ContactBase):
+    """Whoever the session is for. Email optional: a child has none and is keyed by the manager link."""
+    email: str | None = None
+
+
+class StudentCreate(_Input):
+    contact_id: int
     rate: float = Field(gt=0)
     start_date: date
     is_active: bool = True
     grade: int | None = None
     birthday: date | None = None
-    email: str | None = None
 
 
 #todo: add auto grade incrementing every summer
-class StudentUpdate(BaseModel):
+class StudentUpdate(_Input):
     rate: float = Field(gt=0)
     start_date: date
     is_active: bool
     grade: int | None = None
-    email: str | None = None
+    birthday: date | None = None
 
 
 class StudentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    first_name: str
-    last_name: str
+    contact_id: int
+    contact: ContactResponse
     rate: float
     start_date: date
     is_active: bool
     grade: int | None = None
     birthday: date | None = None
-    email: str | None = None
 
 
-class LessonCreate(BaseModel):
+class LessonCreate(_Input):
     student_id: int
     tutor_id: int
     date: date
@@ -92,7 +161,7 @@ class LessonCreate(BaseModel):
     notes: str | None = None
 
 
-class LessonUpdate(BaseModel):
+class LessonUpdate(_Input):
     date: date
     hrs: float | None = Field(default=None, ge=0)
     fee_override: float | None = Field(default=None, ge=0)
@@ -118,7 +187,7 @@ class LessonResponse(BaseModel):
     is_tutor_payout_overridden: bool
 
 
-class CalendarEventCreate(BaseModel):
+class CalendarEventCreate(_Input):
     tutor_id: int
     summary: str
     start: str
@@ -134,7 +203,7 @@ class CalendarEventResponse(BaseModel):
     htmlLink: str | None = None
 
 
-class ScheduleDayCreate(BaseModel):
+class ScheduleDayCreate(_Input):
     day_of_week: int = Field(ge=0, le=6)
     start_time: time
     end_time: time
@@ -155,7 +224,7 @@ class ScheduleDayResponse(BaseModel):
     end_time: time
 
 
-class ScheduleCreate(BaseModel):
+class ScheduleCreate(_Input):
     tutor_id: int
     name: str
     is_default: bool = False
@@ -163,7 +232,7 @@ class ScheduleCreate(BaseModel):
     timezone: str | None = None  # redundant — always Settings.business_timezone; nullable pending refactor
 
 
-class ScheduleUpdate(BaseModel):
+class ScheduleUpdate(_Input):
     name: str
     is_default: bool = False
     timezone: str | None = None  # redundant — always Settings.business_timezone; nullable pending refactor
@@ -181,7 +250,7 @@ class ScheduleResponse(BaseModel):
     days: list[ScheduleDayResponse]
 
 
-class BookingLinkAvailabilityCreate(BaseModel):
+class BookingLinkAvailabilityCreate(_Input):
     booking_link_id: int
     tutor_id: int
     schedule_id: int
@@ -204,18 +273,18 @@ class TutorAvailability(BaseModel):
 _HEX_COLOR_PATTERN = r'^#[0-9a-fA-F]{6}$'
 
 
-class BookingLinkStatusUpdate(BaseModel):
+class BookingLinkStatusUpdate(_Input):
     """Pause and resume only. Archiving is DELETE — it's the irreversible "get rid of this" action,
     so it stays out of reach of a status write."""
     status: Literal["active", "paused"]
 
 
-class BookingTypeCreate(BaseModel):
+class BookingTypeCreate(_Input):
     label: str = Field(min_length=1, max_length=60)
     color: str | None = Field(default=None, pattern=_HEX_COLOR_PATTERN)
 
 
-class BookingTypeUpdate(BaseModel):
+class BookingTypeUpdate(_Input):
     label: str = Field(min_length=1, max_length=60)
     color: str | None = Field(default=None, pattern=_HEX_COLOR_PATTERN)
 
@@ -310,7 +379,7 @@ def _validate_recurrence(count, expires_on, booker_can_set_recur_until, booker_c
         raise ValueError("expires_on must be in the future")
 
 
-class BookingLinkCreate(BaseModel):
+class BookingLinkCreate(_Input):
     slug: str = Field(pattern=_SLUG_PATTERN, max_length=100)
     booking_type_id: int | None = None
     description: str | None = Field(default=None, max_length=DESCRIPTION_MAX_LENGTH)
@@ -367,7 +436,7 @@ class BookingLinkCreate(BaseModel):
 
 
 # same as Create — all fields are mutable
-class BookingLinkUpdate(BaseModel):
+class BookingLinkUpdate(_Input):
     slug: str = Field(pattern=_SLUG_PATTERN, max_length=100)
     booking_type_id: int | None = None
     description: str | None = Field(default=None, max_length=DESCRIPTION_MAX_LENGTH)
@@ -468,7 +537,7 @@ _RESCHEDULE_TYPES = ('reschedule_occurrence', 'reschedule_series')
 _SERIES_TYPES = ('cancel_series', 'reschedule_series')
 
 
-class BookingRequestCreate(BaseModel):
+class BookingRequestCreate(_Input):
     type: str
     # exactly one of these must be provided — mirrors the DB constraint
     booking_id: int | None = None
@@ -528,7 +597,10 @@ class BookingResponse(BaseModel):
     tutor_id: int
     booking_link_id: int
     booking_type_id: int | None = None
-    student_id: int | None = None
+    payer: ContactResponse
+    attendee: ContactResponse
+    sms_opt_in: bool = False
+    guest_reminder_phone: str | None = None
     start: datetime
     end: datetime
     timezone: str
@@ -554,12 +626,6 @@ class BookingResponse(BaseModel):
     def reschedule_action(self) -> str:
         return get_reschedule_action(self, minutes_until(self.start))
 
-    student_first: str
-    student_last: str
-    student_email: str | None = None
-    student_phone: str | None = None
-    parent_email: str | None = None
-    parent_phone: str | None = None
     request: BookingRequestResponse | None = None
 
 
@@ -570,7 +636,10 @@ class BookingSeriesResponse(BaseModel):
     tutor_id: int
     booking_link_id: int
     booking_type_id: int | None = None
-    student_id: int | None = None
+    payer: ContactResponse
+    attendee: ContactResponse
+    sms_opt_in: bool = False
+    guest_reminder_phone: str | None = None
     created: datetime
     last_modified: datetime
     dtstart: datetime
@@ -597,12 +666,6 @@ class BookingSeriesResponse(BaseModel):
     cancel_action: str = Field(validation_alias="series_cancel_mode")
     reschedule_action: str = Field(validation_alias="series_reschedule_mode")
 
-    student_first: str
-    student_last: str
-    student_email: str | None = None
-    student_phone: str | None = None
-    parent_email: str | None = None
-    parent_phone: str | None = None
     request: BookingRequestResponse | None = None
 
 
@@ -612,22 +675,20 @@ def _convert_to_utc(dt: datetime, tz_str: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-class BookingCreate(BaseModel):
+class BookingCreate(_Input):
     tutor_id: int
     booking_link_id: int
-    student_id: int | None = None
     start: datetime
     end: datetime
     timezone: str
     recur_until: date | None = None  # only honoured when booking_link.booker_can_set_recur_until=True
     recur_count: int | None = Field(default=None, ge=2)  # only honoured when booking_link.booker_can_set_count=True
 
-    student_first: str
-    student_last: str
-    student_email: str | None = None
-    student_phone: str | None = None
-    parent_email: str | None = None
-    parent_phone: str | None = None
+    # Who is responsible for the booking, and who the session is for. Equal when someone books for
+    # themselves, in which case the form omits attendee and the router points both FKs at the payer.
+    payer: PayerInput
+    attendee: AttendeeInput | None = None
+    sms_opt_in: bool = False
 
     @model_validator(mode="after")
     def validate_and_convert(self):
@@ -639,17 +700,33 @@ class BookingCreate(BaseModel):
             raise ValueError("start must be in the future")
         if self.recur_until is not None and self.recur_until < self.start.date():
             raise ValueError("recur_until must be on or after the booking start date")
-        if self.student_email is None and self.parent_email is None:
-            raise ValueError("at least one of student_email or parent_email is required")
-        if self.student_phone is None and self.parent_phone is None:
-            raise ValueError("at least one of student_phone or parent_phone is required")
+        return self
+
+    @model_validator(mode="after")
+    def validate_attendee_distinct(self):
+        """Booking for yourself is expressed by omitting the attendee, not by repeating the payer.
+
+        An identical email is the same person outright. An identical name only conflicts when no
+        email distinguishes them: same name, different email is a legitimate Jr./Sr.
+        """
+        if self.attendee is None:
+            return self
+        fold = lambda s: s.strip().lower()
+        if self.attendee.email and fold(self.attendee.email) == fold(self.payer.email):
+            raise ValueError("attendee email matches the payer's; omit attendee to book for yourself")
+        same_name = (
+            fold(self.attendee.first_name) == fold(self.payer.first_name)
+            and fold(self.attendee.last_name) == fold(self.payer.last_name)
+        )
+        if same_name and not self.attendee.email:
+            raise ValueError("attendee name matches the payer's; omit attendee to book for yourself")
         return self
 
 
 # Plain-column updates. Everything here is a column write with at most a validation — no side
 # effects, no new rows. Anything that creates a resource or runs a calendar saga gets its own route
 # (see reschedule), so these never have to branch on which fields changed.
-class BookingUpdate(BaseModel):
+class BookingUpdate(_Input):
     booking_link_id: int         # which link's rules govern future reschedules; rejects archived
     booking_type_id: int | None = None  # null clears the kind label — it's optional
     # Frozen at creation, so this PUT is the only way they ever change.
@@ -657,12 +734,8 @@ class BookingUpdate(BaseModel):
     cancel_notice_minutes: int | None = None
     reschedule_mode: str
     reschedule_notice_minutes: int | None = None
-    student_first: str
-    student_last: str
-    student_email: str | None = None
-    student_phone: str | None = None
-    parent_email: str | None = None
-    parent_phone: str | None = None
+    # Contact details are not here: they live on the Contact row and are edited through /contacts.
+    # Editing them per booking would fork one person into a different record on every session.
     is_no_show: bool = False
 
     @model_validator(mode="after")
@@ -677,16 +750,7 @@ class BookingUpdate(BaseModel):
             raise ValueError("reschedule_notice_minutes must be > 0 when reschedule_mode is a window mode")
         return self
 
-    @model_validator(mode="after")
-    def validate_contact(self):
-        if self.student_email is None and self.parent_email is None:
-            raise ValueError("at least one of student_email or parent_email is required")
-        if self.student_phone is None and self.parent_phone is None:
-            raise ValueError("at least one of student_phone or parent_phone is required")
-        return self
-
-
-class BookingSeriesUpdate(BaseModel):
+class BookingSeriesUpdate(_Input):
     """The series equivalent of BookingUpdate, which a series never had — its bare PUT was the
     reschedule saga until that moved to POST .../reschedule. Excludes dtstart/dtend deliberately:
     moving a series creates a new row, so it can't be a PUT."""
@@ -700,12 +764,6 @@ class BookingSeriesUpdate(BaseModel):
     reschedule_notice_minutes: int | None = None
     series_cancel_mode: str
     series_reschedule_mode: str
-    student_first: str
-    student_last: str
-    student_email: str | None = None
-    student_phone: str | None = None
-    parent_email: str | None = None
-    parent_phone: str | None = None
 
     @model_validator(mode="after")
     def validate_policy(self):
@@ -723,16 +781,8 @@ class BookingSeriesUpdate(BaseModel):
             raise ValueError("reschedule_notice_minutes must be > 0 when reschedule_mode is a window mode")
         return self
 
-    @model_validator(mode="after")
-    def validate_contact(self):
-        if self.student_email is None and self.parent_email is None:
-            raise ValueError("at least one of student_email or parent_email is required")
-        if self.student_phone is None and self.parent_phone is None:
-            raise ValueError("at least one of student_phone or parent_phone is required")
-        return self
 
-
-class BookingReschedule(BaseModel):
+class BookingReschedule(_Input):
     tutor_id: int
     start: datetime
     end: datetime
@@ -772,7 +822,8 @@ class BookingTypeFacetOption(BaseModel):
     color: str | None = None
 
 
-class StudentFacetOption(BaseModel):
+class AttendeeFacetOption(BaseModel):
+    id: int
     first_name: str
     last_name: str
 
@@ -781,7 +832,7 @@ class BookingFacets(BaseModel):
     tutors: list[TutorFacetOption]
     booking_links: list[BookingLinkFacetOption]
     booking_types: list[BookingTypeFacetOption]
-    students: list[StudentFacetOption]
+    attendees: list[AttendeeFacetOption]
 
 
 class BookingListResponse(BaseModel):

@@ -1,3 +1,5 @@
+import type { Booking, BookingSeries, Contact } from './types'
+
 export const formatDate = (iso: string) =>
     new Date(iso).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
 
@@ -42,29 +44,13 @@ const TUTOR_BUBBLE_COLORS = [
 export const tutorBubbleClass = (t: { id: number }) =>
     TUTOR_BUBBLE_COLORS[t.id % TUTOR_BUBBLE_COLORS.length]
 
-// The contact columns, identical on Booking and BookingSeries. Both plain-column PUTs are
-// full-replacement, so they send all six.
-export interface ContactFields {
-    student_first: string
-    student_last: string
-    student_email: string | null
-    student_phone: string | null
-    parent_email: string | null
-    parent_phone: string | null
-}
+// Whoever the session is for, as shown on a row. Reads through the FK, so a correction on the
+// contact reaches every booking that person has — there's nothing frozen on the booking to go stale.
+export const attendeeName = (r: { attendee: Contact }): string =>
+    `${r.attendee.first_name} ${r.attendee.last_name}`
 
-export const contactPayload = (r: ContactFields): ContactFields => ({
-    student_first: r.student_first,
-    student_last:  r.student_last,
-    student_email: r.student_email,
-    student_phone: r.student_phone,
-    parent_email:  r.parent_email,
-    parent_phone:  r.parent_phone,
-})
-
-// Policy is frozen on the row and required on every PUT, so edits carry the row's current values
-// forward unchanged. The occurrence four are on both Booking and BookingSeries; the series two
-// only on BookingSeries.
+// What the two policy dialogs hand back. The occurrence four are on both Booking and
+// BookingSeries; the series two only on BookingSeries.
 export interface OccurrencePolicyFields {
     cancel_mode: string
     cancel_notice_minutes: number | null
@@ -77,16 +63,29 @@ export interface SeriesPolicyFields {
     series_reschedule_mode: string
 }
 
-export const occurrencePolicyPayload = (r: OccurrencePolicyFields): OccurrencePolicyFields => ({
-    cancel_mode: r.cancel_mode,
-    cancel_notice_minutes: r.cancel_notice_minutes,
-    reschedule_mode: r.reschedule_mode,
-    reschedule_notice_minutes: r.reschedule_notice_minutes,
+// Both PUTs are full replacements, not patches: a field left out is either rejected as missing or
+// silently reset to its default (booking_type_id -> null). So every caller sends the whole row and
+// overrides only what it means to change. These mirror BookingUpdate / BookingSeriesUpdate in
+// schemas.py — keep them in step.
+export const bookingPayload = (b: Booking) => ({
+    booking_link_id: b.booking_link_id,
+    booking_type_id: b.booking_type_id,
+    cancel_mode: b.cancel_mode,
+    cancel_notice_minutes: b.cancel_notice_minutes,
+    reschedule_mode: b.reschedule_mode,
+    reschedule_notice_minutes: b.reschedule_notice_minutes,
+    is_no_show: b.is_no_show,
 })
 
-export const seriesPolicyPayload = (r: SeriesPolicyFields): SeriesPolicyFields => ({
-    series_cancel_mode: r.series_cancel_mode,
-    series_reschedule_mode: r.series_reschedule_mode,
+export const seriesPayload = (s: BookingSeries) => ({
+    booking_link_id: s.booking_link_id,
+    booking_type_id: s.booking_type_id,
+    cancel_mode: s.cancel_mode,
+    cancel_notice_minutes: s.cancel_notice_minutes,
+    reschedule_mode: s.reschedule_mode,
+    reschedule_notice_minutes: s.reschedule_notice_minutes,
+    series_cancel_mode: s.series_cancel_mode,
+    series_reschedule_mode: s.series_reschedule_mode,
 })
 
 export const tutorInitials = (t: { first_name: string; last_name: string }) =>

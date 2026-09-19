@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Student, Lesson
+from models import Contact, Student, Lesson
 from schemas import StudentCreate, StudentUpdate, StudentResponse
 
 router = APIRouter(prefix="/students", tags=["students"])
@@ -22,8 +22,11 @@ def get_student(student_id: int, db: Session = Depends(get_db)):
 
 @router.post("/", response_model=StudentResponse, status_code=201)
 def create_student(student_in: StudentCreate, db: Session = Depends(get_db)):
-    if db.query(Student).filter(Student.first_name == student_in.first_name, Student.last_name == student_in.last_name).first():
-        raise HTTPException(status_code=409, detail="Student with this name already exists")
+    """Enroll an existing contact. Identity already exists; this only adds the billing relationship."""
+    if not db.query(Contact).filter(Contact.id == student_in.contact_id).first():
+        raise HTTPException(status_code=404, detail="Contact not found")
+    if db.query(Student).filter(Student.contact_id == student_in.contact_id).first():
+        raise HTTPException(status_code=409, detail="Contact is already enrolled")
     new_student = Student(**student_in.model_dump())
     db.add(new_student)
     db.commit()
@@ -50,6 +53,9 @@ def delete_student(student_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Student not found")
     if db.query(Lesson).filter(Lesson.student_id == student_id).first():
         raise HTTPException(status_code=409, detail="Cannot delete student with existing lessons")
+    # Serialized before the delete: the response nests the contact, and the relationship can't be
+    # loaded off a row that's gone.
+    response = StudentResponse.model_validate(db_student)
     db.delete(db_student)
     db.commit()
-    return db_student
+    return response

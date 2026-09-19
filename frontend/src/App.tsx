@@ -1,6 +1,7 @@
 import { MantineProvider, createTheme } from '@mantine/core'
 import { Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import LessonsTable from './LessonsTable'
+import Clients from './Clients'
 import Availability from './Availability'
 import Links from './Links'
 import LinkPage from './LinkPage'
@@ -21,7 +22,7 @@ const theme = createTheme({
 
 const navItems = [
   { to: '/', label: 'Lessons' },
-  { to: '/students', label: 'Students' },
+  { to: '/clients', label: 'Clients' },
   { to: '/tutors', label: 'Tutors' },
   { to: '/availability', label: 'Availability' },
   { to: '/links', label: 'Links' },
@@ -40,10 +41,6 @@ function App() {
         <Route path="/book/:slug" element={<BookingPage />} />
         <Route path="/manage-occurrence/:ref" element={<ManageOccurrence />} />
         <Route path="/manage-series/:ref" element={<ManageSeries />} />
-        <Route path="/my-bookings" element={<BookingsLayout />}>
-          <Route index element={<ScheduleTab isCustomer={true} />} />
-          <Route path="recurring" element={<RecurringTab isCustomer={true} />} />
-        </Route>
         <Route path="/*" element={
       <div className="flex h-screen bg-gray-800 p-3 gap-3">
 
@@ -104,7 +101,7 @@ function App() {
             <div className={`h-full ${isBookings ? '' : 'max-w-7xl mx-auto'}`}>
               <Routes>
                 <Route path="/" element={<LessonsTable />} />
-                <Route path="/students" element={<div className="text-gray-400">Students — coming soon</div>} />
+                <Route path="/clients" element={<Clients />} />
                 <Route path="/tutors" element={<Tutors />} />
                 <Route path="/availability" element={<Availability />} />
                 <Route path="/links" element={<Links />} />

@@ -1,114 +1,125 @@
-student_a = {
-    "first_name": "Student",
-    "last_name": "A",
+"""Student is enrollment, not identity — a billing relationship on a Contact.
+
+Name, email and phone live on the contact and are tested in test_contacts.py. What's here is the
+rate, the dates, and the guards around enrolling someone.
+"""
+import pytest
+
+
+def _contact(client, first="Student", last="A", email=None):
+    return client.post("/contacts/", json={
+        "first_name": first,
+        "last_name": last,
+        "email": email or f"{first}.{last}@example.com".lower(),
+    }).json()
+
+
+enrollment_required = {
     "rate": 55,
     "start_date": "2021-04-01",
 }
 
-student_b = {
-    "first_name": "Student",
-    "last_name": "B",
-    "rate": 45,
-    "start_date": "2021-04-01"
-}
-
 #will be updated in every mutable field
-student_c_wrong = {
-    "first_name": "Student",
-    "last_name": "C",
+enrollment_wrong = {
     "rate": 1,
     "start_date": "1999-01-01",
     "is_active": False,
     "grade": 150,
     "birthday": "2009-01-01",
-    "email": "email@gmail.com"
 }
 
-student_c_correct = {
-    "first_name": "Student",
-    "last_name": "C",
+enrollment_correct = {
     "rate": 65,
     "start_date": "2022-10-01",
     "is_active": True,
     "grade": 11,
     "birthday": "2009-01-01",
-    "email": "studentc@example.com"
 }
 
 
-#tests all fields, to be deleted
-student_to_delete = {
-    "first_name": "ToDelete",
-    "last_name": "lastname",
-    "rate": 1,
-    "start_date": "1999-01-01",
-    "is_active": False,
-    "grade": 150,
-    "birthday": "1999-01-01",
-    "email": "email@gmail.com"
-}
+@pytest.fixture
+def enrolled(client):
+    """A contact plus their enrollment, in the state enrollment_wrong describes."""
+    contact = _contact(client, last="C")
+    created = client.post("/students/", json={**enrollment_wrong, "contact_id": contact["id"]}).json()
+    return contact, created
+
 
 # --- CREATE ---
 
-# positive control, only required fields
 def test_create_student_required_fields(client):
-    response = client.post("/students/", json=student_a)
+    contact = _contact(client)
+    response = client.post("/students/", json={**enrollment_required, "contact_id": contact["id"]})
     assert response.status_code == 201
     data = response.json()
-    assert data["first_name"] == student_a["first_name"]
-    assert data["last_name"] == student_a["last_name"]
-    assert data["rate"] == student_a["rate"]
-    assert data["start_date"] == student_a["start_date"]
-    assert data["is_active"] #true is default value
+    assert data["contact_id"] == contact["id"]
+    assert data["contact"]["first_name"] == "Student"
+    assert data["rate"] == enrollment_required["rate"]
+    assert data["start_date"] == enrollment_required["start_date"]
+    assert data["is_active"]  # true is default value
     assert data["grade"] is None
     assert data["birthday"] is None
-    assert data["email"] is None
     assert "id" in data
 
-# positive control, all fields
+
 def test_create_student_all_fields(client):
-    response = client.post("/students/", json=student_c_wrong)
+    contact = _contact(client, last="C")
+    response = client.post("/students/", json={**enrollment_wrong, "contact_id": contact["id"]})
     assert response.status_code == 201
     data = response.json()
     assert not data["is_active"]
-    assert data["birthday"] == student_c_wrong["birthday"]
-    assert data["email"] == student_c_wrong["email"]
-    assert "id" in data
+    assert data["birthday"] == enrollment_wrong["birthday"]
+    assert data["grade"] == enrollment_wrong["grade"]
 
-# missing rate and start date 
+
 def test_create_student_missing_required_fields(client):
-    response = client.post("/students/", json = {"first_name": "Student", "last_name": "rate_will_be_missing"})
+    contact = _contact(client)
+    response = client.post("/students/", json={"contact_id": contact["id"]})
     assert response.status_code == 422
 
-# negative hourly rate per hr of teaching 
+
+def test_create_student_unknown_contact(client):
+    response = client.post("/students/", json={**enrollment_required, "contact_id": 9999})
+    assert response.status_code == 404
+
+
+def test_create_student_contact_already_enrolled(client):
+    """One enrollment per contact — the FK is unique, so a second is a conflict, not a second rate."""
+    contact = _contact(client)
+    client.post("/students/", json={**enrollment_required, "contact_id": contact["id"]})
+    response = client.post("/students/", json={**enrollment_required, "contact_id": contact["id"]})
+    assert response.status_code == 409
+
+
 def test_create_student_invalid_rate(client):
-    bad = {**student_a, "rate": -10}
-    response = client.post("/students/", json=bad)
+    contact = _contact(client)
+    response = client.post("/students/", json={**enrollment_required, "contact_id": contact["id"], "rate": -10})
     assert response.status_code == 422
 
-# invalid start date format
+
 def test_create_student_invalid_date(client):
-    bad = {**student_a, "start_date": "not-a-date"}
-    response = client.post("/students/", json=bad)
+    contact = _contact(client)
+    response = client.post("/students/", json={**enrollment_required, "contact_id": contact["id"], "start_date": "not-a-date"})
     assert response.status_code == 422
 
 
 # --- GET ---
 
 def test_get_students(client):
-    client.post("/students/", json=student_a)
-    client.post("/students/", json=student_b)
+    client.post("/students/", json={**enrollment_required, "contact_id": _contact(client, last="A")["id"]})
+    client.post("/students/", json={**enrollment_required, "contact_id": _contact(client, last="B")["id"]})
     response = client.get("/students/")
     assert response.status_code == 200
     assert len(response.json()) == 2
-    # above we dont check fields bc it was already done, we just checking that everyone was added
+
 
 def test_get_student_by_id(client):
-    created_student = client.post("/students/", json=student_a).json()
-    response = client.get(f"/students/{created_student['id']}")
+    contact = _contact(client)
+    created = client.post("/students/", json={**enrollment_required, "contact_id": contact["id"]}).json()
+    response = client.get(f"/students/{created['id']}")
     assert response.status_code == 200
-    assert response.json()["first_name"] == student_a["first_name"]
-    #above we just check that the right person was returned, not all fields
+    assert response.json()["contact"]["first_name"] == "Student"
+
 
 def test_get_student_by_id_not_found(client):
     response = client.get("/students/9999")
@@ -117,49 +128,51 @@ def test_get_student_by_id_not_found(client):
 
 # --- UPDATE ---
 
-def test_update_student(client):
-    created = client.post("/students/", json=student_c_wrong).json()
-    response = client.put(f"/students/{created['id']}", json=student_c_correct)
+def test_update_student(client, enrolled):
+    _contact_row, created = enrolled
+    response = client.put(f"/students/{created['id']}", json=enrollment_correct)
     assert response.status_code == 200
     data = response.json()
-    #only asserting fields that were updated (all mutable fields)
-    assert data["rate"] == student_c_correct["rate"]
-    assert data["start_date"] == student_c_correct["start_date"]
-    assert data["is_active"] == student_c_correct["is_active"]
-    assert data["grade"] == student_c_correct["grade"]
-    assert data["email"] == student_c_correct["email"]
+    assert data["rate"] == enrollment_correct["rate"]
+    assert data["start_date"] == enrollment_correct["start_date"]
+    assert data["is_active"] == enrollment_correct["is_active"]
+    assert data["grade"] == enrollment_correct["grade"]
+
 
 def test_update_student_not_found(client):
-    response = client.put("/students/999", json=student_c_correct)
+    response = client.put("/students/999", json=enrollment_correct)
     assert response.status_code == 404
 
-def test_update_student_invalid_rate(client):
-    created = client.post("/students/", json=student_c_wrong).json()
-    bad = {**student_c_correct, "rate": 0}
-    response = client.put(f"/students/{created['id']}", json=bad)
+
+def test_update_student_invalid_rate(client, enrolled):
+    _contact_row, created = enrolled
+    response = client.put(f"/students/{created['id']}", json={**enrollment_correct, "rate": 0})
     assert response.status_code == 422
 
-def test_update_student_invalid_date(client):
-    created = client.post("/students/", json=student_c_wrong).json()
-    bad = {**student_c_wrong, "start_date": "not-a-date"}
-    response = client.put(f"/students/{created['id']}", json=bad)
+
+def test_update_student_invalid_date(client, enrolled):
+    _contact_row, created = enrolled
+    response = client.put(f"/students/{created['id']}", json={**enrollment_correct, "start_date": "not-a-date"})
     assert response.status_code == 422
 
 
 # --- DELETE ---
 
 def test_delete_student(client):
-    created = client.post("/students/", json = student_to_delete).json()
+    contact = _contact(client, first="ToDelete", last="Lastname")
+    created = client.post("/students/", json={**enrollment_wrong, "contact_id": contact["id"]}).json()
     response = client.delete(f"/students/{created['id']}")
-    assert response.status_code == 200 # we return deleted obj, despite it not being common practice
-    assert response.json()["first_name"] == student_to_delete["first_name"]
-    #confirm it's actually deleted
-    response = client.get(f"/students/{created['id']}")
-    assert response.status_code == 404
+    assert response.status_code == 200  # we return deleted obj, despite it not being common practice
+    assert response.json()["contact"]["first_name"] == "ToDelete"
+    assert client.get(f"/students/{created['id']}").status_code == 404
+    # The person survives the enrollment ending — identity and billing are separate rows.
+    assert client.get(f"/contacts/{contact['id']}").status_code == 200
+
 
 def test_delete_student_not_found(client):
     response = client.delete("/students/9999")
     assert response.status_code == 404
+
 
 # cannot delete a student with existing lessons — historical records must be preserved
 def test_delete_student_with_lessons(client, setup):
@@ -167,4 +180,3 @@ def test_delete_student_with_lessons(client, setup):
     client.post("/lessons/", json=lesson)
     response = client.delete(f"/students/{student['id']}")
     assert response.status_code == 409
-

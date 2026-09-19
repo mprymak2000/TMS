@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import tuple_
 
-from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
+from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_attendee, resolve_payer, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -54,27 +54,22 @@ def _series_response(series: BookingSeries, db: Session) -> BookingSeriesRespons
 
 @router.get("/booking-series", response_model=BookingSeriesListResponse)
 def get_booking_series(
-    email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
     booking_link_ids: list[int] = Query(default=[]),
     booking_type_ids: list[int] = Query(default=[]),
-    student: list[str] = Query(default=[]),
+    attendee_ids: list[int] = Query(default=[]),
     settings=Depends(get_settings),
     db: Session = Depends(get_db),
 ):
     """Filtered series list with facets, no embedded occurrences. Occurrences are fetched
     separately via GET /booking-series/{id}/occurrences."""
-    student_pairs = [tuple(s.split("|", 1)) for s in student] # split string "john|doe" into tuple (john, doe)
-
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
     base_query = db.query(BookingSeries).filter(active_series_filter())
-    if email:
-        base_query = base_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
-    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs).all()
+    scoped_series_rows = apply_scope_filters(base_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids).all()
     results = [BookingSeriesResponse.model_validate(series) for series in scoped_series_rows]
 
-    facets = compute_series_facets(base_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, db)
+    facets = compute_series_facets(base_query, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, db)
     return BookingSeriesListResponse(items=results, facets=facets)
 
 @router.get("/booking-series/{id}/occurrences", response_model=BookingSeriesOccurrencesResponse)
@@ -106,9 +101,9 @@ def get_booking_series_occurrences(
         # what keeps the cursor from being replayed against a different one.
         decoded_cursor = decode_cursor(
             cursor,
-            tutor_ids=[], booking_link_ids=[], booking_type_ids=[], student_pairs=[],
+            tutor_ids=[], booking_link_ids=[], booking_type_ids=[], attendee_ids=[],
             time_min=time_min, time_max=time_max,
-            email=None, pending_only=False, include_cancelled=include_cancelled,
+            pending_only=False, include_cancelled=include_cancelled,
             series_id=series.public_id,
         )
 
@@ -134,24 +129,23 @@ def get_booking_series_occurrences(
     items = merged[:page_size]
     next_cursor = encode_cursor(
         items[-1].start, items[-1].id,
-        tutor_ids=[], booking_link_ids=[], booking_type_ids=[], student_pairs=[],
+        tutor_ids=[], booking_link_ids=[], booking_type_ids=[], attendee_ids=[],
         time_min=time_min, time_max=time_max,
-        email=None, pending_only=False, include_cancelled=include_cancelled,
+        pending_only=False, include_cancelled=include_cancelled,
         series_id=series.public_id,
     ) if len(merged) > page_size else None
     return BookingSeriesOccurrencesResponse(items=items, next_cursor=next_cursor)
 
 @router.get("/", response_model=BookingListResponse)
 def get_bookings(
-    email: str | None = Query(default=None), # main scope
     tutor_ids: list[int] = Query(default=[]), # facet scope
     booking_link_ids: list[int] = Query(default=[]), # facet scope
     booking_type_ids: list[int] = Query(default=[]), # facet scope
-    student: list[str] = Query(default=[]), # facet scope
+    attendee_ids: list[int] = Query(default=[]), # facet scope
     time_min: datetime | None = Query(default=None), # main scope - time
     time_max: datetime | None = Query(default=None), # main scope - time
     include_cancelled: bool = Query(default=False), # facet scope
-    order: str = Query(default="asc"), 
+    order: str = Query(default="asc"),
     pending_only: bool = Query(default=False), # main scope - branch
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=500),
     cursor: str | None = Query(default=None),
@@ -159,30 +153,24 @@ def get_bookings(
     settings=Depends(get_settings),
 ):
     """Cursor-paginated, flat list of all bookings (materialized and virtual occurrences),
-    filtered by tutor_ids/booking_link_ids/student/email/pending_only, scoped by time_min/time_max.
-    Facets returned alongside items. See GET /bookings/pages for the total/page-based equivalent,
-    kept for API completeness only, not called by the frontend."""
+    filtered by tutor_ids/booking_link_ids/booking_type_ids/attendee_ids/pending_only, scoped by
+    time_min/time_max. Facets returned alongside items. See GET /bookings/pages for the total/page-based
+    equivalent, kept for API completeness only, not called by the frontend."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
-    student_pairs = [tuple(s.split("|", 1)) for s in student]
-
     decoded_cursor = None
     if cursor is not None:
-        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled)
+        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, pending_only, include_cancelled)
 
-    # email scope is shared by both branches below - apply it once, up front (though series gets ignored for pending-only branch)
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
     materialized_query = db.query(Booking)
     series_query = db.query(BookingSeries).filter(active_series_filter())
-    if email:
-        materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
 
     ## branch on pending-only: if true, only materialized bookings with a pending request are returned. else main branch runs
     if pending_only:
         base_query = materialized_query.filter(Booking.request.has(BookingRequest.status == 'pending'))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
         # seek direction and sort order must flip together based on `order` - "next page" means
         # "after" when ascending but "before" when descending
         booking_key = tuple_(Booking.start, Booking.public_id)
@@ -193,20 +181,20 @@ def get_bookings(
             scoped_query = scoped_query.filter(past_cursor)
         sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
         booking_rows = scoped_query.order_by(*sort_cols).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, None, None, settings, db) # no series scoping for pending-only request
         items = [BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]]
-        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, email, pending_only, include_cancelled) if len(booking_rows) > page_size else None
+        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, pending_only, include_cancelled) if len(booking_rows) > page_size else None
         return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
 
     ## main branch
     # scope materialized bookings by time, series by time overlap, then calculate facets
     materialized_query = apply_booking_time_scope(materialized_query, time_min, time_max, include_cancelled)
     series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
-    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, settings, db)
-    
-    # scope Bookings and BookingSeries by tutor_ids, booking_link_ids, booking_type_ids, student_pairs, using cursor as a start point
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, settings, db)
+
+    # scope Bookings and BookingSeries by tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, using cursor as a start point
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
     # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
     if decoded_cursor is not None:
         cursor_start, cursor_public_id = decoded_cursor
@@ -232,10 +220,9 @@ def get_bookings(
         tutor_ids,
         booking_link_ids,
         booking_type_ids,
-        student_pairs,
+        attendee_ids,
         time_min,
         time_max,
-        email,
         pending_only,
         include_cancelled
     ) if len(merged) > page_size else None
@@ -245,11 +232,10 @@ def get_bookings(
 
 @router.get("/pages", response_model=BookingPagedListResponse)
 def list_bookings(
-    email: str | None = Query(default=None),
     tutor_ids: list[int] = Query(default=[]),
     booking_link_ids: list[int] = Query(default=[]),
     booking_type_ids: list[int] = Query(default=[]),
-    student: list[str] = Query(default=[]),
+    attendee_ids: list[int] = Query(default=[]),
     time_min: datetime | None = Query(default=None),
     time_max: datetime | None = Query(default=None),
     include_cancelled: bool = Query(default=False),
@@ -261,22 +247,19 @@ def list_bookings(
     settings=Depends(get_settings),
 ):
     """Paginated, flat list of all bookings (materialized + virtual occurrences), optionally
-    filtered by email/tutor_ids/booking_link_ids/pending_only, bounded by time_min/time_max."""
+    filtered by tutor_ids/booking_link_ids/booking_type_ids/attendee_ids/pending_only, bounded by
+    time_min/time_max."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
-
-    student_pairs = [tuple(s.split("|", 1)) for s in student]
 
     # branch on pending
     if pending_only:
         # a virtual occurrence can never have a pending BookingRequest (nothing to request
         # approval on for a row that doesn't exist yet) — real rows only, no virtual merge.
         base_query = db.query(Booking).filter(Booking.request.has(BookingRequest.status == 'pending'))
-        if email:
-            base_query = base_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
         booking_rows = scoped_query.order_by(Booking.start.desc()).offset((page - 1) * page_size).limit(page_size + 1).all()
-        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, None, None, settings, db) # no series scoping for pending-only request
+        facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, None, None, settings, db) # no series scoping for pending-only request
         return BookingPagedListResponse(
             items=[BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]],
             total=None, # not meaningful for pending-only request
@@ -290,24 +273,19 @@ def list_bookings(
     materialized_query = db.query(Booking)
     series_query = db.query(BookingSeries).filter(active_series_filter())
 
-    # apply filters shared by both data types.
-    if email:
-        materialized_query = materialized_query.filter((Booking.student_email == email) | (Booking.parent_email == email))
-        series_query = series_query.filter((BookingSeries.student_email == email) | (BookingSeries.parent_email == email))
-
     ## time/status-scope (materialized bookings only); series time-scoped by overlap instead
     materialized_query = apply_booking_time_scope(materialized_query, time_min, time_max, include_cancelled)
     series_query = apply_series_time_scope(series_query, time_min, time_max, ZoneInfo(settings.business_timezone))
 
-    # get facets: self-excluding (narrows down filter types and which tutors/event types/students are available for further filtering)
-    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, time_min, time_max, settings, db)
+    # get facets: self-excluding (narrows down filter types and which tutors/event types/attendees are available for further filtering)
+    facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, settings, db)
 
     # get actual bookings (items): full scope (no exclusion) on top of the same main-scoped queries, then generate+merge virtual with materialized
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, student_pairs)
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
     scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
 
     ## time/status-scope (series only) - different mechanism than bookings materialized in db
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, student_pairs) # first scope series
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids) # first scope series
     # indefinite only - a bounded series has every occurrence materialized, so it's already above
     scoped_series = scoped_series_query.filter(indefinite_series_filter()).all() # execute query to get series rows.
 
@@ -407,12 +385,27 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             raise HTTPException(status_code=409, detail="One or more occurrences conflict with an existing booking")
         occ = (occ.astimezone(BUSINESS_TZ) + _step).astimezone(UTC)
 
+    # Resolved before the calendar call so the event summary can name the attendee. Both are plain
+    # inserts/updates, rolled back with everything else if the saga below fails.
+    payer = resolve_payer(
+        db, email=booking_in.payer.email, first=booking_in.payer.first_name,
+        last=booking_in.payer.last_name, phone=booking_in.payer.phone,
+    )
+    attendee_in = booking_in.attendee or booking_in.payer
+    attendee = resolve_attendee(
+        db, payer=payer, first=attendee_in.first_name, last=attendee_in.last_name,
+        email=attendee_in.email, phone=attendee_in.phone,
+    )
+    # Guests only. A claimed contact leaves this null so reminders read contact.phone live, and
+    # registering nulls it on every booking they already had.
+    guest_reminder_phone = booking_in.payer.phone if payer.verified_at is None else None
+
     new_public_id = str(uuid4())
     manage_path = "manage-series" if db_booking_link.recurring else "manage-occurrence"
     manage_url = f"{FRONTEND_URL}/{manage_path}/{new_public_id}"
     description_parts = [p for p in [db_booking_link.description, f"Manage your booking: {manage_url}"] if p]
     new_event = {
-            "summary": f"{db_booking_link.slug}: {booking_in.student_first} and {db_tutor.first_name}",
+            "summary": f"{db_booking_link.slug}: {attendee.first_name} and {db_tutor.first_name}",
             "description": "\n\n".join(description_parts),
             "start": {"dateTime": booking_in.start.isoformat(), "timeZone": settings.business_timezone},
             "end": {"dateTime": booking_in.end.isoformat(), "timeZone": settings.business_timezone},
@@ -434,7 +427,10 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             local_end = booking_in.end.astimezone(BUSINESS_TZ)
             series = BookingSeries(
                 public_id=new_public_id,
-                **booking_in.model_dump(exclude={"start", "end", "timezone", "recur_until", "recur_count"}),
+                **booking_in.model_dump(exclude={"start", "end", "timezone", "recur_until", "recur_count", "payer", "attendee"}),
+                payer_id=payer.id,
+                attendee_id=attendee.id,
+                guest_reminder_phone=guest_reminder_phone,
                 dtstart=local_start.replace(tzinfo=None),
                 dtend=local_end.replace(tzinfo=None),
                 freq=db_booking_link.freq,
@@ -449,13 +445,16 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             db.add(series)
             db.flush()
 
-            base_fields = booking_in.model_dump(exclude={"recur_until", "recur_count", "start", "end"})
+            base_fields = booking_in.model_dump(exclude={"recur_until", "recur_count", "start", "end", "payer", "attendee"})
             occ_start = booking_in.start
             first_booking = None
             while occ_start.date() <= _gen_through:
                 booking = Booking(
                     public_id=f"{series.public_id}:{int(occ_start.timestamp())}",
                     **base_fields,
+                    payer_id=payer.id,
+                    attendee_id=attendee.id,
+                    guest_reminder_phone=guest_reminder_phone,
                     series_id=series.id,
                     booking_type_id=series.booking_type_id,
                     **occurrence_policy(series),
@@ -474,7 +473,10 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
 
         new_booking = Booking(
             public_id=new_public_id,
-            **booking_in.model_dump(exclude={"recur_until", "recur_count"}),
+            **booking_in.model_dump(exclude={"recur_until", "recur_count", "payer", "attendee"}),
+            payer_id=payer.id,
+            attendee_id=attendee.id,
+            guest_reminder_phone=guest_reminder_phone,
             booking_type_id=db_booking_link.booking_type_id,
             **occurrence_policy(db_booking_link),
             google_event_id=google_event["id"],
@@ -559,11 +561,11 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         except Exception as e:
             raise HTTPException(status_code=500, detail="Failed to reschedule calendar event") from e
     else:
-        #todo: allow custom event name templates per booking link using dynamic tags e.g. "{student_first} {student_last} - {link_slug}"
+        #todo: allow custom event name templates per booking link using dynamic tags e.g. "{attendee_first} {attendee_last} - {link_slug}"
         manage_url = f"{FRONTEND_URL}/manage-occurrence/{new_public_id}"
         description_parts = [p for p in [booking_link_description, f"Manage your booking: {manage_url}"] if p]
         new_event = {
-            "summary": f"{booking_link_slug}: {db_booking.student_first} and {db_tutor.first_name}",
+            "summary": f"{booking_link_slug}: {db_booking.attendee.first_name} and {db_tutor.first_name}",
             "description": "\n\n".join(description_parts),
             "start": {"dateTime": booking_in.start.isoformat(), "timeZone": "UTC"},
             "end": {"dateTime": booking_in.end.isoformat(), "timeZone": "UTC"},
@@ -576,24 +578,21 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
             raise HTTPException(status_code=500, detail="Failed to create calendar event") from e
 
     # --- Step 2: Insert new booking row ---
-    # Inherits series_id, student info, event type from original; gets new time and google_event_id
+    # Inherits series_id, contacts, event type from original; gets new time and google_event_id
     updated_booking = {
         "public_id": new_public_id,
         **booking_in.model_dump(),
         "series_id": db_booking.series_id,
         "google_event_id": new_google_event_id,
         "status": "confirmed",
-        "student_id": db_booking.student_id,
         "booking_link_id": db_booking.booking_link_id,
         "booking_type_id": db_booking.booking_type_id,
         # Off the old row, not the link — moving a session must not restate its terms.
         **occurrence_policy(db_booking),
-        "student_first": db_booking.student_first,
-        "student_last": db_booking.student_last,
-        "student_email": db_booking.student_email,
-        "student_phone": db_booking.student_phone,
-        "parent_email": db_booking.parent_email,
-        "parent_phone": db_booking.parent_phone,
+        "payer_id": db_booking.payer_id,
+        "attendee_id": db_booking.attendee_id,
+        "sms_opt_in": db_booking.sms_opt_in,
+        "guest_reminder_phone": db_booking.guest_reminder_phone,
     }
     new_booking = Booking(**updated_booking)
     db.add(new_booking)
@@ -1005,7 +1004,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     series_manage_url = f"{FRONTEND_URL}/manage-series/{db_series.public_id}"
     series_description_parts = [p for p in [db_booking_link.description, f"Manage your booking: {series_manage_url}"] if p]
     new_event = {
-        "summary": f"{db_booking_link.slug}: {db_series.student_first} and {db_tutor.first_name}",
+        "summary": f"{db_booking_link.slug}: {db_series.attendee.first_name} and {db_tutor.first_name}",
         "description": "\n\n".join(series_description_parts),
         "start": {"dateTime": booking_in.start.isoformat(), "timeZone": settings.business_timezone},
         "end": {"dateTime": booking_in.end.isoformat(), "timeZone": settings.business_timezone},
@@ -1059,13 +1058,10 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         **occurrence_policy(db_series),
         **series_policy(db_series),
         google_event_id=new_google_event["id"],
-        student_id=db_series.student_id,
-        student_first=db_series.student_first,
-        student_last=db_series.student_last,
-        student_email=db_series.student_email,
-        student_phone=db_series.student_phone,
-        parent_email=db_series.parent_email,
-        parent_phone=db_series.parent_phone,
+        payer_id=db_series.payer_id,
+        attendee_id=db_series.attendee_id,
+        sms_opt_in=db_series.sms_opt_in,
+        guest_reminder_phone=db_series.guest_reminder_phone,
     )
     db.add(new_series)
     db.flush()
@@ -1094,13 +1090,10 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
             **occurrence_policy(new_series),
             timezone=booking_in.timezone,
             status="confirmed",
-            student_id=db_series.student_id,
-            student_first=db_series.student_first,
-            student_last=db_series.student_last,
-            student_email=db_series.student_email,
-            student_phone=db_series.student_phone,
-            parent_email=db_series.parent_email,
-            parent_phone=db_series.parent_phone,
+            payer_id=db_series.payer_id,
+            attendee_id=db_series.attendee_id,
+            sms_opt_in=db_series.sms_opt_in,
+            guest_reminder_phone=db_series.guest_reminder_phone,
             google_event_id=new_google_event["id"],
             start=occ_start,
             end=occ_start + _duration,

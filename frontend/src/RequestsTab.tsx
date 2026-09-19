@@ -1,17 +1,18 @@
 import { useState, useEffect } from 'react'
 import { useOutletContext } from 'react-router-dom'
-import { TextInput, Loader, Button, Modal } from '@mantine/core'
+import { TextInput, Loader, Button } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import { IconSearch } from '@tabler/icons-react'
-import type { Booking, TutorFacetOption, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption } from './types'
-import { extractError, formatDate, formatTime, tutorBubbleClass } from './utils'
+import type { Booking, BookingFacets } from './types'
+import { attendeeName, extractError, formatDate, formatTime, tutorBubbleClass } from './utils'
 import type { BookingsOutletContext } from './BookingsLayout'
-import { FiltersMenu, ActiveFilterChips, OrderToggle, LoadMoreSentinel, PAGE_SIZE } from './BookingToolbar'
+import { FiltersMenu, ActiveFilterChips, OrderToggle, LoadMoreSentinel, PAGE_SIZE, EMPTY_FACETS } from './BookingToolbar'
 import type { BookingFilters, LoadErrors } from './BookingToolbar'
 
-// Admin-only - no customer route exists for Requests (see App.tsx: /my-bookings has no
-// "requests" child route), so unlike ScheduleTab/RecurringTab this never needs isCustomer/email.
+// Admin-only, like every Bookings tab now — the customer-facing /my-bookings routes are gone.
+// Customers reach a single booking or series through the public_id link in their email instead.
 const RequestsTab = () => {
-    const { tutors, bookingLinks, bookingTypes, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
+    const { tutors, bookingLinks, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
 
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [processingRequest, setProcessingRequest] = useState<Booking | null>(null)
@@ -19,13 +20,10 @@ const RequestsTab = () => {
     const [isLoading, setIsLoading] = useState(false)
 
     const [bookings, setBookings] = useState<Booking[]>([])
-    const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
-    const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
-    const [bookingTypeFacetOptions, setBookingTypeFacetOptions] = useState<BookingTypeFacetOption[]>([])
-    const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
+    const [facets, setFacets] = useState<BookingFacets>(EMPTY_FACETS)
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>({
-        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], attendeeIds: [], searchQuery: '', includeCancelled: true,
         dateFrom: null, dateTo: null,
     })
     const [cursor, setCursor] = useState<string | null>(null)
@@ -35,9 +33,8 @@ const RequestsTab = () => {
         const tutor = tutors.find(t => t.id === b.tutor_id)
         const bookingLink = bookingLinks.find(e => e.id === b.booking_link_id)
         return [
-            b.student_first, b.student_last,
-            b.student_email, b.student_phone,
-            b.parent_email, b.parent_phone,
+            b.attendee.first_name, b.attendee.last_name, b.attendee.email, b.attendee.phone,
+            b.payer.first_name, b.payer.last_name, b.payer.email, b.payer.phone,
             b.start.slice(0, 10),
             tutor?.first_name, tutor?.last_name,
             bookingLink?.slug,
@@ -51,7 +48,7 @@ const RequestsTab = () => {
         tutorIds = filters.tutorIds,
         bookingLinkIds = filters.bookingLinkIds,
         bookingTypeIds = filters.bookingTypeIds,
-        students = filters.students,
+        attendeeIds = filters.attendeeIds,
         includeCancelled = filters.includeCancelled,
         cursor: cursorParam = null,
         append = false,
@@ -59,7 +56,7 @@ const RequestsTab = () => {
         tutorIds?: string[]
         bookingLinkIds?: string[]
         bookingTypeIds?: string[]
-        students?: string[]
+        attendeeIds?: string[]
         includeCancelled?: boolean
         cursor?: string | null
         append?: boolean
@@ -72,12 +69,12 @@ const RequestsTab = () => {
             const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
             const bookingLinkParams = bookingLinkIds.map(id => `&booking_link_ids=${id}`).join('')
             const bookingTypeParams = bookingTypeIds.map(id => `&booking_type_ids=${id}`).join('')
-            const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
+            const attendeeParams = attendeeIds.map(id => `&attendee_ids=${id}`).join('')
             const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
             const pageSizeParam = `&page_size=${PAGE_SIZE}`
             const cursorParamStr = cursorParam ? `&cursor=${encodeURIComponent(cursorParam)}` : ''
 
-            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}&pending_only=true${orderParam}${tutorParams}${bookingLinkParams}${bookingTypeParams}${studentParams}${includeCancelledParam}`)
+            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}&pending_only=true${orderParam}${tutorParams}${bookingLinkParams}${bookingTypeParams}${attendeeParams}${includeCancelledParam}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load requests.') }))
@@ -85,10 +82,7 @@ const RequestsTab = () => {
             }
             const body = await response.json()
             setBookings(prev => append ? [...prev, ...body.items] : body.items)
-            setTutorFacetOptions(body.facets.tutors)
-            setBookingLinkFacetOptions(body.facets.booking_links)
-            setBookingTypeFacetOptions(body.facets.booking_types)
-            setStudentFacetOptions(body.facets.students)
+            setFacets(body.facets)
             setCursor(body.next_cursor)
             setLoadErrors({})
         } catch (error) {
@@ -109,10 +103,10 @@ const RequestsTab = () => {
 
     const refresh = () => loadBookings()
 
-    const handleStudentFilterToggle = (value: string) => {
-        const next = filters.students.includes(value) ? filters.students.filter(x => x !== value) : [...filters.students, value]
-        setFilters(f => ({ ...f, students: next }))
-        loadBookings({ students: next })
+    const handleAttendeeFilterToggle = (id: string) => {
+        const next = filters.attendeeIds.includes(id) ? filters.attendeeIds.filter(x => x !== id) : [...filters.attendeeIds, id]
+        setFilters(f => ({ ...f, attendeeIds: next }))
+        loadBookings({ attendeeIds: next })
     }
 
     // Pure display flip — displayed() re-sorts fully every render, so no refetch needed.
@@ -204,18 +198,18 @@ const RequestsTab = () => {
                             size="sm"
                         />
                         <FiltersMenu
-                            tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                            tutorOptions={facets.tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                             tutorSelected={filters.tutorIds}
                             onTutorToggle={handleTutorFilterToggle}
-                            bookingLinkOptions={bookingLinkFacetOptions.map(e => ({ value: String(e.id), label: e.slug }))}
+                            bookingLinkOptions={facets.booking_links.map(e => ({ value: String(e.id), label: e.slug }))}
                             bookingLinkSelected={filters.bookingLinkIds}
                             onBookingLinkToggle={handleBookingLinkFilterToggle}
-                            bookingTypeOptions={bookingTypeFacetOptions.map(t => ({ value: String(t.id), label: t.label }))}
+                            bookingTypeOptions={facets.booking_types.map(t => ({ value: String(t.id), label: t.label }))}
                             bookingTypeSelected={filters.bookingTypeIds}
                             onBookingTypeToggle={handleBookingTypeFilterToggle}
-                            studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
-                            studentSelected={filters.students}
-                            onStudentToggle={handleStudentFilterToggle}
+                            attendeeOptions={facets.attendees.map(a => ({ value: String(a.id), label: `${a.first_name} ${a.last_name}` }))}
+                            attendeeSelected={filters.attendeeIds}
+                            onAttendeeToggle={handleAttendeeFilterToggle}
                             includeCancelled={filters.includeCancelled}
                             onIncludeCancelledToggle={handleIncludeCancelledToggle}
                         />
@@ -227,15 +221,13 @@ const RequestsTab = () => {
                         tutorIds={filters.tutorIds}
                         bookingLinkIds={filters.bookingLinkIds}
                         bookingTypeIds={filters.bookingTypeIds}
-                        students={filters.students}
-                        tutors={tutors}
-                        bookingLinks={bookingLinks}
-                        bookingTypes={bookingTypes}
+                        attendeeIds={filters.attendeeIds}
+                        facets={facets}
                         includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onBookingLinkRemove={handleBookingLinkFilterToggle}
                         onBookingTypeRemove={handleBookingTypeFilterToggle}
-                        onStudentRemove={handleStudentFilterToggle}
+                        onAttendeeRemove={handleAttendeeFilterToggle}
                         onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
                 </div>
@@ -264,7 +256,7 @@ const RequestsTab = () => {
                                     <div className="flex items-center px-5 py-4 gap-4">
                                         <div className="flex-1 min-w-0">
                                             <div className="flex items-center gap-2 mb-1 flex-wrap">
-                                                <span className="font-medium text-gray-800">{b.student_first} {b.student_last}</span>
+                                                <span className="font-medium text-gray-800">{attendeeName(b)}</span>
                                                 <span className="text-xs bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded-full font-medium">{typeLabel}</span>
                                                 {bookingLink && <span className="text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full">{bookingLink.slug}</span>}
                                                 {isSeries && <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full">Series</span>}
@@ -303,12 +295,11 @@ const RequestsTab = () => {
             </div>
 
             {/* approve/deny request modal */}
-            <Modal
+            <AppModal
                 opened={processingRequest !== null}
                 onClose={() => setProcessingRequest(null)}
                 title="Review request"
-                centered
-                size="sm"
+                caption="Approve to apply the change, or deny to leave the booking as it is."
             >
                 {processingRequest && (() => {
                     const req = processingRequest.request!
@@ -317,7 +308,7 @@ const RequestsTab = () => {
                     return (
                         <div className="flex flex-col gap-3">
                             <div className="text-sm text-gray-700">
-                                <p><span className="text-gray-400">Student:</span> {processingRequest.student_first} {processingRequest.student_last}</p>
+                                <p><span className="text-gray-400">Attendee:</span> {attendeeName(processingRequest)}</p>
                                 <p><span className="text-gray-400">Type:</span> {req.type.replace(/_/g, ' ')}</p>
                                 <p><span className="text-gray-400">Current slot:</span> {formatDate(processingRequest.start)} · {formatTime(processingRequest.start)}</p>
                                 {isReschedule && req.requested_start && (
@@ -330,15 +321,15 @@ const RequestsTab = () => {
                                     <p><span className="text-gray-400">Reason:</span> {req.reason}</p>
                                 )}
                             </div>
-                            <div className="flex justify-end gap-2 mt-1">
-                                <Button variant="default" disabled={isSubmitting} onClick={() => setProcessingRequest(null)}>Close</Button>
+                            <ModalFooter>
+                                <Button variant="subtle" color="gray" disabled={isSubmitting} onClick={() => setProcessingRequest(null)}>Close</Button>
                                 <Button color="red" variant="light" loading={isSubmitting} onClick={() => handleDenyRequest(req.id)}>Deny</Button>
                                 <Button color="green" loading={isSubmitting} onClick={() => handleApproveRequest(req.id)}>Approve</Button>
-                            </div>
+                            </ModalFooter>
                         </div>
                     )
                 })()}
-            </Modal>
+            </AppModal>
         </div>
     )
 }

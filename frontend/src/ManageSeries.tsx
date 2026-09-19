@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import type { BookingSeries, BookingLink } from './types'
-import { formatDate, formatUTCTime, extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
+import { attendeeName, formatDate, formatUTCTime, extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
 
 interface LoadErrors {
     series?: string
@@ -96,9 +96,6 @@ const ManageSeries = () => {
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
                 <div className="bg-white rounded-2xl shadow border border-gray-100 p-8 max-w-md w-full text-center">
-                    <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 mb-4 inline-flex items-center gap-1 transition-colors">
-                        ← My bookings
-                    </button>
                     <p className="text-gray-500">{loadErrors.series ?? loadErrors.bookingLink}</p>
                 </div>
             </div>
@@ -120,10 +117,17 @@ const ManageSeries = () => {
                         </svg>
                     </div>
                     <h1 className="text-xl font-bold text-gray-900 mb-2">{msg.title}</h1>
-                    <p className="text-sm text-gray-500 mb-6">{msg.body}</p>
-                    <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 transition-colors font-medium">
-                        ← Back to my bookings
-                    </button>
+                    <p className="text-sm text-gray-500">{msg.body}</p>
+                    {/* Same as ManageOccurrence: no customer list to return to, so rebooking is the
+                        only onward step, and only once the series is actually cancelled. */}
+                    {done === 'cancelled' && bookingLink?.status === 'active' && (
+                        <button
+                            onClick={() => navigate(`/book/${bookingLink.slug}`)}
+                            className="mt-6 text-sm text-indigo-500 hover:text-indigo-700 transition-colors font-medium"
+                        >
+                            Book another session
+                        </button>
+                    )}
                 </div>
             </div>
         )
@@ -134,10 +138,6 @@ const ManageSeries = () => {
     return (
         <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
             <div className="bg-white rounded-2xl shadow border border-gray-100 p-8 max-w-md w-full">
-
-                <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 mb-5 inline-flex items-center gap-1 transition-colors">
-                    ← My bookings
-                </button>
 
                 <h1 className="text-xl font-bold text-gray-900 mb-1">Manage your series</h1>
                 <p className="text-sm text-indigo-600 font-medium mb-6">{bookingLink.slug}</p>
@@ -150,7 +150,7 @@ const ManageSeries = () => {
                     {series.until && (
                         <p className="text-sm text-gray-500 mt-0.5">Until {formatDate(series.until)}</p>
                     )}
-                    <p className="text-sm text-gray-400 mt-1">{series.student_first} {series.student_last}</p>
+                    <p className="text-sm text-gray-400 mt-1">{attendeeName(series)}</p>
                 </div>
 
                 {!series.is_active ? (
@@ -178,12 +178,6 @@ const ManageSeries = () => {
                                             tutorId: series.tutor_id,
                                             originalDayOfWeek: weekdayOf(series.dtstart),
                                             originalStartTime: timeOf(series.dtstart),
-                                            studentFirst: series.student_first,
-                                            studentLast: series.student_last,
-                                            studentEmail: series.student_email,
-                                            studentPhone: series.student_phone,
-                                            parentEmail: series.parent_email,
-                                            parentPhone: series.parent_phone,
                                         }})}
                                         className="w-full py-2.5 rounded-xl border border-indigo-200 text-indigo-600 text-sm font-medium hover:bg-indigo-50 transition-colors"
                                     >
@@ -203,12 +197,6 @@ const ManageSeries = () => {
                                             tutorId: series.tutor_id,
                                             originalDayOfWeek: weekdayOf(series.dtstart),
                                             originalStartTime: timeOf(series.dtstart),
-                                            studentFirst: series.student_first,
-                                            studentLast: series.student_last,
-                                            studentEmail: series.student_email,
-                                            studentPhone: series.student_phone,
-                                            parentEmail: series.parent_email,
-                                            parentPhone: series.parent_phone,
                                         }})}
                                         className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
                                     >

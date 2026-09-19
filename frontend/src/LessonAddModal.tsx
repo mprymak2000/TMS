@@ -1,5 +1,6 @@
 import { useState, useRef } from 'react'
-import { Modal, Select, NumberInput, Checkbox, Textarea, Button, Group, Stack } from '@mantine/core'
+import { Select, NumberInput, Checkbox, Textarea, Button, Group, Stack } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import type { Student, Tutor } from './types'
 
 interface Props {
@@ -42,7 +43,7 @@ const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) =>
   }
 
     const studentOptions = Object.values(students).map(s => (
-        { value: s.id.toString(), label: `${s.first_name} ${s.last_name}`}
+        { value: s.id.toString(), label: `${s.contact.first_name} ${s.contact.last_name}`}
     ))
     
     const tutorOptions = Object.values(tutors).map(t => (
@@ -109,7 +110,7 @@ const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) =>
   const canSubmit = !!studentId && !!tutorId && !!date
 
   return (
-    <Modal opened={opened} onClose={handleClose} title="Add Lesson" size="lg" centered>
+    <AppModal opened={opened} onClose={handleClose} title="Add lesson">
       <Stack>
         {/* Section 1 - Core */}
         <Group grow>
@@ -156,13 +157,13 @@ const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) =>
             </Group>
           </div>
         ) : (
-          <Group justify="flex-end">
-            <Button variant="default" onClick={handleClose}>Cancel</Button>
-            <Button onClick={handleSubmit} color="teal" disabled={!canSubmit}>Save Lesson</Button>
-          </Group>
+          <ModalFooter>
+            <Button variant="subtle" color="gray" onClick={handleClose}>Cancel</Button>
+            <Button onClick={handleSubmit} color="teal" disabled={!canSubmit}>Save lesson</Button>
+          </ModalFooter>
         )}
       </Stack>
-    </Modal>
+    </AppModal>
   )
 }
 

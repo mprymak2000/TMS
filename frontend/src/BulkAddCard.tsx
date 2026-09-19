@@ -69,7 +69,7 @@ export default function BulkAddCard({ students, tutors, onCancel, onSave }: Prop
 
   const studentOptions = Object.values(students).map(s => ({
     value: s.id.toString(),
-    label: `${s.first_name} ${s.last_name}`,
+    label: `${s.contact.first_name} ${s.contact.last_name}`,
   }))
 
   const tutorOptions = Object.values(tutors).map(t => ({

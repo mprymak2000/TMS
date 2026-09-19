@@ -50,9 +50,14 @@ def client():
 
 @pytest.fixture
 def setup(client):
-    student_test = {
+    # Identity first, then enrollment: a Student is a billing relationship on a Contact, not a person.
+    contact = client.post("/contacts/", json={
         "first_name": "Student",
         "last_name": "Test",
+        "email": "student@example.com",
+    }).json()
+    student_test = {
+        "contact_id": contact["id"],
         "rate": 50,
         "start_date": "2026-01-01",
         "is_active": True

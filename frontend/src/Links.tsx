@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Button, Loader, Modal } from '@mantine/core'
+import { Button, Loader } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import { IconPlus, IconPencil, IconTrash, IconExternalLink, IconCopy, IconCheck } from '@tabler/icons-react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import type { Tutor, Schedule, BookingLink, BookingType } from './types'
@@ -323,17 +324,12 @@ const Links = () => {
                 ))}
             </div>
 
-            <Modal
+            <AppModal
                 opened={confirmingPause !== null}
                 onClose={() => { setConfirmingPause(null); setImpact(null) }}
                 title="Pause this link?"
-                centered
-                size="sm"
+                caption="Its booking page stops accepting new bookings. Nothing else changes, and you can resume it at any time."
             >
-                <p className="text-sm text-gray-600 mb-3">
-                    Its booking page stops accepting new bookings. Nothing else changes, and you can
-                    resume it at any time.
-                </p>
                 <ul className="text-sm text-gray-600 space-y-1.5 mb-5 list-disc pl-4 marker:text-gray-300">
                     <li>
                         {impact?.upcoming_bookings ?? 0} upcoming booking{impact?.upcoming_bookings === 1 ? '' : 's'} stay
@@ -344,8 +340,8 @@ const Links = () => {
                     </li>
                     <li>The <code className="font-mono text-xs">/{confirmingPause?.slug}</code> URL stays reserved</li>
                 </ul>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => { setConfirmingPause(null); setImpact(null) }}>Cancel</Button>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => { setConfirmingPause(null); setImpact(null) }}>Cancel</Button>
                     <Button
                         onClick={() => {
                             if (confirmingPause) setStatus(confirmingPause.id, 'pause')
@@ -355,8 +351,8 @@ const Links = () => {
                     >
                         Pause link
                     </Button>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
             <Toast toast={toast} />
         </div>
     )

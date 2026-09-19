@@ -201,10 +201,6 @@ def test_relabelling_a_series_carries_to_all_its_occurrences(client):
         "series_reschedule_mode": "auto",
         "booking_link_id": link["id"],
         "booking_type_id": replacement["id"],
-        "student_first": booking_payload["student_first"],
-        "student_last": booking_payload["student_last"],
-        "student_email": booking_payload["student_email"],
-        "student_phone": booking_payload["student_phone"],
     })
 
     db = TestingSessionLocal()
@@ -250,10 +246,6 @@ def test_virtual_and_materialized_occurrences_agree_field_for_field(client):
         "reschedule_mode": "auto",
         "booking_link_id": link["id"],
         "booking_type_id": t["id"],
-        "student_first": booking_payload["student_first"],
-        "student_last": booking_payload["student_last"],
-        "student_email": booking_payload["student_email"],
-        "student_phone": booking_payload["student_phone"],
     })
     after = next(i for i in client.get(f"/bookings/?{window}").json()["items"] if i["id"] == ref)
 
@@ -282,8 +274,10 @@ def _two_typed_bookings(client):
     tutoring, consult = _type(client, "Tutoring"), _type(client, "Consultation", "#0ea5e9")
     link_a = _link(client, availability, "weekly", tutoring["id"])
     link_b = _link(client, availability, "intro", consult["id"])
-    _book(client, tutor, link_a, student_first="Alice", student_last="Smith")
-    _book(client, tutor, link_b, student_first="Bob", student_last="Jones",
+    _book(client, tutor, link_a,
+          payer={"first_name": "Alice", "last_name": "Smith", "email": "alice@example.com", "phone": "555-0001"})
+    _book(client, tutor, link_b,
+          payer={"first_name": "Bob", "last_name": "Jones", "email": "bob@example.com", "phone": "555-0002"},
           start="2099-06-11T16:00:00", end="2099-06-11T17:00:00")
     return tutoring, consult, link_a, link_b
 
@@ -297,7 +291,7 @@ def test_booking_type_facet_self_excludes(client):
 
     assert {t["id"] for t in body["facets"]["booking_types"]} == {tutoring["id"], consult["id"]}
     assert {l["id"] for l in body["facets"]["booking_links"]} == {link_a["id"]}
-    assert {(s["first_name"], s["last_name"]) for s in body["facets"]["students"]} == {("Alice", "Smith")}
+    assert {(a["first_name"], a["last_name"]) for a in body["facets"]["attendees"]} == {("Alice", "Smith")}
 
 
 def test_booking_type_facet_narrows_under_another_filter(client):
@@ -336,10 +330,6 @@ def test_reclassifying_one_booking_moves_only_that_row(client):
         "reschedule_mode": "auto",
         "booking_link_id": link["id"],
         "booking_type_id": consult["id"],
-        "student_first": booking_payload["student_first"],
-        "student_last": booking_payload["student_last"],
-        "student_email": booking_payload["student_email"],
-        "student_phone": booking_payload["student_phone"],
     })
 
     assert client.get(f"/bookings/{first['id']}").json()["booking_type_id"] == consult["id"]

@@ -89,14 +89,17 @@ Frontend runs at `http://localhost:5173`. CORS is configured in `main.py` to all
 backend/
   main.py          # App entry point, registers routers, CORS middleware, runs create_all on startup
   database.py      # Engine, SessionLocal, Base, get_db() dependency
-  models.py        # SQLAlchemy ORM models (Student, Tutor, Lesson, Schedule, ScheduleDay, BookingLink, BookingType, BookingLinkAvailability, BookingSeries, Booking)
-  schemas.py       # Pydantic schemas: *Create, *Update, *Response per entity
+  models.py        # SQLAlchemy ORM models (Contact, ContactManager, Student, Tutor, Lesson, Schedule, ScheduleDay, BookingLink, BookingType, BookingLinkAvailability, BookingSeries, Booking)
+  schemas.py       # Pydantic schemas: *Create, *Update, *Response per entity. Every request body
+                   # inherits _Input (extra="forbid") — see "Strict request bodies" below
   initialize_database.py  # Local-only seed script (gitignored, real data) — see initialize_database.example.py for the committed template
   booking_utils.py # _ensure_occurrence / _ensure_occurrence_by_token — materializes a series occurrence on demand, idempotent
   tasks.py         # Procrastinate app + periodic jobs (extend_all_series daily cron, weekly reminder job)
   worker.py        # Procrastinate worker entry point
   routers/
-    students.py
+    contacts.py               # CRUD for people; the one place a person's details change. Delete
+                              # RESTRICTs while any booking/series/enrollment references them
+    students.py               # Enrollment CRUD: a rate on a contact_id, not a person
     tutors.py
     lessons.py
     schedules.py              # CRUD for tutor schedules; is_default flip logic; 409 on duplicate name per tutor
@@ -110,7 +113,8 @@ backend/
 frontend/
   src/
     main.tsx           # Entry point, wraps App in BrowserRouter
-    App.tsx            # Root component, sidebar + header layout, React Router routes; /book/:slug and /my-bookings outside admin layout
+    App.tsx            # Root component, sidebar + header layout, React Router routes; /book/:slug,
+                       # /manage-occurrence/:ref and /manage-series/:ref sit outside the admin layout
     LessonsTable.tsx   # Lessons page: view toggle (All/Month/Week), toolbar, table with inline edit/delete/selection
     LessonRow.tsx      # Extracted row component: main row + expanded detail/edit/delete confirm
     LessonAddModal.tsx # Add lesson modal with dirty-check discard confirmation
@@ -120,10 +124,14 @@ frontend/
     ScheduleForm.tsx   # Schedule create/edit form (extracted component); multi-period days, timezone, dirty check
     Links.tsx          # Links admin page: cards list only, navigates to LinkPage for create/edit (diverged from Availability's inline pattern); slug headline + copy button, pause/archive confirms
     LinkPage.tsx       # Routed page (/links/:id, ?tab=) — multi-tab link editor (details/duration/recurrence/hosts/cancellation/limits/booking), per-tab error indicators
-    BookingsLayout.tsx # Layout route mounted at /bookings and /my-bookings — tab bar (NavLink), roster fetch (tutors/booking links, once), toast; renders <Outlet context={BookingsOutletContext}>
-    ScheduleTab.tsx    # /bookings and /my-bookings index route — Day/Week/Month/custom date-range pill, paginated booking list
-    RecurringTab.tsx   # /bookings/recurring and /my-bookings/recurring — RecurringList (day-grouped SeriesRow cards), cancel-series modal
-    RequestsTab.tsx    # /bookings/requests only (no customer route) — pending-request cards, approve/deny modal; no isCustomer/email needed
+    BookingsLayout.tsx # Layout route mounted at /bookings — tab bar (NavLink), roster fetch (tutors/booking links, once), toast; renders <Outlet context={BookingsOutletContext}>
+    ScheduleTab.tsx    # /bookings index route — Day/Week/Month/custom date-range pill, paginated booking list
+    RecurringTab.tsx   # /bookings/recurring — RecurringList (day-grouped SeriesRow cards), cancel-series modal
+    RequestsTab.tsx    # /bookings/requests — pending-request cards, approve/deny modal
+    Clients.tsx        # /clients — the contact roster: dense table, debounced server-side search,
+                       # sortable headers, page-number pagination, role badges, create/edit/delete
+    PolicyModal.tsx    # Booking- and series-level policy editors. One private Shell holds the chrome
+                       # so the two can't drift; each exported dialog owns its own draft state
     BookingToolbar.tsx # Shared by all three tabs above: FiltersMenu, ActiveFilterChips, OrderToggle, LoadMoreSentinel, BookingFilters/LoadErrors types
     BookingRow.tsx     # Shared row component — admin menu (reschedule/cancel/delete/no-show) vs customer-mode compact view
     Tutors.tsx         # Tutors admin page: cards list, calendar_id + check_calendar_conflicts inline edit
@@ -168,7 +176,8 @@ docker-compose.yml # PostgreSQL service with named volume
 - **Schedule** — referenced by `BookingLinkAvailability` (DB FK is `CASCADE`; `delete_schedule` 409s first while any **non-archived** link references it, so it behaves as a RESTRICT from the outside). Archived links are excluded from that check deliberately: their calendar rules are inert so the rows guard nothing, and since archive is terminal, counting them would make any schedule a since-archived link ever used permanently undeletable. That exclusion is the one case where the `CASCADE` actually fires — deleting a schedule held only by archived links drops those inert rows, which is also why the FK can't be RESTRICT; the *default* schedule additionally can't be deleted at all until another schedule is made default first.
 - **BookingLink** — **archive only, no hard delete at any child count.** `DELETE /booking_links/{id}` sets `status='archived'` (409s if already archived); there is no hard-delete route and no restore. Archiving makes the URL 404, calendar rules go inert, the row goes read-only, and the slug is released for reuse — but the row never leaves, so `Booking.booking_link_id` stays NOT NULL and non-dangling forever. That permanence is what lets bookings be grouped by *source* and, more importantly, bulk-reassigned to a live link to make them reschedulable again; the booking's own `booking_type_id` separately carries its *kind*. `paused` is the reversible middle state. Because nothing is ever hard-deleted, the `BookingLinkAvailability` `CASCADE` on this FK is dead code — no delete ever reaches Postgres.
 - **BookingType** — plain hard delete, unguarded at any usage count. It carries no rules and nothing branches on it, so referring rows just lose their label: every `booking_type_id` FK is `ON DELETE SET NULL`. The frontend warns first using `GET /booking_types/{id}/usage`, which counts links, bookings, and series separately (a booking losing a label off a historical record is a different loss from a link needing a new type picked).
-- **Student** — referenced by `Lesson` (app-level RESTRICT, 409; cascade delete intentionally removed to protect financial records). `Booking.student_id`/`BookingSeries.student_id` are rarely populated today (see the `tms-roadmap` skill's `Contact`/`Student` identity-split note) and have no delete guard.
+- **Student** — referenced by `Lesson` (app-level RESTRICT, 409; cascade delete intentionally removed to protect financial records). Deleting an enrollment leaves the `Contact` standing: identity and billing are separate rows, and a client who left gets `is_active=False` rather than a delete.
+- **Contact** — RESTRICT, same shape as Tutor: 409 while any `Booking`, `BookingSeries`, or `Student` references them. `payer_id`/`attendee_id` are NOT NULL so there's nothing to null out, and a booking with no person is meaningless. Soft delete was considered and rejected — it buys the ability to delete a referenced contact, which is the thing you don't want, at the cost of an archived state every query has to filter. The delete that actually happens is a stray duplicate: repoint the bad booking's attendee first, which leaves that row unreferenced. `contact_managers` rows are the contact's own and go with it (`ON DELETE CASCADE`, cleared explicitly so SQLite matches Postgres).
 
 **Tutor `is_active`**: Both Student and Tutor have `is_active`. Retiring a student/tutor means setting `is_active=False`, not deleting them. For Tutor specifically, this is enforced, not just a display flag: `create_booking`/`_reschedule_booking`/`_reschedule_series` (`routers/bookings.py`) reject an inactive `tutor_id`, `get_available_slots` excludes inactive tutors, and `extend_single_series` (`tasks.py`) stops materializing new occurrences for a series whose tutor has gone inactive. Already-confirmed/already-materialized bookings are untouched either way.
 
@@ -200,10 +209,11 @@ docker-compose.yml # PostgreSQL service with named volume
   - `cursor` (opaque, base64) is the only pagination input besides `page_size`. `encode_cursor`/`decode_cursor` (`booking_utils.py`) pack `start` timestamp + `public_id` tiebreaker + a fingerprint of the filters/time-window the cursor was minted under; a cursor replayed against a different filter combination is rejected rather than silently returning a mismatched page.
   - The materialized query seeks via the cursor's `(start, public_id)` tuple instead of re-fetching the whole window every call; `_virtual_occurrences`/`scoped_virtual_occurrences` start walking from the cursor instead of always from `series.dtstart`. Cost is `O(page_size)` regardless of depth.
   - Response carries `next_cursor` (null once exhausted), no `total`/`has_more`.
+  - **`GET /contacts/` deliberately does NOT use a cursor** — it takes `search`/`sort`/`direction`/`page`/`page_size` and returns `{items, total}`. A cursor trades random access for cheap deep scroll, which is right for a time-ordered booking feed and wrong for a name-ordered roster: the client list is jumped around, shows a total, and is never scrolled to the end. Every ORDER BY appends `Contact.id` so a tie on the sort key can't drop or repeat a row across a page boundary, and `ix_contacts_name` keeps the default ordering off a filesort.
   - `GET /bookings/pages` is the separate, still-available `total`/page-number-returning endpoint (bounded `time_max`, `BookingPagedListResponse`) — kept for API completeness, not called by the frontend, which uses cursor-based Next/Prev everywhere.
-  - Design: `.claude/plans/done-cursor-pagination-and-endpoint-split.md` (implemented).
-- **Filtering / facets** (`booking_utils.py`): `GET /bookings/` and `GET /booking-series` both take `tutor_ids`/`booking_link_ids`/`booking_type_ids`/`student` filters and return `facets` alongside `items` in the same response — the self-excluding, Google-Flights-style filter-checklist options, not just the filtered results.
-  - `apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_ids, student_pairs, email=None, exclude=None)` — the one shared filter-applier for both `Booking` and `BookingSeries` (same column names on both). `exclude` skips one dimension's own clause — this is what makes self-exclusion possible. Students match on `(student_first, student_last)` exact pairs via `tuple_(...).in_(...)`, not independent `.in_()` calls on each name — matching first/last separately would cross-match two different guests who happen to share only one name. Pairs travel over the wire as a pipe-delimited `"First|Last"` string (same composite-string convention as `public_id`), decoded server-side.
+- **Filtering / facets** (`booking_utils.py`): `GET /bookings/` and `GET /booking-series` both take `tutor_ids`/`booking_link_ids`/`booking_type_ids`/`attendee_ids` filters and return `facets` alongside `items` in the same response — the self-excluding, Google-Flights-style filter-checklist options, not just the filtered results.
+  - `apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude=None)` — the one shared filter-applier for both `Booking` and `BookingSeries` (same column names on both). `exclude` skips one dimension's own clause — this is what makes self-exclusion possible. All four dimensions are plain FK `.in_()` clauses. Attendee used to match on `(student_first, student_last)` pairs via `tuple_(...)`, travelling as a pipe-delimited `"First|Last"` string; the contact FK deleted that special-casing, and with it the bug where a typo split one person into two filter options.
+  - **There is no `email` query param.** It filtered by a raw client-supplied address with nothing verifying ownership, so anyone could read anyone's bookings by guessing. Scoping a list to one person is `attendee_ids` now; scoping it to *the requester* waits for a session to derive it from — and when that lands, the filter must come from the session, never from client input (same rule the roadmap states for `tenant_id`).
   - `compute_timeline_facets(...)` / `compute_series_facets(...)` — call `apply_scope_filters` three times per request, once per facet dimension, each time excluding that one dimension so its own filter never narrows its own options. For the timeline version, series facets are existence-checked via `_virtual_occurrences(series, time_min, time_max, count=1, settings)` — reuses the real occurrence-window walk rather than reimplementing date math, `count=1` since facets only need "does this series contribute anything here," not the full list. Scoped to indefinite series (`indefinite_series_filter()`), since a bounded series is fully materialized and already contributed through the `Booking` queries.
   - **Self-exclusion only protects a facet from its own filter** — it does nothing about *other* active filters (or the time window) legitimately narrowing a selected value out of the response. Handled backend-side now: `compute_timeline_facets`/`compute_series_facets` union the currently-selected values back into each facet's own response before returning, so a selection never silently disappears from its own facet — no frontend fallback needed anymore.
 - Datetimes stored as UTC (`DateTime(timezone=True)`). `BookingCreate`/`BookingReschedule` schemas convert client-local time to UTC via `model_validator(mode="after")` using `zoneinfo`. `Booking.timezone` is the booker's timezone captured at booking time — consumed once as a write-time UTC-conversion input, then not read again by any current frontend display path (`utils.ts`'s `formatDate`/`formatTime` and `BookingPage.tsx` both format using the *current* viewer's live-detected timezone, ignoring the stored value, which is strictly more correct for a live browser session). **The column is slated to be dropped** — it's a request-time conversion input, not state. Emails will render in business time with the zone stated explicitly ("4:00 PM ET"), which is both unambiguous and immune to the booker having moved since; guessing their current zone from a value captured months ago is worse than naming the zone outright. It should live only on `BookingCreate`/`BookingReschedule` and be excluded before reaching the ORM, the same way `fee_override` already is. See the roadmap.
@@ -220,6 +230,89 @@ docker-compose.yml # PostgreSQL service with named volume
 - `available-slots`: all schedule and series times resolve to the business canonical timezone (`Settings.business_timezone`). `BookingSeries.timezone` was **already dropped** as redundant with it. `Schedule.timezone` is **not** redundant and stays — a tutor in another zone enters their hours in their own local time, and that column is the only thing that says which zone to convert from (its model TODO claiming otherwise reflects today's single-tutor data, not the design). On timezone change: shift all stored times by old→new offset using current DST state, then update Settings.
 - **Known limitation, not being addressed now**: one global `Settings.business_timezone` assumes a single-location business. A business spanning multiple physical locations in different timezones (a franchise model) isn't representable — that would need timezone scoped per-tutor (or a future `Location` entity) rather than one app-wide value, and every booking would need its zone denormalized at creation from whichever tutor produced it, same freeze-at-creation pattern as the planned per-booking policy denormalization ("BookingLink data model" below). Deliberately deferred — no multi-location feature is currently planned. See `tms-roadmap` skill.
 
+**Contact identity** — **shipped.** People are rows, created by the booking that names them.
+
+```
+contacts          id, email (unique, nullable), first_name, last_name, phone, verified_at, created
+contact_managers  manager_id, managed_id      who may book for whom; unique pair, CHECK not-self
+students          id, contact_id UNIQUE, rate, start_date, is_active, grade, birthday
+bookings          payer_id NOT NULL, attendee_id NOT NULL -> contacts   (both indexed, facet keys)
+booking_series    same pair
+```
+
+**Row at transaction, not at registration.** The booking creates the person whether or not they ever
+log in — the Shopify/Acuity shape, where guest checkouts still produce a customer. The alternative
+(guests are strings, registration backfills by email) is right when attendees are one-time and the
+customer is someone else; it's wrong here because the repeat relationship *is* the product. Fuller
+write-up in `notes/learning.md`.
+
+**One table of people, two roles on the booking.** `payer_id` and `attendee_id` both point at
+`contacts` and are allowed to be the same row — an adult booking for themselves is the row where
+they match. Roles live on the transaction, never as a column on the person, because one human is a
+payer on one booking and an attendee on another. Anything you'd want a `role` column for is derived
+(`EXISTS (SELECT 1 FROM bookings WHERE payer_id = :id)`).
+
+**`Student` is enrollment, not identity.** Name, email and phone are on the `Contact`; what's left is
+what's true *because* they're billed here. A one-off consultation attendee is a contact with no
+student row, which is what lets someone book without anyone inventing a rate. Siblings at different
+rates is why rate sits on the attendee rather than the payer. `Booking` points at `Contact`, never at
+`Student` — enrollment is one hop away, and only when a rate is needed. Rate resolution is
+`fee_override ?? (hrs × student.rate) ?? (hrs × link.price)`. Admin-created: a guest can't supply a
+rate, and `Lesson.student_id` is NOT NULL. **TODO: rename to `Enrollment`** — "student" is
+tutoring-specific in a product also meant for therapy, training and coaching.
+
+**No contact snapshot on a booking.** The six `student_*`/`parent_*` columns are gone; a booking
+reads its person through the FK. Unlike policy or `Lesson.fee`, a name or phone change is a
+*correction*, not a different fact, so it should reach the whole history rather than fork. A booking
+is an operational record you act on, not a document asserting something about the past — when
+invoicing lands, snapshot onto the **invoice**, not back onto the booking (that's what Stripe does).
+
+**Resolution** (`booking_utils.py`) — `resolve_payer` upserts by lowercased email;
+`resolve_attendee` has the full branch table in its docstring. The rule underneath it:
+**auto-match only on a strong key, never on a weak one.** Email is strong, so it matches globally
+(which is how two payers end up sharing one dependent). A name is not, so it only matches within one
+payer's dependents, and only when no email contradicts it. Deliberate duplicates: a dependent whose
+email changes, a second payer naming the same emailless dependent, and a dependent who once booked as
+their own payer. All resolved by hand rather than by heuristics — repoint the booking's attendee, then
+delete the stray contact.
+
+Guest form writes are **not** additive-only: an unclaimed contact takes the newest booking's name and
+phone, a `verified_at` one doesn't. Nothing sets `verified_at` until auth, so today every row takes
+the newer input.
+
+`sms_opt_in` and `guest_reminder_phone` ride on both tables. The phone is frozen for guests, since
+unverified input shouldn't follow a later profile edit, and is nulled for every booking once the
+contact registers — after which send time reads `contact.phone` live.
+
+**Roles are derived, never stored.** There is no role column and no separate attendee table — a
+person is "an attendee" only because their id turned up in `Booking.attendee_id`. That's what the
+attendee facet is: `SELECT DISTINCT attendee_id` over the scoped bookings, then looked up in
+`contacts` (`compute_timeline_facets` → `_build_facets`). `GET /contacts/` returns the same rows
+answering a different question — *who exists*, not *who was in the room this week* — so the roster
+legitimately lists people the facet never will, a payer who has never attended being the usual case.
+Its `bookings_as_payer`/`bookings_as_attendee` counts are computed per request from two `GROUP BY`
+queries, not stored.
+
+**There is only an attendee facet, not a payer one.** `apply_scope_filters` filters on
+`attendee_id` alone, inherited from the old `(student_first, student_last)` facet. The gap: with
+one payer covering two dependents there's no way to ask "everything this payer is on," which is the
+invoicing question. Adding it means a `payer_ids` param and a fifth facet query — backlog, see the
+`tms-roadmap` skill.
+
+**The customer surface is deep links only.** `/my-bookings` and every `isCustomer` branch are gone.
+A customer reaches one booking or one series through the `public_id` link in their calendar event
+(`/manage-occurrence/:ref`, `/manage-series/:ref`) — unguessable, and it names exactly one row,
+which is what makes a login unnecessary to reach it. The list view went with the `email` query
+param and for the same reason: it scoped to a client-supplied address with nothing proving
+ownership. A customer booking list comes back with auth, scoped from the session.
+
+**Strict request bodies.** Every schema taking a request body inherits `_Input`
+(`extra="forbid"`). Pydantic's default drops unknown fields silently, so a client sending something
+the server no longer accepts got a 200 and a no-op. Tolerating that only pays when clients deploy
+independently (a public API, a mobile app); one frontend from this repo means drift is a bug. Turning
+it on immediately caught `PUT /tutors` being sent immutable names and `PUT /lessons` being sent
+`student_id`/`tutor_id`.
+
 **Two entry points, two rule regimes.** Every change to a booking arrives through one of two doors, governed completely differently. Conflating them is where the superseded invariant below went wrong.
 
 - **The booking page — customer-facing, fully rule-governed.** Availability, buffers, caps, lead time, booking horizon, cancel/reschedule notice floors. This is the only path that reads a `BookingLink`'s calendar rules.
@@ -233,7 +326,7 @@ The consequence that matters: **bringing a past booking forward is an admin edit
 
 What *is* true, and independent of timing: policy and the rest of the wiring are frozen onto the booking at creation and **copy forward on reschedule** (the original booking's terms, never the link's current ones), so they resolve correctly no matter when a move happens or what state the link is in.
 
-**BookingLink data model** — **shipped, across three passes.** Pass 1 landed the rename off `EventType`, the `status` lifecycle, `slug`, and reassignment. Pass 2 landed the `booking_types` table and the kind facet. Pass 3 landed the policy freeze: the occurrence-level four and the series-level two are copied onto `Booking`/`BookingSeries` at creation, and `cancel_action`/`reschedule_action` read the row rather than the link. Still unbuilt: the intake-form tables (`form_fields`, `booking_link_fields`, `event_field_responses`) — contact info remains fixed columns on `Booking`/`BookingSeries` — and a business-wide default policy that links inherit from, which is a separate future feature rather than a missing half of Pass 3.
+**BookingLink data model** — **shipped, across three passes.** Pass 1 landed the rename off `EventType`, the `status` lifecycle, `slug`, and reassignment. Pass 2 landed the `booking_types` table and the kind facet. Pass 3 landed the policy freeze: the occurrence-level four and the series-level two are copied onto `Booking`/`BookingSeries` at creation, and `cancel_action`/`reschedule_action` read the row rather than the link. Still unbuilt: the intake-form tables (`form_fields`, `booking_link_fields`, `event_field_responses`), and a business-wide default policy that links inherit from, which is a separate future feature rather than a missing half of Pass 3. Contact info is **no longer** fixed columns on `Booking`/`BookingSeries` — see "Contact identity" above.
 
 A **`BookingLink`** ("Link" in the UI) is a **factory**. Its fields split by whether they answer a **NOW** question or a **THEN** question:
 
@@ -336,8 +429,9 @@ booking_links                         [the factory -- archive only, row lives fo
   booking_type_id -> booking_types.id   which kind it stamps; nullable, SET NULL
                                         many links may share one type -- that is how
                                         their bookings group together
-  cancel_mode, cancel_notice_minutes         NULL => inherit Settings
-  reschedule_mode, reschedule_notice_minutes NULL => inherit Settings
+  cancel_mode, cancel_notice_minutes         occurrence level; modes NOT NULL, default 'auto'
+  reschedule_mode, reschedule_notice_minutes
+  series_cancel_mode, series_reschedule_mode series level; 'blocked'|'auto'|'request', no window
 
 booking_link_availability             [SLOT RULE — live junction]
   booking_link_id, tutor_id, schedule_id
@@ -358,13 +452,17 @@ bookings          -- and booking_series: EVERY field below exists on BOTH
                                             relabels this row too. Admin-repointable
                                             per row; series occurrences copy off the
                                             SERIES, not the link. Indexed (facet key).
-  start_at, end_at                          duration, frozen by construction
+  start, end                                duration, frozen by construction
     (booking_series uses dtstart/dtend for the same job -- naive local pattern,
      not an absolute instant; see the BookingSeries notes above)
-  cancel_allowed, cancel_cutoff_min         policy, frozen at creation
-  reschedule_allowed, reschedule_cutoff_min, max_reschedules
-  status, reschedule_count
-  first_name, last_name, email (nullable), phone (nullable)
+  cancel_mode, cancel_notice_minutes        policy, frozen at creation; modes NOT
+  reschedule_mode, reschedule_notice_minutes  NULL, server_default 'auto'
+  series_cancel_mode, series_reschedule_mode  booking_series only; no notice window
+  status
+  student_first, student_last, student_email, student_phone,
+  parent_email, parent_phone                nullable per the two CHECKs: at least one
+                                            email and at least one phone
+  -- not built: max_reschedules / reschedule_count (no cap is enforced today)
 
 event_field_responses                 [WIRING — frozen answers]
   booking_id, field_id (nullable)
@@ -432,7 +530,7 @@ The series pair carries **no notice window** on purpose. "24 hours' notice" is a
 **No `Policy` entity, and no business-wide default yet.** A standalone shared table was designed and dropped twice — see the `tms-roadmap` skill's Decisions. A business-wide default on `Settings` that links inherit from is a separate future feature (`tms-roadmap`, Future Features), not a deferred half of this: policy is set per link today, and nothing here anticipates inheritance.
 
 **Client info** — two distinct things, not to be conflated:
-- **Fixed contact fields** (`first_name`, `last_name`, `email`, `phone`) — plain columns on **both `Booking` and `BookingSeries`** (as they already are today), email/phone nullable. For logged-in users, copy their profile name/contact *at booking time* rather than referencing `user_id` live — consistent with the freeze-on-creation pattern elsewhere, since an old booking's client-facing info shouldn't drift when someone edits their profile later.
+- **Superseded — contact fields are NOT frozen onto a booking.** This bullet used to call for `first_name`/`last_name`/`email`/`phone` as plain columns on both tables, copied at booking time so an old booking wouldn't drift when a profile is edited. That was wrong for this entity: unlike policy, a change to someone's name or phone is a correction, and drifting is the *desired* behaviour. `Booking`/`BookingSeries` carry `payer_id`/`attendee_id` and read through them. See "Contact identity" above.
 - **Custom intake questions** — a reusable label:answer system. `form_fields` is the shared question library (name, input type, options); `booking_link_fields` is the live join saying which questions a link asks, in what order, required or not; `event_field_responses` stores one answer row per question per booking, with a `label_snapshot` of the question text *as it was asked*, so later renaming a question never rewrites the meaning of an old answer.
 
 **Deletion rules under this model:**
@@ -467,9 +565,9 @@ The series pair carries **no notice window** on purpose. "24 hours' notice" is a
 
 **UI stack**: Mantine v7 for form controls (Select, NumberInput, Modal, etc.), Tailwind for layout/spacing. Native `<input>` elements used inside the inline edit form in `LessonRow.tsx`; Mantine components used in `LessonAddModal.tsx` and `BulkAddCard.tsx`.
 
-**Layout**: Dark sidebar (`bg-gray-900`, collapsible via `sidebarCollapsed` state + `transition-all`) and header share one visual shell (rounded card floating on the dark shell, no hard right angle between them). React Router routes: `/` → LessonsTable, `/tutors` → Tutors, `/bookings` and `/my-bookings` → nested routes through `BookingsLayout` (see below).
+**Layout**: Dark sidebar (`bg-gray-900`, collapsible via `sidebarCollapsed` state + `transition-all`) and header share one visual shell (rounded card floating on the dark shell, no hard right angle between them). React Router routes: `/` → LessonsTable, `/clients` → Clients, `/tutors` → Tutors, `/bookings` → nested routes through `BookingsLayout` (see below).
 
-**Bookings nested routing**: `/bookings` and `/my-bookings` (customer mode, no `requests` child route) are both parent routes rendering `BookingsLayout`, which stays mounted across tab switches and owns everything shared — roster fetch (once), toast, tab bar. Its `<Outlet context={... satisfies BookingsOutletContext}>` is the slot React Router fills with whichever child route matched (`ScheduleTab`/`RecurringTab`/`RequestsTab`); each reads that context via `useOutletContext<BookingsOutletContext>()` instead of fetching the roster itself. A tab switch is real navigation (URL changes, browser back/forward works), not local `useState` toggling — switching tabs unmounts/remounts the tab component, so each tab's own filter/pagination state resets on revisit by design (not persisted).
+**Bookings nested routing**: `/bookings` is the parent route rendering `BookingsLayout`, which stays mounted across tab switches and owns everything shared — roster fetch (once), toast, tab bar. Its `<Outlet context={... satisfies BookingsOutletContext}>` is the slot React Router fills with whichever child route matched (`ScheduleTab`/`RecurringTab`/`RequestsTab`); each reads that context via `useOutletContext<BookingsOutletContext>()` instead of fetching the roster itself. A tab switch is real navigation (URL changes, browser back/forward works), not local `useState` toggling — switching tabs unmounts/remounts the tab component, so each tab's own filter/pagination state resets on revisit by design (not persisted).
 
 **LessonsTable view model**: Three views — `'All' | 'Month' | 'Week'`. `useLessons` hook exposes `ungrouped` (filtered+sorted), `byMonth`/`months`, `byWeek`/`weeks`. `lessonsToDisplay` is derived in the component based on view + `periodIndex`. Switching views resets selection and `periodIndex`.
 
@@ -494,6 +592,45 @@ The series pair carries **no notice window** on purpose. "24 hours' notice" is a
 - `TIME_OPTIONS`: 96 × 15-min slots (00:00–23:45) + `'23:59'` appended. Index arithmetic used for add/cascade logic.
 - Multi-period cascade: when `to` changes, each subsequent period's `from` is pushed 15 min past the previous `to`; if that breaches the period's own `to`, `to` is also pushed forward; `splice(i)` removes unresolvable periods.
 - `canAddPeriod`: disabled only when first period starts at `TIME_OPTIONS[0]` AND last period ends at `TIME_OPTIONS[last]`. If only the end is full, new period prepends before the first.
+
+**Clients page pattern** (`Clients.tsx`) — the one page built for scale rather than for today's data,
+since the client roster is the only list that grows unboundedly with a practice's size:
+- **Dense table, not cards.** Cards suit a handful of tutors or links; a roster is scanned and sorted.
+- **Everything server-side** — search, sort, paging. Nothing is filtered in the browser, because the
+  browser doesn't have the rest of the set.
+- Search is **debounced 250ms** into `debouncedSearch`, which is what the fetch effect depends on. A
+  new search resets `page` to 1, since the old page number means nothing against a new result set.
+- One `useEffect` keyed on `[debouncedSearch, sort, direction, page]` — every control is just state,
+  and the fetch follows.
+- One modal serves create and edit (`editing` is `null` | `'new'` | the row); the fields are identical
+  and `PUT` vs `POST` is the only branch.
+- Delete surfaces the backend's 409 text rather than a generic failure — a contact with bookings is
+  RESTRICTed, so the conflict is the *expected* answer, not an edge case.
+
+**Form state lives in the form, not the parent** (`PolicyModal.tsx`). A half-edited draft nobody else
+reads isn't shared state, so lifting it up is the wrong default. Both policy dialogs own their own
+draft, seeded straight from the row; the caller passes `key={String(open)}` so a changed key discards
+the instance and re-seeds on reopen — no reset effect, and the Mantine modal stays mounted long
+enough to animate out (conditional mounting resets state too, but cuts the exit transition). The
+shared chrome lives in a private `Shell` in the same file so the booking and series dialogs can't
+drift apart visually, while each keeps state named for its own columns. Contrast `LinkPage`, which
+*correctly* holds its policy fields as controlled props: there the policy rows are part of one big
+form with a single Save, so that state genuinely is shared.
+
+**Full-replacement PUTs need a carry-forward payload** (`bookingPayload`/`seriesPayload` in `utils.ts`).
+`PUT /bookings/{id}` and `PUT /booking-series/{id}` replace rather than patch: a required field left
+out 422s, and a defaulted one silently reverts (`booking_type_id` → null). So every caller sends the
+whole row and overrides the one field it means to change — `{ ...bookingPayload(b), booking_type_id: 5 }`.
+One function per update schema, mirroring `BookingUpdate`/`BookingSeriesUpdate`, so the field list
+exists once instead of being hand-rolled at each call site. (The real fix is making these PATCH, which
+would delete both helpers — see the `tms-roadmap` skill.)
+
+**Filter chips read facets, not rosters** (`BookingToolbar.tsx`). Rosters exist to fill pickers that
+*write* to a booking — the reassign dropdown, the type picker, the tutor bubble. The filter UI is a
+different job, and every `*FacetOption` already carries its own display fields. Three chips happened
+to have a roster lying around and one (attendees) never could, since contacts aren't fetched wholesale;
+resolving all four through `facets` removed the special case. Safe because the backend unions selected
+values back into each facet, so a selected id is always nameable.
 
 **Mantine focus override**: `index.css` overrides `.m_8fb7ebe7:focus` to use indigo-400 border color instead of default purple.
 

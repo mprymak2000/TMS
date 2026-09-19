@@ -1,13 +1,39 @@
-export interface Student {
+// A person. Created by the booking that names them, never by signing up. Payer, attendee, or both.
+export interface Contact {
   id: number
   first_name: string
   last_name: string
+  email: string | null   // null for a dependent who has none of their own
+  phone: string | null
+  verified_at: string | null   // set once they prove the inbox; nothing writes it until auth
+}
+
+// What GET /contacts/ returns: a Contact plus how they've actually been used. Roles are derived
+// from the bookings at read time, never stored on the person — the same human is a payer on one
+// booking and an attendee on another. 0/0 means added by hand, not yet booked.
+export interface ContactListRow extends Contact {
+  created: string
+  bookings_as_payer: number
+  bookings_as_attendee: number
+}
+
+// Page numbers, not a cursor: the roster is jumped around and shows a total, which is the random
+// access a cursor trades away. Opposite call from bookings, for the opposite access pattern.
+export interface ContactPagedResponse {
+  items: ContactListRow[]
+  total: number
+}
+
+// Enrollment, not identity: what's true of a contact because they're billed here.
+export interface Student {
+  id: number
+  contact_id: number
+  contact: Contact
   rate: number
   start_date: string
   is_active: boolean
   grade: number | null
   birthday: string | null
-  email: string | null
 }
 
 export interface Tutor {
@@ -122,7 +148,11 @@ export interface Booking {
   tutor_id: number
   booking_link_id: number
   booking_type_id: number | null
-  student_id: number | null
+  // Who is responsible and who attends. The same contact when someone books for themselves.
+  payer: Contact
+  attendee: Contact
+  sms_opt_in: boolean
+  guest_reminder_phone: string | null   // frozen for guests; null once the contact is claimed
   start: string
   end: string
   timezone: string
@@ -138,12 +168,6 @@ export interface Booking {
   reschedule_notice_minutes: number | null
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'
-  student_first: string
-  student_last: string
-  student_email: string | null
-  student_phone: string | null
-  parent_email: string | null
-  parent_phone: string | null
   request: BookingRequest | null
 }
 
@@ -152,7 +176,10 @@ export interface BookingSeries {
   tutor_id: number
   booking_link_id: number
   booking_type_id: number | null
-  student_id: number | null
+  payer: Contact
+  attendee: Contact
+  sms_opt_in: boolean
+  guest_reminder_phone: string | null
   created: string
   last_modified: string
   dtstart: string
@@ -173,12 +200,6 @@ export interface BookingSeries {
   series_reschedule_mode: string
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'
-  student_first: string
-  student_last: string
-  student_email: string | null
-  student_phone: string | null
-  parent_email: string | null
-  parent_phone: string | null
   request: BookingRequest | null
 }
 
@@ -193,14 +214,15 @@ export interface BookingLinkFacetOption {
   slug: string
 }
 
-// todo: this will be a guestID identifier in the future
 export interface BookingTypeFacetOption {
   id: number
   label: string
   color: string | null
 }
 
-export interface StudentFacetOption {
+// An ordinary FK facet now that a booking points at a contact — no more "First|Last" pairs.
+export interface AttendeeFacetOption {
+  id: number
   first_name: string
   last_name: string
 }
@@ -209,7 +231,7 @@ export interface BookingFacets {
   tutors: TutorFacetOption[]
   booking_links: BookingLinkFacetOption[]
   booking_types: BookingTypeFacetOption[]
-  students: StudentFacetOption[]
+  attendees: AttendeeFacetOption[]
 }
 
 export interface BookingListResponse {

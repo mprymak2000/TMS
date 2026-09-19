@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { useOutletContext } from 'react-router-dom'
-import { TextInput, Loader, Button, Modal } from '@mantine/core'
+import { TextInput, Loader, Button } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import { IconSearch } from '@tabler/icons-react'
-import type { Tutor, BookingLink, BookingType, BookingSeries, TutorFacetOption, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption } from './types'
+import type { Tutor, BookingLink, BookingType, BookingSeries, BookingFacets } from './types'
 import { extractError, DAY_NAMES, weekdayOf, timeOf } from './utils'
 import SeriesRow from './SeriesRow'
 import type { BookingsOutletContext } from './BookingsLayout'
-import { FiltersMenu, ActiveFilterChips, OrderToggle } from './BookingToolbar'
+import { FiltersMenu, ActiveFilterChips, OrderToggle, EMPTY_FACETS } from './BookingToolbar'
 import type { BookingFilters, LoadErrors } from './BookingToolbar'
 
 // Shared by admin and customer Recurring tab — Monday..Sunday section headers (only for days
@@ -20,7 +21,6 @@ const RecurringList = ({
     bookingTypes,
     reloadBookingTypes,
     onSeriesUpdated,
-    isCustomer,
     includeCancelled,
     onRefresh,
     onError,
@@ -36,7 +36,6 @@ const RecurringList = ({
     reloadBookingTypes: () => void
     onSeriesUpdated: (series: BookingSeries) => void
     bookingLinks: BookingLink[]
-    isCustomer: boolean
     includeCancelled: boolean
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
@@ -71,7 +70,6 @@ const RecurringList = ({
                                 onPermanentDeleteSeries={onPermanentDeleteSeries}
                                 expanded={expandedSeriesId === s.id}
                                 onToggleExpand={() => onToggleExpand(s.id)}
-                                isCustomer={isCustomer}
                                 includeCancelled={includeCancelled}
                             />
                         </div>
@@ -82,23 +80,19 @@ const RecurringList = ({
     )
 }
 
-const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
+const RecurringTab = () => {
     const { tutors, bookingLinks, bookingTypes, reloadBookingTypes, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
 
-    const [email] = useState('')
     const [seriesList, setSeriesList] = useState<BookingSeries[]>([])
     // Only one series open at a time across the whole list — expanding one collapses whichever other
     // row was open. Owned here rather than by RecurringList, which the loading branch below unmounts
     // on every non-silent reload, taking the open row with it.
     const [expandedSeriesId, setExpandedSeriesId] = useState<string | null>(null)
     const [isLoadingSeries, setIsLoadingSeries] = useState(false)
-    const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
-    const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
-    const [bookingTypeFacetOptions, setBookingTypeFacetOptions] = useState<BookingTypeFacetOption[]>([])
-    const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
+    const [facets, setFacets] = useState<BookingFacets>(EMPTY_FACETS)
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>({
-        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], attendeeIds: [], searchQuery: '', includeCancelled: true,
         dateFrom: null, dateTo: null,
     })
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
@@ -112,7 +106,8 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         const tutor = tutors.find(t => t.id === s.tutor_id)
         const bookingLink = bookingLinks.find(e => e.id === s.booking_link_id)
         return [
-            s.student_first, s.student_last,
+            s.attendee.first_name, s.attendee.last_name, s.attendee.email, s.attendee.phone,
+            s.payer.first_name, s.payer.last_name, s.payer.email, s.payer.phone,
             tutor?.first_name, tutor?.last_name,
             bookingLink?.slug,
         ].filter(Boolean).join(' ').toLowerCase()
@@ -122,28 +117,25 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         tutorIds = filters.tutorIds,
         bookingLinkIds = filters.bookingLinkIds,
         bookingTypeIds = filters.bookingTypeIds,
-        students = filters.students,
-        emailFilter,
+        attendeeIds = filters.attendeeIds,
         silent = false,
     }: {
         tutorIds?: string[]
         bookingLinkIds?: string[]
         bookingTypeIds?: string[]
-        students?: string[]
-        emailFilter?: string
+        attendeeIds?: string[]
         // Background revalidation after an inline edit — no spinner, no list swap.
         silent?: boolean
     } = {}) => {
         if (!silent) setIsLoadingSeries(true)
         try {
             const base = `${import.meta.env.VITE_API_URL}/bookings/booking-series`
-            const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
             const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
             const bookingLinkParams = bookingLinkIds.map(id => `&booking_link_ids=${id}`).join('')
             const bookingTypeParams = bookingTypeIds.map(id => `&booking_type_ids=${id}`).join('')
-            const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
+            const attendeeParams = attendeeIds.map(id => `&attendee_ids=${id}`).join('')
 
-            const response = await fetch(`${base}?${emailParam}${tutorParams}${bookingLinkParams}${bookingTypeParams}${studentParams}`)
+            const response = await fetch(`${base}?${tutorParams}${bookingLinkParams}${bookingTypeParams}${attendeeParams}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load series.') }))
@@ -154,10 +146,7 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             // row from the PUT response, so writing the list here would overwrite that with the list
             // endpoint's copy — which, if the edit changed a filtered field, no longer includes it.
             if (!silent) setSeriesList(body.items)
-            setTutorFacetOptions(body.facets.tutors)
-            setBookingLinkFacetOptions(body.facets.booking_links)
-            setBookingTypeFacetOptions(body.facets.booking_types)
-            setStudentFacetOptions(body.facets.students)
+            setFacets(body.facets)
             setLoadErrors({})
         } catch (error) {
             console.error(error)
@@ -168,18 +157,16 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     }
 
     useEffect(() => {
-        if (!isCustomer) { loadBookingSeries(); return }
-        const saved = sessionStorage.getItem('customer_email')
-        if (saved) loadBookingSeries({ emailFilter: saved })
+        loadBookingSeries()
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
-    const refresh = () => loadBookingSeries({ emailFilter: isCustomer ? email : undefined })
+    const refresh = () => loadBookingSeries()
 
-    const handleStudentFilterToggle = (value: string) => {
-        const next = filters.students.includes(value) ? filters.students.filter(x => x !== value) : [...filters.students, value]
-        setFilters(f => ({ ...f, students: next }))
-        loadBookingSeries({ emailFilter: isCustomer ? email : undefined, students: next })
+    const handleAttendeeFilterToggle = (id: string) => {
+        const next = filters.attendeeIds.includes(id) ? filters.attendeeIds.filter(x => x !== id) : [...filters.attendeeIds, id]
+        setFilters(f => ({ ...f, attendeeIds: next }))
+        loadBookingSeries({ attendeeIds: next })
     }
 
     // Pure display flip — displayed() re-sorts fully every render, so no refetch needed.
@@ -190,19 +177,19 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const handleTutorFilterToggle = (id: string) => {
         const next = filters.tutorIds.includes(id) ? filters.tutorIds.filter(x => x !== id) : [...filters.tutorIds, id]
         setFilters(f => ({ ...f, tutorIds: next }))
-        loadBookingSeries({ emailFilter: isCustomer ? email : undefined, tutorIds: next })
+        loadBookingSeries({ tutorIds: next })
     }
 
     const handleBookingLinkFilterToggle = (id: string) => {
         const next = filters.bookingLinkIds.includes(id) ? filters.bookingLinkIds.filter(x => x !== id) : [...filters.bookingLinkIds, id]
         setFilters(f => ({ ...f, bookingLinkIds: next }))
-        loadBookingSeries({ emailFilter: isCustomer ? email : undefined, bookingLinkIds: next })
+        loadBookingSeries({ bookingLinkIds: next })
     }
 
     const handleBookingTypeFilterToggle = (id: string) => {
         const next = filters.bookingTypeIds.includes(id) ? filters.bookingTypeIds.filter(x => x !== id) : [...filters.bookingTypeIds, id]
         setFilters(f => ({ ...f, bookingTypeIds: next }))
-        loadBookingSeries({ emailFilter: isCustomer ? email : undefined, bookingTypeIds: next })
+        loadBookingSeries({ bookingTypeIds: next })
     }
 
     // BookingSeries rows carry no status of their own; SeriesRow reads includeCancelled directly
@@ -289,8 +276,7 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 {/* load errors */}
                 {loadErrors.bookings && <p className="text-sm text-red-500 mb-2">{loadErrors.bookings}</p>}
 
-                {!isCustomer && (
-                    <div className="mb-5">
+                <div className="mb-5">
                         <div className="flex items-center gap-2 flex-wrap">
                             <TextInput
                                 placeholder="Search..."
@@ -304,22 +290,22 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                 size="sm"
                             />
                             <FiltersMenu
-                                tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                                tutorOptions={facets.tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                                 tutorSelected={filters.tutorIds}
                                 onTutorToggle={handleTutorFilterToggle}
                                 // No manual bookingLinks.filter(e => e.recurring) special-case needed —
-                                // bookingLinkFacetOptions comes from get_booking_series's facets, which
+                                // facets.booking_links comes from get_booking_series's facets, which
                                 // are already recurring-only by construction (a BookingSeries only
                                 // ever exists for a recurring=true booking link).
-                                bookingLinkOptions={bookingLinkFacetOptions.map(e => ({ value: String(e.id), label: e.slug }))}
+                                bookingLinkOptions={facets.booking_links.map(e => ({ value: String(e.id), label: e.slug }))}
                                 bookingLinkSelected={filters.bookingLinkIds}
                                 onBookingLinkToggle={handleBookingLinkFilterToggle}
-                            bookingTypeOptions={bookingTypeFacetOptions.map(t => ({ value: String(t.id), label: t.label }))}
+                            bookingTypeOptions={facets.booking_types.map(t => ({ value: String(t.id), label: t.label }))}
                             bookingTypeSelected={filters.bookingTypeIds}
                             onBookingTypeToggle={handleBookingTypeFilterToggle}
-                                studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
-                                studentSelected={filters.students}
-                                onStudentToggle={handleStudentFilterToggle}
+                                attendeeOptions={facets.attendees.map(a => ({ value: String(a.id), label: `${a.first_name} ${a.last_name}` }))}
+                                attendeeSelected={filters.attendeeIds}
+                                onAttendeeToggle={handleAttendeeFilterToggle}
                                 includeCancelled={filters.includeCancelled}
                                 onIncludeCancelledToggle={handleIncludeCancelledToggle}
                             />
@@ -331,19 +317,16 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                             tutorIds={filters.tutorIds}
                             bookingLinkIds={filters.bookingLinkIds}
                         bookingTypeIds={filters.bookingTypeIds}
-                            students={filters.students}
-                            tutors={tutors}
-                            bookingLinks={bookingLinks}
-                            bookingTypes={bookingTypes}
+                            attendeeIds={filters.attendeeIds}
+                            facets={facets}
                             includeCancelled={filters.includeCancelled}
                             onTutorRemove={handleTutorFilterToggle}
                             onBookingLinkRemove={handleBookingLinkFilterToggle}
                         onBookingTypeRemove={handleBookingTypeFilterToggle}
-                            onStudentRemove={handleStudentFilterToggle}
+                            onAttendeeRemove={handleAttendeeFilterToggle}
                             onIncludeCancelledRemove={handleIncludeCancelledToggle}
                         />
-                    </div>
-                )}
+                </div>
             </div>
 
             <div className="flex-1 min-h-0 overflow-y-auto">
@@ -358,9 +341,8 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         reloadBookingTypes={reloadBookingTypes}
                         onSeriesUpdated={updated => {
                             setSeriesList(prev => prev.map(x => x.id === updated.id ? updated : x))
-                            loadBookingSeries({ emailFilter: isCustomer ? email : undefined, silent: true })
+                            loadBookingSeries({ silent: true })
                         }}
-                        isCustomer={isCustomer}
                         includeCancelled={filters.includeCancelled}
                         onRefresh={msg => { refresh(); showToast(msg) }}
                         onError={msg => showToast(msg, 'error')}
@@ -373,62 +355,50 @@ const RecurringTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 )}
             </div>
 
-            {/* cancel series confirm modal — admin only */}
-            {!isCustomer && <Modal
+            {/* cancel series confirm modal */}
+            <AppModal
                 opened={cancellingSeriesId !== null}
                 onClose={() => setCancellingSeriesId(null)}
                 title="Cancel entire series?"
-                centered
-                size="sm"
+                caption="All future occurrences will be removed and the recurring calendar event will be cancelled."
             >
-                <p className="text-sm text-gray-600 mb-4">
-                    All future occurrences will be removed and the recurring calendar event will be cancelled.
-                </p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setCancellingSeriesId(null)}>Keep it</Button>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setCancellingSeriesId(null)}>Keep it</Button>
                     <Button color="red" loading={isCancelling} onClick={() => cancellingSeriesId !== null && handleCancelSeries(cancellingSeriesId)}>
                         Cancel series
                     </Button>
-                </div>
-            </Modal>}
+                </ModalFooter>
+            </AppModal>
 
-            {/* permanent delete confirm modal — admin only */}
-            {!isCustomer && <Modal
+            {/* permanent delete confirm modal */}
+            <AppModal
                 opened={permanentDeleteSeriesId !== null}
                 onClose={() => setPermanentDeleteSeriesId(null)}
                 title="Permanently delete this series?"
-                centered
-                size="sm"
+                caption="This cannot be undone. Every booking in this series, past and future, will be permanently deleted along with the recurring calendar event."
             >
-                <p className="text-sm text-gray-600 mb-4">
-                    This cannot be undone. Every booking in this series, past and future, will be permanently deleted along with the recurring calendar event.
-                </p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setPermanentDeleteSeriesId(null)}>Keep it</Button>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setPermanentDeleteSeriesId(null)}>Keep it</Button>
                     <Button color="red" loading={isPermanentDeleting} onClick={() => permanentDeleteSeriesId !== null && handlePermanentDeleteSeries(permanentDeleteSeriesId)}>
                         Delete permanently
                     </Button>
-                </div>
-            </Modal>}
+                </ModalFooter>
+            </AppModal>
 
-            {/* cascade delete confirm modal — admin only, shown when the series has a rescheduled predecessor chain */}
-            {!isCustomer && <Modal
+            {/* cascade delete confirm modal — shown when the series has a rescheduled predecessor chain */}
+            <AppModal
                 opened={confirmingCascadeDeleteSeriesId !== null}
                 onClose={() => setConfirmingCascadeDeleteSeriesId(null)}
                 title="Delete entire reschedule chain?"
-                centered
-                size="sm"
+                caption="This series was created by rescheduling an earlier one. All series in the reschedule chain, and every booking in each, will be permanently deleted."
             >
-                <p className="text-sm text-gray-600 mb-4">
-                    This series was created by rescheduling an earlier one. All series in the reschedule chain, and every booking in each, will be permanently deleted.
-                </p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingCascadeDeleteSeriesId(null)}>Cancel</Button>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setConfirmingCascadeDeleteSeriesId(null)}>Cancel</Button>
                     <Button color="red" loading={isPermanentDeleting} onClick={() => confirmingCascadeDeleteSeriesId !== null && handlePermanentDeleteSeries(confirmingCascadeDeleteSeriesId, true)}>
                         Delete all
                     </Button>
-                </div>
-            </Modal>}
+                </ModalFooter>
+            </AppModal>
         </div>
     )
 }

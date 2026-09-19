@@ -1,17 +1,20 @@
 import { useState, useEffect, useRef } from 'react'
 import { Loader, Button, Popover, Switch } from '@mantine/core'
 import { IconX, IconChevronDown, IconSortAscending, IconSortDescending } from '@tabler/icons-react'
-import type { Tutor, BookingLink, BookingType } from './types'
+import type { BookingFacets } from './types'
 
 // Shared toolbar pieces used by every Bookings tab (Schedule/Recurring/Requests) - filters,
 // active-filter chips, sort toggle, and infinite-scroll trigger. Pulled out of any one tab's
 // own file so nothing has to import "shared" code from a sibling tab component.
 
+// Every tab seeds its facet state with this before the first response lands.
+export const EMPTY_FACETS: BookingFacets = { tutors: [], booking_links: [], booking_types: [], attendees: [] }
+
 export interface BookingFilters {
     tutorIds: string[]
     bookingLinkIds: string[]
     bookingTypeIds: string[]
-    students: string[]
+    attendeeIds: string[]
     dateFrom: string | null
     dateTo: string | null
     searchQuery: string
@@ -80,66 +83,61 @@ const FilterChip = ({ label, onRemove }: { label: string; onRemove: () => void }
 
 // Shared by Schedule, Recurring, and Requests' toolbars — self-guards, renders nothing when
 // there's nothing active, so callers don't need their own activeFilterCount check.
+//
+// Labels come from the facets, not from the rosters BookingsLayout fetches — those exist to fill
+// pickers that write to a booking (reassign its link, change its type), and there's no roster of
+// contacts anyway. Facet options carry their own display fields, and the backend unions selected
+// values back into each facet, so a selected id is always nameable.
 export const ActiveFilterChips = ({
     tutorIds,
     bookingLinkIds,
     bookingTypeIds,
-    students,
-    tutors,
-    bookingLinks,
-    bookingTypes,
+    attendeeIds,
+    facets,
     includeCancelled,
     onTutorRemove,
     onBookingLinkRemove,
     onBookingTypeRemove,
-    onStudentRemove,
+    onAttendeeRemove,
     onIncludeCancelledRemove,
 }: {
     tutorIds: string[]
     bookingLinkIds: string[]
     bookingTypeIds: string[]
-    students: string[]
-    tutors: Tutor[]
-    bookingLinks: BookingLink[]
-    bookingTypes: BookingType[]
+    attendeeIds: string[]
+    facets: BookingFacets
     includeCancelled: boolean
     onTutorRemove: (id: string) => void
     onBookingLinkRemove: (id: string) => void
     onBookingTypeRemove: (id: string) => void
-    onStudentRemove: (value: string) => void
+    onAttendeeRemove: (id: string) => void
     onIncludeCancelledRemove: () => void
 }) => {
-    if (tutorIds.length === 0 && bookingLinkIds.length === 0 && bookingTypeIds.length === 0 && students.length === 0 && includeCancelled) return null
+    if (tutorIds.length === 0 && bookingLinkIds.length === 0 && bookingTypeIds.length === 0 && attendeeIds.length === 0 && includeCancelled) return null
+
+    const chips = <T extends { id: number }>(
+        prefix: string,
+        ids: string[],
+        options: T[],
+        label: (o: T) => string,
+        onRemove: (id: string) => void,
+    ) => ids.map(id => {
+        const option = options.find(o => String(o.id) === id)
+        return (
+            <FilterChip
+                key={`${prefix}-${id}`}
+                label={`${prefix}: ${option ? label(option) : ''}`}
+                onRemove={() => onRemove(id)}
+            />
+        )
+    })
+
     return (
         <div className="flex flex-wrap gap-2 mt-3">
-            {tutorIds.map(id => (
-                <FilterChip
-                    key={`tutor-${id}`}
-                    label={`Tutor: ${tutors.find(t => String(t.id) === id)?.first_name ?? ''}`}
-                    onRemove={() => onTutorRemove(id)}
-                />
-            ))}
-            {bookingLinkIds.map(id => (
-                <FilterChip
-                    key={`event-${id}`}
-                    label={`Link: ${bookingLinks.find(e => String(e.id) === id)?.slug ?? ''}`}
-                    onRemove={() => onBookingLinkRemove(id)}
-                />
-            ))}
-            {bookingTypeIds.map(id => (
-                <FilterChip
-                    key={`type-${id}`}
-                    label={`Type: ${bookingTypes.find(t => String(t.id) === id)?.label ?? ''}`}
-                    onRemove={() => onBookingTypeRemove(id)}
-                />
-            ))}
-            {students.map(pair => (
-                <FilterChip
-                    key={`student-${pair}`}
-                    label={`Student: ${pair.replace('|', ' ')}`}
-                    onRemove={() => onStudentRemove(pair)}
-                />
-            ))}
+            {chips('Tutor', tutorIds, facets.tutors, t => t.first_name, onTutorRemove)}
+            {chips('Link', bookingLinkIds, facets.booking_links, l => l.slug, onBookingLinkRemove)}
+            {chips('Type', bookingTypeIds, facets.booking_types, t => t.label, onBookingTypeRemove)}
+            {chips('Attendee', attendeeIds, facets.attendees, a => `${a.first_name} ${a.last_name}`, onAttendeeRemove)}
             {!includeCancelled && (
                 <FilterChip label="Hide cancelled" onRemove={onIncludeCancelledRemove} />
             )}
@@ -210,9 +208,9 @@ export const FiltersMenu = ({
     bookingTypeOptions,
     bookingTypeSelected,
     onBookingTypeToggle,
-    studentOptions,
-    studentSelected,
-    onStudentToggle,
+    attendeeOptions,
+    attendeeSelected,
+    onAttendeeToggle,
     includeCancelled,
     onIncludeCancelledToggle,
 }: {
@@ -225,17 +223,17 @@ export const FiltersMenu = ({
     bookingTypeOptions: FilterOption[]
     bookingTypeSelected: string[]
     onBookingTypeToggle: (value: string) => void
-    studentOptions: FilterOption[]
-    studentSelected: string[]
-    onStudentToggle: (value: string) => void
+    attendeeOptions: FilterOption[]
+    attendeeSelected: string[]
+    onAttendeeToggle: (value: string) => void
     includeCancelled: boolean
     onIncludeCancelledToggle: () => void
 }) => {
     const [opened, setOpened] = useState(false)
     // Independent toggles, not a single-open accordion — expanding Students shouldn't collapse
     // Tutors if it's already open.
-    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'bookingLinks' | 'bookingTypes' | 'students'>>(new Set())
-    const toggleSection = (key: 'tutors' | 'bookingLinks' | 'bookingTypes' | 'students') => {
+    const [expandedSections, setExpandedSections] = useState<Set<'tutors' | 'bookingLinks' | 'bookingTypes' | 'attendees'>>(new Set())
+    const toggleSection = (key: 'tutors' | 'bookingLinks' | 'bookingTypes' | 'attendees') => {
         setExpandedSections(prev => {
             const next = new Set(prev)
             if (next.has(key)) next.delete(key)
@@ -243,7 +241,7 @@ export const FiltersMenu = ({
             return next
         })
     }
-    const activeCount = tutorSelected.length + bookingLinkSelected.length + bookingTypeSelected.length + studentSelected.length + (includeCancelled ? 0 : 1)
+    const activeCount = tutorSelected.length + bookingLinkSelected.length + bookingTypeSelected.length + attendeeSelected.length + (includeCancelled ? 0 : 1)
 
     return (
         <Popover
@@ -295,12 +293,12 @@ export const FiltersMenu = ({
                 />
                 <div className="border-t border-gray-100" />
                 <FilterAccordionSection
-                    label="Students"
-                    options={studentOptions}
-                    selected={studentSelected}
-                    expanded={expandedSections.has('students')}
-                    onToggleExpand={() => toggleSection('students')}
-                    onToggleOption={onStudentToggle}
+                    label="Attendees"
+                    options={attendeeOptions}
+                    selected={attendeeSelected}
+                    expanded={expandedSections.has('attendees')}
+                    onToggleExpand={() => toggleSection('attendees')}
+                    onToggleOption={onAttendeeToggle}
                 />
                 <div className="border-t border-gray-100" />
                 <button

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
-import { Textarea, Switch, NumberInput, Select, Button, Loader, Input, Modal, Radio } from '@mantine/core'
+import { Textarea, Switch, NumberInput, Select, Button, Loader, Input, Radio } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import { IconChevronLeft, IconPlus, IconTrash, IconExternalLink, IconFileDescription, IconClock, IconRepeat, IconUsers, IconBan, IconAdjustmentsHorizontal, IconCreditCard, IconCopy, IconCheck, IconLinkOff } from '@tabler/icons-react'
 import type { Tutor, Schedule, BookingLink, BookingType } from './types'
 import { extractError } from './utils'
@@ -815,23 +816,19 @@ const LinkPage = () => {
                     </div>
                 </div>
             </div>
-            <Modal
+            <AppModal
                 opened={confirmingLeave}
                 onClose={() => setConfirmingLeave(false)}
                 title="Discard unsaved changes?"
-                centered
-                size="sm"
+                caption={isNew
+                    ? "This link hasn't been created yet — leaving now discards it."
+                    : 'Your edits to this link will be lost.'}
             >
-                <p className="text-sm text-gray-600 mb-4">
-                    {isNew
-                        ? "This link hasn't been created yet — leaving now discards it."
-                        : 'Your edits to this link will be lost.'}
-                </p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingLeave(false)}>Keep editing</Button>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setConfirmingLeave(false)}>Keep editing</Button>
                     <Button color="red" onClick={() => navigate('/links')}>Discard</Button>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
             <Toast toast={toast} />
         </div>
     )

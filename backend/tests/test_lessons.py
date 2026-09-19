@@ -1,3 +1,8 @@
+# LessonUpdate has no student_id/tutor_id — a lesson can't change who it was for or who taught it —
+# so an update payload is built from this rather than from the create payload.
+lesson_update = {"date": "2024-01-01", "pay_status": False}
+
+
 # --- CREATE ---
 
 # hrs = 0, no fee_override, no tutor_pay_override
@@ -126,7 +131,7 @@ def test_create_lesson_cancelled_both_overrides(client, setup):
 
 def test_create_lesson_owner_as_tutor(client, setup):
     student, tutor, lesson = setup
-    tutor = client.post("/tutors/", json={**tutor, "first_name": "Owner", "pay_rate": 0}).json() # make tutor the owner (no tutor payouts, all proceeds go to the house)
+    tutor = client.post("/tutors/", json={"first_name": "Owner", "last_name": tutor["last_name"], "pay_rate": 0}).json() # make tutor the owner (no tutor payouts, all proceeds go to the house)
     lesson = {**lesson, "tutor_id": tutor["id"], "hrs": 2} 
     response = client.post("/lessons/", json=lesson)
     assert response.status_code == 201
@@ -210,7 +215,7 @@ def test_get_lesson_by_id_not_found(client):
 def test_update_lesson(client, setup_update):
     student, tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5, "notes": "original lesson"}
-    lesson_updated = {**lesson_prev, "hrs": 2, "pay_status": True, "notes": "Updated lesson"}
+    lesson_updated = {**lesson_update, "hrs": 1.5, "notes": "original lesson","hrs": 2, "pay_status": True, "notes": "Updated lesson"}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -231,7 +236,7 @@ def test_update_lesson(client, setup_update):
 def test_update_lesson_fee_override(client, setup_update):
     _student, tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5, "notes": "original lesson"}
-    lesson_updated = {**lesson_prev, "fee_override": 200}
+    lesson_updated = {**lesson_update, "hrs": 1.5, "notes": "original lesson","fee_override": 200}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -247,7 +252,7 @@ def test_update_lesson_fee_override(client, setup_update):
 def test_update_lesson_no_fee_override(client, setup_update):
     student, tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5, "fee_override": 200, "notes": "original lesson"}
-    lesson_updated = {**lesson_prev, "fee_override": None}
+    lesson_updated = {**lesson_update, "hrs": 1.5, "notes": "original lesson", "fee_override": None}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -263,7 +268,7 @@ def test_update_lesson_no_fee_override(client, setup_update):
 def test_update_lesson_add_tutor_pay_override(client, setup_update):
     student, _tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5}
-    lesson_updated = {**lesson_prev, "tutor_pay_override": 100}
+    lesson_updated = {**lesson_update, "hrs": 1.5, "tutor_pay_override": 100}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -279,7 +284,7 @@ def test_update_lesson_add_tutor_pay_override(client, setup_update):
 def test_update_lesson_remove_tutor_pay_override(client, setup_update):
     student, tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5, "tutor_pay_override": 100}
-    lesson_updated = {**lesson_prev, "tutor_pay_override": None}
+    lesson_updated = {**lesson_update, "hrs": 1.5, "tutor_pay_override": None}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -295,7 +300,7 @@ def test_update_lesson_remove_tutor_pay_override(client, setup_update):
 def test_update_lesson_occurred_to_cancelled(client, setup_update):
     student, tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 2}
-    lesson_updated = {**lesson_prev, "hrs": 0, "fee_override": 50}
+    lesson_updated = {**lesson_update, "hrs": 0, "fee_override": 50}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -311,7 +316,7 @@ def test_update_lesson_occurred_to_cancelled(client, setup_update):
 def test_update_lesson_cancelled_to_occurred(client, setup_update):
     student, tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 0, "fee_override": 50}
-    lesson_updated = {**lesson_prev, "hrs": 2, "fee_override": None}
+    lesson_updated = {**lesson_update, "hrs": 2, "fee_override": None}
     created = client.post("/lessons/", json=lesson_prev).json()
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
     assert response.status_code == 200
@@ -326,7 +331,7 @@ def test_update_lesson_cancelled_to_occurred(client, setup_update):
 def test_update_lesson_pay_status_flip(client, setup_update):
     _student, _tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5}
-    lesson_updated = {**lesson_prev, "pay_status": True}
+    lesson_updated = {**lesson_update, "hrs": 1.5, "pay_status": True}
     created = client.post("/lessons/", json=lesson_prev).json()
     assert not created["pay_status"]
     response = client.put(f"/lessons/{created['id']}", json=lesson_updated)
@@ -335,8 +340,7 @@ def test_update_lesson_pay_status_flip(client, setup_update):
 
 # case 9: lesson not found
 def test_update_lesson_not_found(client, setup_update):
-    _student, _tutor, lesson = setup_update
-    response = client.put("/lessons/9999", json={**lesson, "hrs": 2})
+    response = client.put("/lessons/9999", json={**lesson_update, "hrs": 2})
     assert response.status_code == 404
 
 # case 10: invalid date format
@@ -344,7 +348,7 @@ def test_update_lesson_invalid_date(client, setup_update):
     _student, _tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5}
     created = client.post("/lessons/", json=lesson_prev).json()
-    response = client.put(f"/lessons/{created['id']}", json={**lesson_prev, "date": "01-01-2025"})
+    response = client.put(f"/lessons/{created['id']}", json={**lesson_update, "hrs": 1.5, "date": "01-01-2025"})
     assert response.status_code == 422
 
 # case 11: negative hrs
@@ -352,7 +356,7 @@ def test_update_lesson_invalid_hrs(client, setup_update):
     _student, _tutor, lesson = setup_update
     lesson_prev = {**lesson, "hrs": 1.5}
     created = client.post("/lessons/", json=lesson_prev).json()
-    response = client.put(f"/lessons/{created['id']}", json={**lesson_prev, "hrs": -2})
+    response = client.put(f"/lessons/{created['id']}", json={**lesson_update, "hrs": -2})
     assert response.status_code == 422
 
 

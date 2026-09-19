@@ -1,22 +1,16 @@
-import { useState, useEffect } from 'react'
-import { Modal, Button, Menu, TextInput, Select } from '@mantine/core'
-import { IconCalendarEvent, IconRefresh, IconPencil, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink, IconShieldCog } from '@tabler/icons-react'
+import { useState } from 'react'
+import { Button, Menu, Select } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
+import { IconCalendarEvent, IconRefresh, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink, IconShieldCog } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingLink, BookingType } from './types'
-import { formatDate, extractError, contactPayload, occurrencePolicyPayload } from './utils'
+import { formatDate, extractError, attendeeName, bookingPayload } from './utils'
 import type { OccurrencePolicyFields } from './utils'
-import PolicyModal from './PolicyModal'
-
-interface ContactForm {
-    studentEmail: string
-    studentPhone: string
-    parentEmail:  string
-    parentPhone:  string
-}
+import { BookingPolicyModal } from './PolicyModal'
 
 // All the state/handlers/menu-items/modals behind a booking row's "manage" affordance — shared
 // by BookingRow's own dots-menu and SeriesRow's occurrence pills, so both trigger the exact same
-// actions (reschedule/modify contact/no-show/cancel/delete) without duplicating any of this logic.
+// actions (reschedule/no-show/cancel/delete) without duplicating any of this logic.
 interface UseBookingActionsOptions {
     booking: Booking
     bookingLink: BookingLink | undefined    // resolved from the roster, which can miss
@@ -44,20 +38,10 @@ export const useBookingActions = ({
     const [confirmingDelete, setConfirmingDelete] = useState(false)
     const [confirmingPermanentDelete, setConfirmingPermanentDelete] = useState(false)
     const [confirmingCascadeDelete, setConfirmingCascadeDelete] = useState(false)
-    const [editingContact, setEditingContact] = useState(false)
-    const [contact, setContact] = useState<ContactForm>({
-        studentEmail: booking.student_email ?? '',
-        studentPhone: booking.student_phone ?? '',
-        parentEmail:  booking.parent_email  ?? '',
-        parentPhone:  booking.parent_phone  ?? '',
-    })
-    const [contactError, setContactError]   = useState<string | null>(null)
-    const [contactSaving, setContactSaving] = useState(false)
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [reassigning, setReassigning] = useState(false)
     const [reassignTarget, setReassignTarget] = useState<string | null>(null)
     const [editingPolicy, setEditingPolicy] = useState(false)
-    const [policy, setPolicy] = useState<OccurrencePolicyFields>(() => occurrencePolicyPayload(booking))
 
     // The roster includes archived links so existing rows can resolve their source — but an
     // archived link is never a valid target to move a booking onto.
@@ -68,20 +52,15 @@ export const useBookingActions = ({
         setReassigning(true)
     }
 
-    const openPolicy = () => {
-        setPolicy(occurrencePolicyPayload(booking))
-        setEditingPolicy(true)
-    }
-
     // Editing a virtual occurrence materializes it first (resolve_ref), so this row becomes a real
     // exception with its own terms while the rest of the series keeps the series' template.
-    const handlePolicySave = async () => {
+    const handlePolicySave = async (policy: OccurrencePolicyFields) => {
         setIsSubmitting(true)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...buildPayload(), ...policy }),
+                body: JSON.stringify({ ...bookingPayload(booking), ...policy }),
             })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to update policy'))
@@ -106,7 +85,7 @@ export const useBookingActions = ({
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...buildPayload(), booking_link_id: Number(reassignTarget) }),
+                body: JSON.stringify({ ...bookingPayload(booking), booking_link_id: Number(reassignTarget) }),
             })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to reassign booking link'))
@@ -122,24 +101,6 @@ export const useBookingActions = ({
     }
 
     const isPast = new Date(booking.start) < new Date()
-
-    const isDirty =
-        contact.studentEmail !== (booking.student_email ?? '') ||
-        contact.studentPhone !== (booking.student_phone ?? '') ||
-        contact.parentEmail  !== (booking.parent_email  ?? '') ||
-        contact.parentPhone  !== (booking.parent_phone  ?? '')
-
-    useEffect(() => {
-        if (editingContact) {
-            setContact({
-                studentEmail: booking.student_email ?? '',
-                studentPhone: booking.student_phone ?? '',
-                parentEmail:  booking.parent_email  ?? '',
-                parentPhone:  booking.parent_phone  ?? '',
-            })
-            setContactError(null)
-        }
-    }, [editingContact])
 
     const handleDelete = async () => {
         setIsSubmitting(true)
@@ -197,7 +158,7 @@ export const useBookingActions = ({
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...buildPayload(), booking_type_id: bookingTypeId }),
+                body: JSON.stringify({ ...bookingPayload(booking), booking_type_id: bookingTypeId }),
             })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to change type.'))
@@ -215,29 +176,12 @@ export const useBookingActions = ({
         }
     }
 
-    // Full-replacement PUT, so every mutable column goes on the wire — including the two FKs, which
-    // is how reassignment and reclassification work now that neither has an endpoint of its own.
-    const buildPayload = () => ({
-        booking_link_id: booking.booking_link_id,
-        booking_type_id: booking.booking_type_id,
-        ...occurrencePolicyPayload(booking),
-        // Names come off the row (immutable here); the four editable fields come off the form.
-        ...contactPayload({
-            ...booking,
-            student_email: contact.studentEmail || null,
-            student_phone: contact.studentPhone || null,
-            parent_email:  contact.parentEmail  || null,
-            parent_phone:  contact.parentPhone  || null,
-        }),
-        is_no_show: booking.is_no_show,
-    })
-
     const handleNoShow = async () => {
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ...buildPayload(), is_no_show: true }),
+                body: JSON.stringify({ ...bookingPayload(booking), is_no_show: true }),
             })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to mark as no-show.'))
@@ -247,34 +191,6 @@ export const useBookingActions = ({
         } catch (error) {
             console.error(error)
             onError('Failed to mark as no-show.')
-        }
-    }
-
-    const handleSaveContact = async () => {
-        const hasEmail = contact.studentEmail || contact.parentEmail
-        const hasPhone = contact.studentPhone || contact.parentPhone
-        if (!hasEmail || !hasPhone) {
-            setContactError('At least one email and one phone number are required.')
-            return
-        }
-        setContactSaving(true)
-        try {
-            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(buildPayload()),
-            })
-            if (!res.ok) {
-                setContactError(extractError(await res.json(), 'Failed to update contact info.'))
-                return
-            }
-            setEditingContact(false)
-            onRefresh('Contact updated')
-        } catch (error) {
-            console.error(error)
-            setContactError('Failed to update contact info.')
-        } finally {
-            setContactSaving(false)
         }
     }
 
@@ -302,12 +218,6 @@ export const useBookingActions = ({
                                 rescheduleFromId: booking.id,
                                 originalStart: booking.start,
                                 originalEnd: booking.end,
-                                studentFirst: booking.student_first,
-                                studentLast:  booking.student_last,
-                                studentEmail: booking.student_email,
-                                studentPhone: booking.student_phone,
-                                parentEmail:  booking.parent_email,
-                                parentPhone:  booking.parent_phone,
                             }
                         })
                     }}
@@ -326,12 +236,6 @@ export const useBookingActions = ({
                                     tutorId: booking.tutor_id,
                                     originalStart: booking.start,
                                     originalEnd: booking.end,
-                                    studentFirst: booking.student_first,
-                                    studentLast:  booking.student_last,
-                                    studentEmail: booking.student_email,
-                                    studentPhone: booking.student_phone,
-                                    parentEmail:  booking.parent_email,
-                                    parentPhone:  booking.parent_phone,
                                 }
                             })
                         }}
@@ -348,10 +252,7 @@ export const useBookingActions = ({
                     Reassign booking link
                 </Menu.Item>
             )}
-            <Menu.Item leftSection={<IconPencil size={14} />} disabled={booking.status !== 'confirmed'} onClick={() => setEditingContact(true)}>
-                Modify contact
-            </Menu.Item>
-            <Menu.Item leftSection={<IconShieldCog size={14} />} disabled={booking.status !== 'confirmed'} onClick={openPolicy}>
+            <Menu.Item leftSection={<IconShieldCog size={14} />} disabled={booking.status !== 'confirmed'} onClick={() => setEditingPolicy(true)}>
                 Change policy
             </Menu.Item>
             <Menu.Item leftSection={<IconUserOff size={14} />} color="orange" disabled={booking.status !== 'confirmed'} onClick={handleNoShow}>
@@ -378,12 +279,9 @@ export const useBookingActions = ({
 
     const modals = (
         <>
-            <Modal opened={reassigning} onClose={() => setReassigning(false)}
-                title="Reassign booking link" centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">
-                    This booking's link was archived, so its scheduling rules no longer apply and it can't be
-                    rescheduled. Pointing it at an active link restores that. Nothing else about the booking changes.
-                </p>
+            <AppModal opened={reassigning} onClose={() => setReassigning(false)}
+                title="Reassign booking link"
+                caption="This booking's link was archived, so its scheduling rules no longer apply and it can't be rescheduled. Pointing it at an active link restores that. Nothing else about the booking changes.">
                 <Select
                     label="Booking link"
                     placeholder="Pick an active link"
@@ -392,81 +290,48 @@ export const useBookingActions = ({
                     onChange={setReassignTarget}
                     searchable
                 />
-                <div className="flex justify-end gap-2 mt-4">
-                    <Button variant="default" onClick={() => setReassigning(false)}>Cancel</Button>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setReassigning(false)}>Cancel</Button>
                     <Button loading={isSubmitting} disabled={!reassignTarget} onClick={handleReassign}>Reassign</Button>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
 
-            <PolicyModal
+            {/* key flips on open, so the draft re-seeds off the booking and an abandoned edit
+                is discarded — without unmounting the modal mid-transition. */}
+            <BookingPolicyModal
+                key={String(editingPolicy)}
+                booking={booking}
                 opened={editingPolicy}
-                onClose={() => setEditingPolicy(false)}
-                title="Booking reschedule & cancel policy"
-                caption="Manage an attendee's permission to cancel and reschedule this booking."
                 saving={isSubmitting}
+                onClose={() => setEditingPolicy(false)}
                 onSave={handlePolicySave}
-                fields={[
-                    {
-                        label: 'Cancelling',
-                        mode: policy.cancel_mode,
-                        noticeMinutes: policy.cancel_notice_minutes,
-                        onChange: (mode, notice) => setPolicy(p => ({ ...p, cancel_mode: mode, cancel_notice_minutes: notice })),
-                    },
-                    {
-                        label: 'Rescheduling',
-                        mode: policy.reschedule_mode,
-                        noticeMinutes: policy.reschedule_notice_minutes,
-                        onChange: (mode, notice) => setPolicy(p => ({ ...p, reschedule_mode: mode, reschedule_notice_minutes: notice })),
-                    },
-                ]}
             />
 
-            <Modal opened={confirmingDelete} onClose={() => setConfirmingDelete(false)}
-                title={`Cancel ${booking.student_first}'s booking on ${formatDate(booking.start)}?`} centered size="sm">
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingDelete(false)}>Keep it</Button>
+            <AppModal opened={confirmingDelete} onClose={() => setConfirmingDelete(false)}
+                title={`Cancel ${attendeeName(booking)}'s booking on ${formatDate(booking.start)}?`}>
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setConfirmingDelete(false)}>Keep it</Button>
                     <Button color="red" loading={isSubmitting} onClick={handleDelete}>Cancel booking</Button>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
 
-            <Modal opened={confirmingPermanentDelete} onClose={() => setConfirmingPermanentDelete(false)}
-                title={`Permanently delete ${booking.student_first}'s booking?`} centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">This cannot be undone. The calendar event will also be removed.</p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingPermanentDelete(false)}>Keep it</Button>
+            <AppModal opened={confirmingPermanentDelete} onClose={() => setConfirmingPermanentDelete(false)}
+                title={`Permanently delete ${attendeeName(booking)}'s booking?`}
+                caption="This cannot be undone. The calendar event will also be removed.">
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setConfirmingPermanentDelete(false)}>Keep it</Button>
                     <Button color="red" loading={isSubmitting} onClick={() => handlePermanentDelete()}>Delete permanently</Button>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
 
-            <Modal opened={confirmingCascadeDelete} onClose={() => setConfirmingCascadeDelete(false)}
-                title="Delete entire reschedule chain?" centered size="sm">
-                <p className="text-sm text-gray-600 mb-4">
-                    This booking was created by rescheduling an earlier one. All bookings in the reschedule chain will be permanently deleted.
-                </p>
-                <div className="flex justify-end gap-2">
-                    <Button variant="default" onClick={() => setConfirmingCascadeDelete(false)}>Cancel</Button>
+            <AppModal opened={confirmingCascadeDelete} onClose={() => setConfirmingCascadeDelete(false)}
+                title="Delete entire reschedule chain?"
+                caption="This booking was created by rescheduling an earlier one. All bookings in the reschedule chain will be permanently deleted.">
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setConfirmingCascadeDelete(false)}>Cancel</Button>
                     <Button color="red" loading={isSubmitting} onClick={() => handlePermanentDelete(true)}>Delete all</Button>
-                </div>
-            </Modal>
-
-            <Modal opened={editingContact} onClose={() => setEditingContact(false)}
-                title="Modify contact info" centered size="sm">
-                <div className="flex flex-col gap-3">
-                    <TextInput label="Student email" value={contact.studentEmail}
-                        onChange={e => { setContact(c => ({ ...c, studentEmail: e.target.value })); setContactError(null) }} />
-                    <TextInput label="Student phone" value={contact.studentPhone}
-                        onChange={e => { setContact(c => ({ ...c, studentPhone: e.target.value })); setContactError(null) }} />
-                    <TextInput label="Parent email" value={contact.parentEmail}
-                        onChange={e => { setContact(c => ({ ...c, parentEmail: e.target.value })); setContactError(null) }} />
-                    <TextInput label="Parent phone" value={contact.parentPhone}
-                        onChange={e => { setContact(c => ({ ...c, parentPhone: e.target.value })); setContactError(null) }} />
-                    {contactError && <p className="text-sm text-red-500">{contactError}</p>}
-                    <div className="flex justify-end gap-2 mt-1">
-                        <Button variant="default" onClick={() => setEditingContact(false)}>Cancel</Button>
-                        <Button loading={contactSaving} disabled={!isDirty} onClick={handleSaveContact}>Save</Button>
-                    </div>
-                </div>
-            </Modal>
+                </ModalFooter>
+            </AppModal>
         </>
     )
 

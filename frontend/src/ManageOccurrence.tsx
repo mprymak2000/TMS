@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import type { Booking, BookingLink } from './types'
-import { formatDate, formatTime, extractError } from './utils'
+import { attendeeName, formatDate, formatTime, extractError } from './utils'
 
 interface LoadErrors {
     booking?: string
@@ -99,9 +99,6 @@ const ManageOccurrence = () => {
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
                 <div className="bg-white rounded-2xl shadow border border-gray-100 p-8 max-w-md w-full text-center">
-                    <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 mb-4 inline-flex items-center gap-1 transition-colors">
-                        ← My bookings
-                    </button>
                     <p className="text-gray-500">{loadErrors.booking ?? loadErrors.bookingLink}</p>
                 </div>
             </div>
@@ -125,10 +122,19 @@ const ManageOccurrence = () => {
                         </svg>
                     </div>
                     <h1 className="text-xl font-bold text-gray-900 mb-2">{msg.title}</h1>
-                    <p className="text-sm text-gray-500 mb-6">{msg.body}</p>
-                    <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 transition-colors font-medium">
-                        ← Back to my bookings
-                    </button>
+                    <p className="text-sm text-gray-500">{msg.body}</p>
+                    {/* Nothing to navigate back to — there's no customer booking list, this page is
+                        reached from a link in the calendar event. Rebooking is the only onward step
+                        worth offering, and only after a cancel: the other three still have a
+                        booking standing. */}
+                    {done === 'cancelled' && bookingLink?.status === 'active' && (
+                        <button
+                            onClick={() => navigate(`/book/${bookingLink.slug}`)}
+                            className="mt-6 text-sm text-indigo-500 hover:text-indigo-700 transition-colors font-medium"
+                        >
+                            Book another session
+                        </button>
+                    )}
                 </div>
             </div>
         )
@@ -140,10 +146,6 @@ const ManageOccurrence = () => {
         <div className="min-h-screen bg-gray-50 flex items-center justify-center p-6">
             <div className="bg-white rounded-2xl shadow border border-gray-100 p-8 max-w-md w-full">
 
-                <button onClick={() => navigate('/my-bookings')} className="text-sm text-indigo-500 hover:text-indigo-700 mb-5 inline-flex items-center gap-1 transition-colors">
-                    ← My bookings
-                </button>
-
                 <h1 className="text-xl font-bold text-gray-900 mb-1">Manage your booking</h1>
                 <p className="text-sm text-indigo-600 font-medium mb-6">{bookingLink.slug}</p>
 
@@ -151,7 +153,7 @@ const ManageOccurrence = () => {
                 <div className="bg-gray-50 rounded-xl px-5 py-4 mb-6">
                     <p className="text-sm font-semibold text-gray-900">{formatDate(booking.start)}</p>
                     <p className="text-sm text-gray-500">{formatTime(booking.start)} – {formatTime(booking.end)}</p>
-                    <p className="text-sm text-gray-400 mt-1">{booking.student_first} {booking.student_last}</p>
+                    <p className="text-sm text-gray-400 mt-1">{attendeeName(booking)}</p>
                 </div>
 
                 {booking.status !== 'confirmed' ? (
@@ -241,12 +243,6 @@ const ManageOccurrence = () => {
                                             rescheduleFromId: booking.id,
                                             originalStart: booking.start,
                                             originalEnd: booking.end,
-                                            studentFirst: booking.student_first,
-                                            studentLast: booking.student_last,
-                                            studentEmail: booking.student_email,
-                                            studentPhone: booking.student_phone,
-                                            parentEmail: booking.parent_email,
-                                            parentPhone: booking.parent_phone,
                                         }})}
                                         className="w-full py-2.5 rounded-xl border border-indigo-200 text-indigo-600 text-sm font-medium hover:bg-indigo-50 transition-colors"
                                     >
@@ -265,12 +261,6 @@ const ManageOccurrence = () => {
                                             requestRescheduleRef: ref,
                                             originalStart: booking.start,
                                             originalEnd: booking.end,
-                                            studentFirst: booking.student_first,
-                                            studentLast: booking.student_last,
-                                            studentEmail: booking.student_email,
-                                            studentPhone: booking.student_phone,
-                                            parentEmail: booking.parent_email,
-                                            parentPhone: booking.parent_phone,
                                         }})}
                                         className="w-full py-2.5 rounded-xl border border-amber-200 text-amber-700 text-sm font-medium hover:bg-amber-50 transition-colors"
                                     >

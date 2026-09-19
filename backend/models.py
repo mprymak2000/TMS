@@ -4,21 +4,72 @@ from database import Base
 from datetime import datetime, timedelta, UTC
 from uuid import uuid4
 
-class Student(Base):
-    __tablename__ = "students"
-    __table_args__ = (UniqueConstraint('first_name', 'last_name', name='uq_student_name'),)
+class Contact(Base):
+    """A person. Created by the booking that names them, never by signing up.
+
+    Everyone is here: the payer, the attendee, and the adult who is both. Guest bookings create
+    contacts like any other, which is what makes the client list complete and makes "registering"
+    later a single write rather than a string-matched backfill. Staff are NOT here. Tutor is its own
+    table with its own permission model.
+    """
+    __tablename__ = "contacts"
+    # The roster's default ordering. Without it every page of a large practice's client list does a
+    # filesort over the whole table.
+    __table_args__ = (Index("ix_contacts_name", "first_name", "last_name"),)
 
     id = Column(Integer, primary_key=True, index=True)
+    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # Nullable because a child attendee has no address of their own. Postgres and SQLite both treat
+    # NULLs as distinct under UNIQUE, so many contacts share the null without a partial index.
+    # Stored lowercased and stripped. Plus-addressing is left intact, jane+x@ is a different address.
+    email = Column(String, nullable=True, unique=True)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
+    phone = Column(String, nullable=True)
+    # Set once someone proves control of the inbox. Nothing writes it yet, auth will. Until then
+    # every contact is unverified, so the profile is last-write-wins from the newest booking.
+    verified_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Named for what the row holds, not for its class: the contact IS the student, so
+    # contact.student would read as if it were someone else. Student is slated to become Enrollment.
+    enrollment = relationship("Student", back_populates="contact", uselist=False)
+
+
+class ContactManager(Base):
+    """Who may book for whom. A link table, so two parents can share a child and one parent can have
+    several. Nobody needs a row pointing at themselves, being yourself is not a grant.
+    """
+    __tablename__ = "contact_managers"
+    __table_args__ = (
+        UniqueConstraint("manager_id", "managed_id", name="uq_contact_manager_pair"),
+        CheckConstraint("manager_id <> managed_id", name="chk_contact_manager_not_self"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    manager_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False, index=True)
+    managed_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    manager = relationship("Contact", foreign_keys=[manager_id])
+    managed = relationship("Contact", foreign_keys=[managed_id])
+
+
+class Student(Base):
+    """Enrollment, not identity: what's true of a contact because they're enrolled here. Admin-created,
+    since a guest can't supply a rate. TODO: rename to Enrollment, "student" is tutoring-specific.
+    """
+    __tablename__ = "students"
+
+    id = Column(Integer, primary_key=True, index=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, unique=True)
     rate = Column(Float, nullable=False)
     start_date = Column(Date, nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
 
+    # Here rather than on Contact because they're only ever collected for a student, never a payer.
     grade = Column(Integer, nullable=True)
     birthday = Column(Date, nullable=True)
-    email = Column(String, nullable=True)
 
+    contact = relationship("Contact", back_populates="enrollment")
     lessons = relationship("Lesson", back_populates="student")
 
 
@@ -340,18 +391,20 @@ class BookingSeries(Base):
     rescheduled_to = Column(Integer, ForeignKey("booking_series.id", ondelete="SET NULL"), nullable=True)
     google_event_id = Column(String, nullable=True) # google calendar series master event
 
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=True)
-    student_first = Column(String, nullable=False)
-    student_last = Column(String, nullable=False)
-    student_email = Column(String, nullable=True)
-    student_phone = Column(String, nullable=True)
-    parent_email = Column(String, nullable=True)
-    parent_phone = Column(String, nullable=True)
+    # Who pays and who attends. Both NOT NULL, and allowed to be the same contact: an adult booking
+    # for themselves is the row where they match, a parent booking for a child is where they differ.
+    # Facet keys, so both are indexed.
+    payer_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
+    attendee_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
+    # Template each occurrence copies, same as the policy columns above.
+    sms_opt_in = Column(Boolean, nullable=False, default=False)
+    guest_reminder_phone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="series")
     booking_link = relationship("BookingLink")
     booking_type = relationship("BookingType")
-    student_record = relationship("Student")
+    payer = relationship("Contact", foreign_keys=[payer_id])
+    attendee = relationship("Contact", foreign_keys=[attendee_id])
     bookings = relationship("Booking", back_populates="series")
     request = relationship("BookingRequest", back_populates="series", uselist=False)
     # backref: rescheduled_from_series (uselist=False) — the predecessor series that got
@@ -380,16 +433,7 @@ class BookingSeries(Base):
 
 class Booking(Base):
     __tablename__ = "bookings"
-    # below ensures on db level that at least one of student_email or parent_email is provided, and at least one of student_phone or parent_phone is provided
     __table_args__ = (
-        CheckConstraint(
-            "student_email IS NOT NULL OR parent_email IS NOT NULL",
-            name="chk_booking_email"
-        ),
-        CheckConstraint(
-            "student_phone IS NOT NULL OR parent_phone IS NOT NULL",
-            name="chk_booking_phone"
-        ),
         UniqueConstraint("series_id", "start", name="uq_booking_series_occurence"),
         CheckConstraint(f"cancel_mode IN {_ALL_MODES_SQL}", name="chk_booking_cancel_mode"),
         CheckConstraint(f"reschedule_mode IN {_ALL_MODES_SQL}", name="chk_booking_reschedule_mode"),
@@ -433,20 +477,20 @@ class Booking(Base):
     # Alternative: remove SET NULL and collect predecessors with insert(0, ...) instead of append() so the
     # list is [furthest, ..., immediate] and deletes go referencing-side first — no FK violations, no SET NULL needed.
     rescheduled_to = Column(Integer, ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True)
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=True)  # null for new one-off customers; linked when student record exists
-
-    student_first = Column(String, nullable=False)
-    student_last = Column(String, nullable=False)
-    student_email = Column(String, nullable=True)
-    student_phone = Column(String, nullable=True)
-    parent_email = Column(String, nullable=True)
-    parent_phone = Column(String, nullable=True)
+    # Same pair as BookingSeries, same rules. An occurrence copies both off its series.
+    payer_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
+    attendee_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
+    sms_opt_in = Column(Boolean, nullable=False, default=False)
+    # The phone a guest typed, frozen: unverified input shouldn't follow a later profile edit.
+    # Nulled for every booking when the contact registers, so send time reads contact.phone live.
+    guest_reminder_phone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="bookings")
     booking_link = relationship("BookingLink")
     booking_type = relationship("BookingType")
     series = relationship("BookingSeries", back_populates="bookings")
-    student_record = relationship("Student")
+    payer = relationship("Contact", foreign_keys=[payer_id])
+    attendee = relationship("Contact", foreign_keys=[attendee_id])
     lesson = relationship("Lesson", back_populates="booking", uselist=False)
     request = relationship("BookingRequest", back_populates="booking", uselist=False)
     # backref: rescheduled_from_booking (uselist=False) — the predecessor booking that got

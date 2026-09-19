@@ -1,14 +1,15 @@
 import { useState, useEffect } from 'react'
 import { useOutletContext } from 'react-router-dom'
-import { TextInput, Loader, Button, Modal, Popover } from '@mantine/core'
+import { TextInput, Loader, Button, Popover } from '@mantine/core'
+import AppModal, { ModalFooter } from './AppModal'
 import { DatePicker } from '@mantine/dates'
 import { IconSearch, IconChevronLeft, IconChevronRight } from '@tabler/icons-react'
 import type { ReactNode } from 'react'
-import type { Booking, TutorFacetOption, BookingLinkFacetOption, BookingTypeFacetOption, StudentFacetOption } from './types'
-import { extractError, formatDate, formatTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, parseLocalDateStr } from './utils'
+import type { Booking, BookingFacets } from './types'
+import { attendeeName, extractError, formatDate, formatTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, parseLocalDateStr } from './utils'
 import BookingRow from './BookingRow'
 import type { BookingsOutletContext } from './BookingsLayout'
-import { FiltersMenu, ActiveFilterChips, OrderToggle, LoadMoreSentinel, PAGE_SIZE } from './BookingToolbar'
+import { FiltersMenu, ActiveFilterChips, OrderToggle, LoadMoreSentinel, PAGE_SIZE, EMPTY_FACETS } from './BookingToolbar'
 import type { BookingFilters, LoadErrors } from './BookingToolbar'
 
 // ============================================================================
@@ -323,19 +324,14 @@ const ScopeSwitcher = ({
 // MAIN COMPONENT
 // ============================================================================
 
-const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
+const ScheduleTab = () => {
     // shared context (from BookingsLayout)
     const { tutors, bookingLinks, bookingTypes, reloadBookingTypes, isLoadingRoster, showToast } = useOutletContext<BookingsOutletContext>()
 
     // ---- STATE ----
-    const [email] = useState('')
-
     // fetched data + facet options
     const [bookings, setBookings] = useState<Booking[]>([])
-    const [tutorFacetOptions, setTutorFacetOptions] = useState<TutorFacetOption[]>([])
-    const [bookingLinkFacetOptions, setBookingLinkFacetOptions] = useState<BookingLinkFacetOption[]>([])
-    const [bookingTypeFacetOptions, setBookingTypeFacetOptions] = useState<BookingTypeFacetOption[]>([])
-    const [studentFacetOptions, setStudentFacetOptions] = useState<StudentFacetOption[]>([])
+    const [facets, setFacets] = useState<BookingFacets>(EMPTY_FACETS)
     const [loadErrors, setLoadErrors] = useState<LoadErrors>({})
     const [isLoading, setIsLoading] = useState(false)
 
@@ -349,7 +345,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     // Client side display order, does not influence backend fetch order (load more still gets future dates, despite them now being on the bottom)
     const [order, setOrder] = useState<'asc' | 'desc'>('asc')
     const [filters, setFilters] = useState<BookingFilters>(() => ({
-        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], students: [], searchQuery: '', includeCancelled: true,
+        tutorIds: [], bookingLinkIds: [], bookingTypeIds: [], attendeeIds: [], searchQuery: '', includeCancelled: true,
         ...periodBounds('week', new Date()),
     }))
 
@@ -369,12 +365,11 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         tutorIds = filters.tutorIds,
         bookingLinkIds = filters.bookingLinkIds,
         bookingTypeIds = filters.bookingTypeIds,
-        students = filters.students,
+        attendeeIds = filters.attendeeIds,
         dateFrom = filters.dateFrom,
         dateTo = filters.dateTo,
         includeCancelled = filters.includeCancelled,
         isRange = scope === 'custom',
-        emailFilter,
         cursor: cursorParam = null,
         append = false,
         silent = false,
@@ -382,12 +377,11 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         tutorIds?: string[]
         bookingLinkIds?: string[]
         bookingTypeIds?: string[]
-        students?: string[]
+        attendeeIds?: string[]
         dateFrom?: string | null
         dateTo?: string | null
         includeCancelled?: boolean
         isRange?: boolean
-        emailFilter?: string
         cursor?: string | null
         append?: boolean
         // Background revalidation after an inline edit — skips the loading flag so the list
@@ -406,19 +400,18 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         else if (!silent) setIsLoading(true)
         try {
             const base = `${import.meta.env.VITE_API_URL}/bookings/`
-            const emailParam = emailFilter ? `&email=${encodeURIComponent(emailFilter)}` : ''
             const timeMinParam = timeMin ? `&time_min=${timeMin}` : ''
             const timeMaxParam = timeMax ? `&time_max=${timeMax}` : ''
             const orderParam = `&order=${fetchOrder}`
             const tutorParams = tutorIds.map(id => `&tutor_ids=${id}`).join('')
             const bookingLinkParams = bookingLinkIds.map(id => `&booking_link_ids=${id}`).join('')
             const bookingTypeParams = bookingTypeIds.map(id => `&booking_type_ids=${id}`).join('')
-            const studentParams = students.map(pair => `&student=${encodeURIComponent(pair)}`).join('')
+            const attendeeParams = attendeeIds.map(id => `&attendee_ids=${id}`).join('')
             const includeCancelledParam = includeCancelled ? `&include_cancelled=true` : ''
             const pageSizeParam = pageSize !== undefined ? `&page_size=${pageSize}` : ''
             const cursorParamStr = cursorParam ? `&cursor=${encodeURIComponent(cursorParam)}` : ''
 
-            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${bookingLinkParams}${bookingTypeParams}${studentParams}${includeCancelledParam}${emailParam}`)
+            const response = await fetch(`${base}?${pageSizeParam}${cursorParamStr}${timeMinParam}${timeMaxParam}${orderParam}${tutorParams}${bookingLinkParams}${bookingTypeParams}${attendeeParams}${includeCancelledParam}`)
             if (!response.ok) {
                 const err = await response.json()
                 setLoadErrors(prev => ({ ...prev, bookings: extractError(err, 'Failed to load bookings.') }))
@@ -434,10 +427,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 setCursor(body.next_cursor)
             }
             // filter options
-            setTutorFacetOptions(body.facets.tutors)
-            setBookingLinkFacetOptions(body.facets.booking_links)
-            setBookingTypeFacetOptions(body.facets.booking_types)
-            setStudentFacetOptions(body.facets.students)
+            setFacets(body.facets)
             // error state cleared on success
             setLoadErrors({})
         } catch (error) {
@@ -449,15 +439,13 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         }
     }
 
-    const refresh = () => loadBookings({ emailFilter: isCustomer ? email : undefined })
+    const refresh = () => loadBookings()
 
-    const handleLoadMore = () => loadBookings({ emailFilter: isCustomer ? email : undefined, cursor, append: true })
+    const handleLoadMore = () => loadBookings({ cursor, append: true })
 
     // ---- EFFECTS ----
     useEffect(() => {
-        if (!isCustomer) { loadBookings(); return }
-        const saved = sessionStorage.getItem('customer_email')
-        if (saved) loadBookings({ emailFilter: saved })
+        loadBookings()
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
 
@@ -468,7 +456,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         // specific day lands on that day's month, not the current month.
         const bounds = periodBounds(g, periodAnchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        loadBookings({ isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
     // Called when the date-range pill's picker closes with a selection. A pick exactly matching
@@ -480,26 +468,26 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
             setScope('day')
             setPeriodAnchor(parseLocalDateStr(pickedFrom))
             setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedFrom }))
-            loadBookings({ emailFilter: isCustomer ? email : undefined, isRange: false, dateFrom: pickedFrom, dateTo: pickedFrom })
+            loadBookings({ isRange: false, dateFrom: pickedFrom, dateTo: pickedFrom })
             return
         }
         if (matchesFullWeek(pickedFrom, pickedTo)) {
             setScope('week')
             setPeriodAnchor(parseLocalDateStr(pickedFrom))
             setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedTo }))
-            loadBookings({ emailFilter: isCustomer ? email : undefined, isRange: false, dateFrom: pickedFrom, dateTo: pickedTo })
+            loadBookings({ isRange: false, dateFrom: pickedFrom, dateTo: pickedTo })
             return
         }
         if (matchesFullMonth(pickedFrom, pickedTo)) {
             setScope('month')
             setPeriodAnchor(parseLocalDateStr(pickedFrom))
             setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedTo }))
-            loadBookings({ emailFilter: isCustomer ? email : undefined, isRange: false, dateFrom: pickedFrom, dateTo: pickedTo })
+            loadBookings({ isRange: false, dateFrom: pickedFrom, dateTo: pickedTo })
             return
         }
         setScope('custom')
         setFilters(f => ({ ...f, dateFrom: pickedFrom, dateTo: pickedTo }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, isRange: true, dateFrom: pickedFrom, dateTo: pickedTo })
+        loadBookings({ isRange: true, dateFrom: pickedFrom, dateTo: pickedTo })
     }
 
     const handlePeriodShift = (direction: 1 | -1) => {
@@ -512,7 +500,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         setPeriodAnchor(nextAnchor)
         const bounds = periodBounds(scope, nextAnchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        loadBookings({ dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
     // Preserves the current Day/Week/Month scope, just re-anchored to today. Custom mode has no
@@ -525,7 +513,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         setScope(nextScope)
         const bounds = periodBounds(nextScope, anchor)
         setFilters(f => ({ ...f, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
+        loadBookings({ isRange: false, dateFrom: bounds.dateFrom, dateTo: bounds.dateTo })
     }
 
     // ---- HANDLERS: filters ----
@@ -534,31 +522,31 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
     const handleTutorFilterToggle = (id: string) => {
         const next = filters.tutorIds.includes(id) ? filters.tutorIds.filter(x => x !== id) : [...filters.tutorIds, id]
         setFilters(f => ({ ...f, tutorIds: next }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, tutorIds: next })
+        loadBookings({ tutorIds: next })
     }
 
     const handleBookingLinkFilterToggle = (id: string) => {
         const next = filters.bookingLinkIds.includes(id) ? filters.bookingLinkIds.filter(x => x !== id) : [...filters.bookingLinkIds, id]
         setFilters(f => ({ ...f, bookingLinkIds: next }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, bookingLinkIds: next })
+        loadBookings({ bookingLinkIds: next })
     }
 
     const handleBookingTypeFilterToggle = (id: string) => {
         const next = filters.bookingTypeIds.includes(id) ? filters.bookingTypeIds.filter(x => x !== id) : [...filters.bookingTypeIds, id]
         setFilters(f => ({ ...f, bookingTypeIds: next }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, bookingTypeIds: next })
+        loadBookings({ bookingTypeIds: next })
     }
 
-    const handleStudentFilterToggle = (value: string) => {
-        const next = filters.students.includes(value) ? filters.students.filter(x => x !== value) : [...filters.students, value]
-        setFilters(f => ({ ...f, students: next }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, students: next })
+    const handleAttendeeFilterToggle = (id: string) => {
+        const next = filters.attendeeIds.includes(id) ? filters.attendeeIds.filter(x => x !== id) : [...filters.attendeeIds, id]
+        setFilters(f => ({ ...f, attendeeIds: next }))
+        loadBookings({ attendeeIds: next })
     }
 
     const handleIncludeCancelledToggle = () => {
         const next = !filters.includeCancelled
         setFilters(f => ({ ...f, includeCancelled: next }))
-        loadBookings({ emailFilter: isCustomer ? email : undefined, includeCancelled: next })
+        loadBookings({ includeCancelled: next })
     }
 
     // Pure display flip — displayed() re-sorts fully every render, so no refetch needed.
@@ -602,9 +590,8 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
         const tutor = tutors.find(t => t.id === b.tutor_id)
         const bookingLink = bookingLinks.find(e => e.id === b.booking_link_id)
         return [
-            b.student_first, b.student_last,
-            b.student_email, b.student_phone,
-            b.parent_email, b.parent_phone,
+            b.attendee.first_name, b.attendee.last_name, b.attendee.email, b.attendee.phone,
+            b.payer.first_name, b.payer.last_name, b.payer.email, b.payer.phone,
             b.start.slice(0, 10),
             tutor?.first_name, tutor?.last_name,
             bookingLink?.slug,
@@ -648,18 +635,18 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     size="sm"
                                 />
                                 <FiltersMenu
-                                    tutorOptions={tutorFacetOptions.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
+                                    tutorOptions={facets.tutors.map(t => ({ value: String(t.id), label: `${t.first_name} ${t.last_name}` }))}
                                     tutorSelected={filters.tutorIds}
                                     onTutorToggle={handleTutorFilterToggle}
-                                    bookingLinkOptions={bookingLinkFacetOptions.map(e => ({ value: String(e.id), label: e.slug }))}
+                                    bookingLinkOptions={facets.booking_links.map(e => ({ value: String(e.id), label: e.slug }))}
                                     bookingLinkSelected={filters.bookingLinkIds}
                                     onBookingLinkToggle={handleBookingLinkFilterToggle}
-                                    bookingTypeOptions={bookingTypeFacetOptions.map(t => ({ value: String(t.id), label: t.label }))}
+                                    bookingTypeOptions={facets.booking_types.map(t => ({ value: String(t.id), label: t.label }))}
                                     bookingTypeSelected={filters.bookingTypeIds}
                                     onBookingTypeToggle={handleBookingTypeFilterToggle}
-                                    studentOptions={studentFacetOptions.map(s => ({ value: `${s.first_name}|${s.last_name}`, label: `${s.first_name} ${s.last_name}` }))}
-                                    studentSelected={filters.students}
-                                    onStudentToggle={handleStudentFilterToggle}
+                                    attendeeOptions={facets.attendees.map(a => ({ value: String(a.id), label: `${a.first_name} ${a.last_name}` }))}
+                                    attendeeSelected={filters.attendeeIds}
+                                    onAttendeeToggle={handleAttendeeFilterToggle}
                                     includeCancelled={filters.includeCancelled}
                                     onIncludeCancelledToggle={handleIncludeCancelledToggle}
                                 />
@@ -673,15 +660,13 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                         tutorIds={filters.tutorIds}
                         bookingLinkIds={filters.bookingLinkIds}
                         bookingTypeIds={filters.bookingTypeIds}
-                        students={filters.students}
-                        tutors={tutors}
-                        bookingLinks={bookingLinks}
-                        bookingTypes={bookingTypes}
+                        attendeeIds={filters.attendeeIds}
+                        facets={facets}
                         includeCancelled={filters.includeCancelled}
                         onTutorRemove={handleTutorFilterToggle}
                         onBookingLinkRemove={handleBookingLinkFilterToggle}
                         onBookingTypeRemove={handleBookingTypeFilterToggle}
-                        onStudentRemove={handleStudentFilterToggle}
+                        onAttendeeRemove={handleAttendeeFilterToggle}
                         onIncludeCancelledRemove={handleIncludeCancelledToggle}
                     />
                 </div>
@@ -734,7 +719,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                     // Optimistic: the row updates instantly, then a
                                                     // silent refetch reconciles the facet options.
                                                     setBookings(prev => prev.map(x => x.id === updated.id ? updated : x))
-                                                    loadBookings({ emailFilter: isCustomer ? email : undefined, silent: true })
+                                                    loadBookings({ silent: true })
                                                 }}
                                                 bookingLinks={bookingLinks}
                                                 expanded={expandedId === b.id}
@@ -742,7 +727,6 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                                 onRefresh={msg => { refresh(); showToast(msg) }}
                                                 onError={msg => showToast(msg, 'error')}
                                                 onReviewRequest={setProcessingRequest}
-                                                isCustomer={isCustomer}
                                                 compact={true}
                                             />
                                         </div>
@@ -762,13 +746,12 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                 )}
             </div>
 
-            {/* approve/deny request modal — admin only */}
-            {!isCustomer && <Modal
+            {/* approve/deny request modal */}
+            <AppModal
                 opened={processingRequest !== null}
                 onClose={() => setProcessingRequest(null)}
                 title="Review request"
-                centered
-                size="sm"
+                caption="Approve to apply the change, or deny to leave the booking as it is."
             >
                 {processingRequest && (() => {
                     const req = processingRequest.request!
@@ -777,7 +760,7 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                     return (
                         <div className="flex flex-col gap-3">
                             <div className="text-sm text-gray-700">
-                                <p><span className="text-gray-400">Student:</span> {processingRequest.student_first} {processingRequest.student_last}</p>
+                                <p><span className="text-gray-400">Attendee:</span> {attendeeName(processingRequest)}</p>
                                 <p><span className="text-gray-400">Type:</span> {req.type.replace(/_/g, ' ')}</p>
                                 <p><span className="text-gray-400">Current slot:</span> {formatDate(processingRequest.start)} · {formatTime(processingRequest.start)}</p>
                                 {isReschedule && req.requested_start && (
@@ -790,15 +773,15 @@ const ScheduleTab = ({ isCustomer = false }: { isCustomer?: boolean }) => {
                                     <p><span className="text-gray-400">Reason:</span> {req.reason}</p>
                                 )}
                             </div>
-                            <div className="flex justify-end gap-2 mt-1">
-                                <Button variant="default" disabled={isSubmitting} onClick={() => setProcessingRequest(null)}>Close</Button>
+                            <ModalFooter>
+                                <Button variant="subtle" color="gray" disabled={isSubmitting} onClick={() => setProcessingRequest(null)}>Close</Button>
                                 <Button color="red" variant="light" loading={isSubmitting} onClick={() => handleDenyRequest(req.id)}>Deny</Button>
                                 <Button color="green" loading={isSubmitting} onClick={() => handleApproveRequest(req.id)}>Approve</Button>
-                            </div>
+                            </ModalFooter>
                         </div>
                     )
                 })()}
-            </Modal>}
+            </AppModal>
         </div>
     )
 }

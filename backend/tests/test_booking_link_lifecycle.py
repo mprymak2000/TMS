@@ -194,12 +194,6 @@ def _reassign(client, booking, booking_link_id):
         "reschedule_mode": "auto",
         "booking_link_id": booking_link_id,
         "booking_type_id": booking.get("booking_type_id"),
-        "student_first": booking["student_first"],
-        "student_last": booking["student_last"],
-        "student_email": booking["student_email"],
-        "student_phone": booking["student_phone"],
-        "parent_email": booking["parent_email"],
-        "parent_phone": booking["parent_phone"],
         "is_no_show": booking["is_no_show"],
     })
 

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import outlookIcon from './assets/outlook-icon.svg'
-import { TextInput, Select, Button } from '@mantine/core'
+import { TextInput, Select, Button, Checkbox, SegmentedControl, Tooltip } from '@mantine/core'
 import type { Tutor, BookingLink, BookingLinkAvailability, AvailableSlot } from './types'
 import { useLocation, useParams } from 'react-router'
 import { extractError, formatUTCTime, addDays, startOfWeek, startOfMonth, endOfMonth, toLocalDateStr, DAY_NAMES } from './utils'
@@ -17,35 +17,61 @@ interface LoadErrors {
     unknown?: string
 }
 
+// Two roles, and forSelf is the only thing that decides whether the attendee block is sent at all.
+// Booking for yourself means OMITTING attendee — the backend then points both FKs at the payer.
+// Copying the payer's details into the attendee fields instead would create a second contact.
 interface ContactForm {
-    studentFirst: string
-    studentLast: string
-    studentEmail: string
-    studentPhone: string
-    parentEmail: string
-    parentPhone: string
+    payerFirst: string
+    payerLast: string
+    payerEmail: string
+    payerPhone: string
+    forSelf: boolean
+    attendeeFirst: string
+    attendeeLast: string
+    attendeeEmail: string
+    attendeePhone: string
+    smsOptIn: boolean
 }
 
 interface ContactFormErrors {
-    studentFirst?: string
-    studentLast?: string
-    contactEmail?: string
-    contactPhone?: string
+    payerFirst?: string
+    payerLast?: string
+    payerEmail?: string
+    attendeeFirst?: string
+    attendeeLast?: string
+    attendee?: string
 }
 
 interface ContactFormTouched {
-    studentFirst?: boolean
-    studentLast?: boolean
-    contactEmail?: boolean
-    contactPhone?: boolean
+    payerFirst?: boolean
+    payerLast?: boolean
+    payerEmail?: boolean
+    attendeeFirst?: boolean
+    attendeeLast?: boolean
 }
+
+const fold = (s: string) => s.trim().toLowerCase()
 
 const validate = (form: ContactForm): ContactFormErrors => {
     const errs: ContactFormErrors = {}
-    if (!form.studentFirst.trim()) errs.studentFirst = 'First name is required'
-    if (!form.studentLast.trim()) errs.studentLast = 'Last name is required'
-    if (!form.studentEmail.trim() && !form.parentEmail.trim()) errs.contactEmail = 'At least one email is required'
-    if (!form.studentPhone.trim() && !form.parentPhone.trim()) errs.contactPhone = 'At least one phone number is required'
+    if (!form.payerFirst.trim()) errs.payerFirst = 'First name is required'
+    if (!form.payerLast.trim()) errs.payerLast = 'Last name is required'
+    // Required outright now: the email is the key the contact is found by, not an intake rule.
+    if (!form.payerEmail.trim()) errs.payerEmail = 'Email is required'
+    if (form.forSelf) return errs
+
+    if (!form.attendeeFirst.trim()) errs.attendeeFirst = 'First name is required'
+    if (!form.attendeeLast.trim()) errs.attendeeLast = 'Last name is required'
+    // Mirrors BookingCreate.validate_attendee_distinct so the 422 never has to reach the user.
+    if (form.attendeeEmail.trim() && fold(form.attendeeEmail) === fold(form.payerEmail)) {
+        errs.attendee = 'Same email as yours — choose "Myself" instead'
+    } else if (
+        fold(form.attendeeFirst) === fold(form.payerFirst)
+        && fold(form.attendeeLast) === fold(form.payerLast)
+        && !form.attendeeEmail.trim()
+    ) {
+        errs.attendee = 'Same name as yours — choose "Myself", or add their email'
+    }
     return errs
 }
 
@@ -117,9 +143,10 @@ const BookingPage = () => {
     const [confirmingReschedule, setConfirmingReschedule] = useState(false)
     const [loading, setLoading] = useState(false)
     const [contact, setContact] = useState<ContactForm>({
-        studentFirst: '', studentLast: '',
-        studentEmail: '', studentPhone: '',
-        parentEmail: '', parentPhone: '',
+        payerFirst: '', payerLast: '', payerEmail: '', payerPhone: '',
+        forSelf: true,
+        attendeeFirst: '', attendeeLast: '', attendeeEmail: '', attendeePhone: '',
+        smsOptIn: false,
     })
     const [contactErrors, setContactErrors] = useState<ContactFormErrors>({})
     const [touched, setTouched] = useState<ContactFormTouched>({})
@@ -173,20 +200,6 @@ const BookingPage = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [tutors])
 
-    useEffect(() => {
-        if (!rescheduleFromId && !rescheduleSeriesId) return
-        setContact(contact => ({
-            ...contact,
-            studentFirst: location.state?.studentFirst ?? '',
-            studentLast: location.state?.studentLast ?? '',
-            studentEmail: location.state?.studentEmail ?? '',
-            studentPhone: location.state?.studentPhone ?? '',
-            parentEmail: location.state?.parentEmail ?? '',
-            parentPhone: location.state?.parentPhone ?? '',
-        }))
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [])
-
     const loadSlots = async () => {
         if (!bookingLink || !selectedTutorId) return
         const dateFrom = view === 'month' ? startOfMonth(currentDate) : startOfWeek(currentDate)
@@ -232,7 +245,7 @@ const BookingPage = () => {
         return acc
     }, {} as Record<string, AvailableSlot[]>)
 
-    const touchAll = () => setTouched({ studentFirst: true, studentLast: true, contactEmail: true, contactPhone: true })
+    const touchAll = () => setTouched({ payerFirst: true, payerLast: true, payerEmail: true, attendeeFirst: true, attendeeLast: true })
 
     const buildSubmitPayload = () => ({
         tutor_id: selectedSlot!.tutor_id,
@@ -242,12 +255,22 @@ const BookingPage = () => {
         timezone: timezone,
         recur_until: recurUntil || null,
         recur_count: recurCount,
-        student_first: contact.studentFirst,
-        student_last: contact.studentLast,
-        student_email: contact.studentEmail || null,
-        student_phone: contact.studentPhone || null,
-        parent_email: contact.parentEmail || null,
-        parent_phone: contact.parentPhone || null,
+        sms_opt_in: contact.smsOptIn,
+        payer: {
+            first_name: contact.payerFirst,
+            last_name: contact.payerLast,
+            email: contact.payerEmail,
+            phone: contact.payerPhone || null,
+        },
+        // Omitted, not copied, when booking for yourself — see the ContactForm comment.
+        ...(contact.forSelf ? {} : {
+            attendee: {
+                first_name: contact.attendeeFirst,
+                last_name: contact.attendeeLast,
+                email: contact.attendeeEmail || null,
+                phone: contact.attendeePhone || null,
+            },
+        }),
     })
 
     const buildReschedulePayload = () => ({
@@ -376,7 +399,12 @@ const BookingPage = () => {
 
     const resetBooking = () => {
         setStep('pick'); setSelectedSlot(null); setSelectedDate(null); setConfirmingReschedule(false);
-        setContact({ studentFirst: '', studentLast: '', studentEmail: '', studentPhone: '', parentEmail: '', parentPhone: '' })
+        setContact({
+            payerFirst: '', payerLast: '', payerEmail: '', payerPhone: '',
+            forSelf: true,
+            attendeeFirst: '', attendeeLast: '', attendeeEmail: '', attendeePhone: '',
+            smsOptIn: false,
+        })
         setContactErrors({}); setTouched({}); setSubmitError(null); setRecurUntil(null)
         setRescheduleFromId(null); setRescheduleSeriesId(null)
         setSlots([])
@@ -864,59 +892,106 @@ const BookingPage = () => {
                                     <TextInput
                                         label="First name"
                                         placeholder="First"
-                                        value={contact.studentFirst}
-                                        onChange={e => setContact(prev => ({ ...prev, studentFirst: e.target.value }))}
-                                        onBlur={() => setTouched(prev => ({ ...prev, studentFirst: true }))}
-                                        error={touched.studentFirst ? contactErrors.studentFirst : undefined}
+                                        value={contact.payerFirst}
+                                        onChange={e => setContact(prev => ({ ...prev, payerFirst: e.target.value }))}
+                                        onBlur={() => setTouched(prev => ({ ...prev, payerFirst: true }))}
+                                        error={touched.payerFirst ? contactErrors.payerFirst : undefined}
                                         className="flex-1"
                                         required
                                     />
                                     <TextInput
                                         label="Last name"
                                         placeholder="Last"
-                                        value={contact.studentLast}
-                                        onChange={e => setContact(prev => ({ ...prev, studentLast: e.target.value }))}
-                                        onBlur={() => setTouched(prev => ({ ...prev, studentLast: true }))}
-                                        error={touched.studentLast ? contactErrors.studentLast : undefined}
+                                        value={contact.payerLast}
+                                        onChange={e => setContact(prev => ({ ...prev, payerLast: e.target.value }))}
+                                        onBlur={() => setTouched(prev => ({ ...prev, payerLast: true }))}
+                                        error={touched.payerLast ? contactErrors.payerLast : undefined}
                                         className="flex-1"
                                         required
                                     />
                                 </div>
 
-                                <div className="rounded-2xl border border-gray-100 bg-gray-50 p-4 flex flex-col gap-4">
-                                    <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Student contact</p>
-                                    <TextInput
-                                        label="Email"
-                                        placeholder="student@email.com"
-                                        value={contact.studentEmail}
-                                        onChange={e => setContact(prev => ({ ...prev, studentEmail: e.target.value }))}
-                                        onBlur={() => setTouched(prev => ({ ...prev, contactEmail: true }))}
-                                        error={touched.contactEmail ? contactErrors.contactEmail : undefined}
-                                    />
-                                    <TextInput
-                                        label="Phone"
-                                        placeholder="(555) 000-0000"
-                                        value={contact.studentPhone}
-                                        onChange={e => setContact(prev => ({ ...prev, studentPhone: e.target.value }))}
-                                        onBlur={() => setTouched(prev => ({ ...prev, contactPhone: true }))}
-                                        error={touched.contactPhone ? contactErrors.contactPhone : undefined}
-                                    />
-                                </div>
+                                <TextInput
+                                    label="Email"
+                                    placeholder="you@email.com"
+                                    value={contact.payerEmail}
+                                    onChange={e => setContact(prev => ({ ...prev, payerEmail: e.target.value }))}
+                                    onBlur={() => setTouched(prev => ({ ...prev, payerEmail: true }))}
+                                    error={touched.payerEmail ? contactErrors.payerEmail : undefined}
+                                    required
+                                />
+                                <TextInput
+                                    label="Phone"
+                                    placeholder="(555) 000-0000"
+                                    value={contact.payerPhone}
+                                    onChange={e => setContact(prev => ({ ...prev, payerPhone: e.target.value }))}
+                                />
+
+                                {/* The column and the payload field are wired; the sending isn't built yet,
+                                    so the box is visible but inert rather than hidden. */}
+                                <Tooltip label="Not available yet" position="right" withArrow>
+                                    <div className="w-fit">
+                                        <Checkbox
+                                            label="Text me a reminder before the session"
+                                            checked={contact.smsOptIn}
+                                            onChange={e => setContact(prev => ({ ...prev, smsOptIn: e.currentTarget.checked }))}
+                                            disabled
+                                        />
+                                    </div>
+                                </Tooltip>
 
                                 <div className="rounded-2xl border border-gray-100 bg-gray-50 p-4 flex flex-col gap-4">
-                                    <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Parent contact <span className="normal-case font-normal text-gray-300">(optional)</span></p>
-                                    <TextInput
-                                        label="Email"
-                                        placeholder="parent@email.com"
-                                        value={contact.parentEmail}
-                                        onChange={e => setContact(prev => ({ ...prev, parentEmail: e.target.value }))}
+                                    <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Who is this session for?</p>
+                                    <SegmentedControl
+                                        fullWidth size="sm" radius="md"
+                                        value={contact.forSelf ? 'self' : 'other'}
+                                        onChange={v => setContact(prev => ({ ...prev, forSelf: v === 'self' }))}
+                                        data={[{ value: 'self', label: 'Myself' }, { value: 'other', label: 'Someone else' }]}
                                     />
-                                    <TextInput
-                                        label="Phone"
-                                        placeholder="(555) 000-0000"
-                                        value={contact.parentPhone}
-                                        onChange={e => setContact(prev => ({ ...prev, parentPhone: e.target.value }))}
-                                    />
+                                    {!contact.forSelf && (
+                                        <>
+                                            <div className="flex gap-3">
+                                                <TextInput
+                                                    label="First name"
+                                                    placeholder="First"
+                                                    value={contact.attendeeFirst}
+                                                    onChange={e => setContact(prev => ({ ...prev, attendeeFirst: e.target.value }))}
+                                                    onBlur={() => setTouched(prev => ({ ...prev, attendeeFirst: true }))}
+                                                    error={touched.attendeeFirst ? contactErrors.attendeeFirst : undefined}
+                                                    className="flex-1"
+                                                    required
+                                                />
+                                                <TextInput
+                                                    label="Last name"
+                                                    placeholder="Last"
+                                                    value={contact.attendeeLast}
+                                                    onChange={e => setContact(prev => ({ ...prev, attendeeLast: e.target.value }))}
+                                                    onBlur={() => setTouched(prev => ({ ...prev, attendeeLast: true }))}
+                                                    error={touched.attendeeLast ? contactErrors.attendeeLast : undefined}
+                                                    className="flex-1"
+                                                    required
+                                                />
+                                            </div>
+                                            {/* Optional, but it's what keys them: with an address they're found on every
+                                                future booking, without one they're matched by name under you. */}
+                                            <TextInput
+                                                label="Their email"
+                                                description="Optional, but lets us recognise them next time"
+                                                placeholder="them@email.com"
+                                                value={contact.attendeeEmail}
+                                                onChange={e => setContact(prev => ({ ...prev, attendeeEmail: e.target.value }))}
+                                            />
+                                            <TextInput
+                                                label="Their phone"
+                                                placeholder="(555) 000-0000"
+                                                value={contact.attendeePhone}
+                                                onChange={e => setContact(prev => ({ ...prev, attendeePhone: e.target.value }))}
+                                            />
+                                            {contactErrors.attendee && (
+                                                <p className="text-sm text-red-500">{contactErrors.attendee}</p>
+                                            )}
+                                        </>
+                                    )}
                                 </div>
 
                                 {bookingLink?.booker_can_set_recur_until && (

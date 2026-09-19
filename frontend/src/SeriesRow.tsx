@@ -3,11 +3,12 @@ import { Loader, Menu } from '@mantine/core'
 import { IconChevronDown, IconDotsVertical, IconCalendarStats, IconBan, IconTrash, IconArrowBackUp, IconPlus, IconMinus, IconShieldCog } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingSeries, Tutor, BookingLink, BookingType } from './types'
-import { extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf, contactPayload, occurrencePolicyPayload, seriesPolicyPayload } from './utils'
+import { attendeeName, extractError, formatDate, formatShortDate, formatTime, formatUTCTime, weekdayOf, timeOf, seriesPayload } from './utils'
 import { statusConfig } from './BookingRow'
 import { useBookingActions } from './useBookingActions'
 import BookingTypePicker from './BookingTypePicker'
-import PolicyModal from './PolicyModal'
+import { SeriesPolicyModal } from './PolicyModal'
+import type { SeriesPolicyFields } from './utils'
 
 // Fallback page size before the container has been measured (first render, pre-layout).
 const DEFAULT_PAGE_SIZE = 4
@@ -23,7 +24,6 @@ const OccurrenceCard = ({
     bookingLinks,
     expectedTutor,
     tutors,
-    isCustomer,
     isNext,
     onRefresh,
     onError,
@@ -34,13 +34,11 @@ const OccurrenceCard = ({
     bookingLinks: BookingLink[]
     expectedTutor: Tutor | undefined
     tutors: Tutor[]
-    isCustomer: boolean
     isNext: boolean
     onRefresh: (msg: string) => void
     onError: (msg: string) => void
     onBookingUpdated: (booking: Booking) => void
 }) => {
-    const navigate = useNavigate()
     const { isPast, menuItems, modals } = useBookingActions({ booking, bookingLink, bookingLinks, onRefresh, onError, onBookingUpdated })
     const cfg = statusConfig(booking, isPast)
     // Series-bound booking public_ids always encode their own start time as a trailing unix
@@ -150,26 +148,15 @@ const OccurrenceCard = ({
                 <span className={`text-xs px-2 py-0.5 rounded-full w-fit shrink-0 ${cfg.label ? cfg.chip : 'bg-emerald-50 text-emerald-600'}`}>
                     {cfg.label ?? 'Confirmed'}
                 </span>
-                {isCustomer ? (
-                    <button
-                        onClick={() => navigate(`/manage-occurrence/${booking.id}`)}
-                        className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
-                    >
-                        Manage
-                    </button>
-                ) : (
-                    <>
-                        <Menu shadow="md" width={210} position="bottom-end">
-                            <Menu.Target>
-                                <button className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors">
-                                    <IconDotsVertical size={16} />
-                                </button>
-                            </Menu.Target>
-                            <Menu.Dropdown>{menuItems}</Menu.Dropdown>
-                        </Menu>
-                        {modals}
-                    </>
-                )}
+                <Menu shadow="md" width={210} position="bottom-end">
+                    <Menu.Target>
+                        <button className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors">
+                            <IconDotsVertical size={16} />
+                        </button>
+                    </Menu.Target>
+                    <Menu.Dropdown>{menuItems}</Menu.Dropdown>
+                </Menu>
+                {modals}
             </div>
         </div>
     )
@@ -194,35 +181,24 @@ interface SeriesRowProps {
     // managing its own independent open/closed state.
     expanded: boolean
     onToggleExpand: () => void
-    isCustomer?: boolean
     includeCancelled?: boolean
 }
 
-const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBookingTypes, onSeriesUpdated, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, isCustomer = false, includeCancelled = true }: SeriesRowProps) => {
-    const bookingType = bookingTypes.find(t => t.id === series.booking_type_id)
-
+const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBookingTypes, onSeriesUpdated, bookingLinks, onRefresh, onError, onCancelSeries, onPermanentDeleteSeries, expanded, onToggleExpand, includeCancelled = true }: SeriesRowProps) => {
     // Relabelling a series carries to every occurrence, past included — the backend does the
     // cascade; picking the series is what says "all of it".
     const [editingPolicy, setEditingPolicy] = useState(false)
     const [savingPolicy, setSavingPolicy] = useState(false)
-    const [policy, setPolicy] = useState(() => ({
-        ...occurrencePolicyPayload(series), ...seriesPolicyPayload(series),
-    }))
 
     // The occurrence four are the template future occurrences copy; already-materialized ones keep
     // what they froze. The series two govern acting on the series itself.
-    const handlePolicySave = async () => {
+    const handlePolicySave = async (policy: SeriesPolicyFields) => {
         setSavingPolicy(true)
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    booking_link_id: series.booking_link_id,
-                    booking_type_id: series.booking_type_id,
-                    ...policy,
-                    ...contactPayload(series),
-                }),
+                body: JSON.stringify({ ...seriesPayload(series), ...policy }),
             })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to update policy.'))
@@ -244,13 +220,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/booking-series/${series.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    booking_link_id: series.booking_link_id,
-                    booking_type_id: bookingTypeId,
-                    ...occurrencePolicyPayload(series),
-                    ...seriesPolicyPayload(series),
-                    ...contactPayload(series),
-                }),
+                body: JSON.stringify({ ...seriesPayload(series), booking_type_id: bookingTypeId }),
             })
             if (!res.ok) {
                 onError(extractError(await res.json(), 'Failed to change type.'))
@@ -358,45 +328,25 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                     {timeStr}
                 </span>
                 <span className={`flex-1 min-w-0 truncate ml-6 text-gray-800 transition-all ${expanded ? 'text-base font-medium' : 'text-sm'}`}>
-                    {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {series.student_first} {series.student_last}
+                    {tutor ? `${tutor.first_name} ${tutor.last_name}` : '—'} · {attendeeName(series)}
                 </span>
                 {/* Kind, editable in place. Bare until the row is hovered — same treatment as a
                     booking row, except changing it here relabels every occurrence. */}
                 <span className="flex-1 min-w-0 ml-6 text-xs text-gray-500" onClick={e => e.stopPropagation()}>
-                    {isCustomer ? (
-                        bookingType && (
-                            <>
-                                <span
-                                    className="inline-block w-2 h-2 rounded-full mr-1.5 align-middle shrink-0 border border-black/5"
-                                    style={{ background: bookingType.color ?? '#d1d5db' }}
-                                />
-                                {bookingType.label}
-                            </>
-                        )
-                    ) : (
-                        <BookingTypePicker
-                            variant="inline"
-                            value={series.booking_type_id}
-                            onChange={handleReclassify}
-                            types={bookingTypes}
-                            onTypesChanged={reloadBookingTypes}
-                            onError={onError}
-                        />
-                    )}
+                    <BookingTypePicker
+                        variant="inline"
+                        value={series.booking_type_id}
+                        onChange={handleReclassify}
+                        types={bookingTypes}
+                        onTypesChanged={reloadBookingTypes}
+                        onError={onError}
+                    />
                 </span>
                 <span className="flex-1 min-w-0 truncate ml-6 text-xs text-gray-400">
                     {bookingLink?.slug}{series.until ? ` · until ${formatDate(series.until)}` : ''}
                 </span>
                 <div className={`flex items-center gap-0.5 shrink-0 ml-6 transition-opacity ${expanded ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`} onClick={e => e.stopPropagation()}>
-                    {isCustomer ? (
-                        <button
-                            onClick={() => navigate(`/manage-series/${series.id}`)}
-                            className="text-xs text-indigo-500 hover:text-indigo-700 px-2 py-1 rounded-lg hover:bg-indigo-50 transition-colors"
-                        >
-                            Manage series
-                        </button>
-                    ) : (
-                        <Menu shadow="md" width={210} position="bottom-end">
+                    <Menu shadow="md" width={210} position="bottom-end">
                             <Menu.Target>
                                 <button className="flex items-center justify-center w-7 h-7 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors">
                                     <IconDotsVertical size={16} />
@@ -411,12 +361,6 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                                             tutorId: series.tutor_id,
                                             originalDayOfWeek: weekdayOf(series.dtstart),
                                             originalStartTime: timeOf(series.dtstart),
-                                            studentFirst: series.student_first,
-                                            studentLast: series.student_last,
-                                            studentEmail: series.student_email,
-                                            studentPhone: series.student_phone,
-                                            parentEmail: series.parent_email,
-                                            parentPhone: series.parent_phone,
                                         }
                                     })}
                                 >
@@ -424,10 +368,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                                 </Menu.Item>
                                 <Menu.Item
                                     leftSection={<IconShieldCog size={14} />}
-                                    onClick={() => {
-                                        setPolicy({ ...occurrencePolicyPayload(series), ...seriesPolicyPayload(series) })
-                                        setEditingPolicy(true)
-                                    }}
+                                    onClick={() => setEditingPolicy(true)}
                                 >
                                     Change policy
                                 </Menu.Item>
@@ -447,8 +388,7 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                                     Delete permanently
                                 </Menu.Item>
                             </Menu.Dropdown>
-                        </Menu>
-                    )}
+                    </Menu>
                 </div>
             </div>
 
@@ -472,7 +412,6 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                                     bookingLinks={bookingLinks}
                                     expectedTutor={tutor}
                                     tutors={tutors}
-                                    isCustomer={isCustomer}
                                     isNext={i === 0}
                                     onRefresh={onRefresh}
                                     onError={onError}
@@ -507,23 +446,15 @@ const SeriesRow = ({ series, tutor, tutors, bookingLink, bookingTypes, reloadBoo
                 occurrences not yet materialized, so on a finite series — every occurrence created
                 up front — editing it would silently change nothing. Per-booking policy is edited on
                 a booking, with a this/following/all scope prompt (backlog). */}
-            <PolicyModal
+            {/* key flips on open, so the draft re-seeds off the series and an abandoned edit
+                is discarded — without unmounting the modal mid-transition. */}
+            <SeriesPolicyModal
+                key={String(editingPolicy)}
+                series={series}
                 opened={editingPolicy}
-                onClose={() => setEditingPolicy(false)}
-                title="Series reschedule & cancel policy"
-                caption="Manage an attendee's permission to cancel and reschedule all future bookings of the series."
                 saving={savingPolicy}
+                onClose={() => setEditingPolicy(false)}
                 onSave={handlePolicySave}
-                fields={[
-                    {
-                        label: 'Cancelling', simple: true, mode: policy.series_cancel_mode,
-                        onChange: mode => setPolicy(p => ({ ...p, series_cancel_mode: mode })),
-                    },
-                    {
-                        label: 'Rescheduling', simple: true, mode: policy.series_reschedule_mode,
-                        onChange: mode => setPolicy(p => ({ ...p, series_reschedule_mode: mode })),
-                    },
-                ]}
             />
         </div>
     )
