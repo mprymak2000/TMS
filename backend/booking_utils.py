@@ -533,6 +533,8 @@ def _virtual_occurrences(
                     public_id=public_id,
                     series_public_id=series.public_id,
                     rescheduled_to_public_id=None,
+                    created=series.created,
+                    last_modified=series.last_modified,
                     tutor_id=series.tutor_id,
                     booking_link_id=series.booking_link_id,
                     booking_type_id=series.booking_type_id,

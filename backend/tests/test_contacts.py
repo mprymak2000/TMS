@@ -326,6 +326,16 @@ def test_contact_search_matches_name_and_email(client):
     assert len(client.get("/contacts/").json()["items"]) == 2
 
 
+# Neither column holds "dana ruiz" on its own, so this only matches if the joined name is searched.
+def test_contact_search_matches_a_full_name(client):
+    client.post("/contacts/", json={"first_name": "Dana", "last_name": "Ruiz"})
+    client.post("/contacts/", json={"first_name": "Sam", "last_name": "Jones"})
+
+    assert client.get("/contacts/?search=dana%20ruiz").json()["total"] == 1
+    assert client.get("/contacts/?search=DANA%20Ruiz").json()["total"] == 1
+    assert client.get("/contacts/?search=dana%20jones").json()["total"] == 0
+
+
 # ── roster listing: paging, sorting, role counts ─────────────────────────────
 
 # total counts every match, not just the rows on this page — that's the whole reason the roster

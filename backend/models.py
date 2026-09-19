@@ -454,6 +454,9 @@ class Booking(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))  # for public-facing links
+    # Server-managed, never accepted from a request.
+    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     series_id = Column(Integer, ForeignKey("booking_series.id"), nullable=True) # for recurrent bookings (series means every wed at 5pm for 5 months)
     # Facet keys — same reasoning as BookingSeries above.
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False, index=True)

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { TextInput, Button } from '@mantine/core'
 import AppModal, { ModalFooter } from './AppModal'
 import { IconSearch, IconPencil, IconTrash, IconChevronLeft, IconChevronRight, IconArrowUp, IconArrowDown } from '@tabler/icons-react'
@@ -65,11 +66,47 @@ const Clients = () => {
     const [loadError, setLoadError] = useState<string | null>(null)
     const { toast, showToast } = useToast()
 
-    const [search, setSearch] = useState('')
-    const [debouncedSearch, setDebouncedSearch] = useState('')
-    const [sort, setSort] = useState<Sort>('name')
-    const [direction, setDirection] = useState<'asc' | 'desc'>('asc')
-    const [page, setPage] = useState(1)
+    // The query string is the source of truth for what's being viewed, so a filtered list can be
+    // linked, bookmarked and reached with the back button. Everything comes back as a string.
+    const [params, setParams] = useSearchParams()
+    const search = params.get('search') ?? ''
+    const sort = (params.get('sort') ?? 'name') as Sort
+    const direction = (params.get('direction') ?? 'asc') as 'asc' | 'desc'
+    const page = Number(params.get('page') ?? 1)
+
+    // setParams replaces the whole query string, so merge onto the previous one. An empty value is
+    // deleted rather than written, otherwise clearing the search box leaves a trailing "?search=".
+    const updateParams = (changes: Record<string, string | null>, replace = false) => {
+        setParams(prev => {
+            const next = new URLSearchParams(prev)
+            for (const [key, value] of Object.entries(changes)) {
+                if (!value) next.delete(key)
+                else next.set(key, value)
+            }
+            return next
+        }, { replace })
+    }
+
+    // The box is local so typing stays instant; the URL catches up once you pause. Without the
+    // debounce every keystroke would be a request and a history entry, and out-of-order responses
+    // could leave the list showing results for a prefix of what was typed.
+    const [searchInput, setSearchInput] = useState(search)
+    useEffect(() => {
+        if (searchInput === search) return
+        const timer = setTimeout(() => {
+            // Push, so back undoes a search. The debounce is what makes that safe: keystrokes
+            // collapse into one write per pause in typing, not one per character.
+            updateParams({ search: searchInput, page: null })
+        }, 250)
+        return () => clearTimeout(timer)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [searchInput])
+
+    // The other direction: back/forward, or opening a link with ?search= already set, moves the URL
+    // without touching the box. No loop — the debounce above bails when the two already agree.
+    useEffect(() => {
+        setSearchInput(search)
+    }, [search])
 
     // null = closed, 'new' = create, a row = edit. One modal for both, since the fields are identical.
     const [editing, setEditing] = useState<ContactListRow | 'new' | null>(null)
@@ -79,26 +116,17 @@ const Clients = () => {
     const [deleting, setDeleting] = useState<ContactListRow | null>(null)
     const [deleteError, setDeleteError] = useState<string | null>(null)
 
-    // Searching is a server round trip, so wait for a pause in typing rather than firing per keystroke.
-    useEffect(() => {
-        const timer = setTimeout(() => {
-            setDebouncedSearch(search)
-            setPage(1)   // a new search invalidates whatever page number was showing
-        }, 250)
-        return () => clearTimeout(timer)
-    }, [search])
-
     const loadContacts = async () => {
         setLoading(true)
         try {
-            const params = new URLSearchParams({
+            const query = new URLSearchParams({
                 sort,
                 direction,
                 page: String(page),
                 page_size: String(PAGE_SIZE),
             })
-            if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim())
-            const res = await fetch(`${API}/contacts/?${params}`)
+            if (search.trim()) query.set('search', search.trim())
+            const res = await fetch(`${API}/contacts/?${query}`)
             if (!res.ok) {
                 setLoadError(extractError(await res.json(), 'Failed to load clients'))
                 return
@@ -117,12 +145,16 @@ const Clients = () => {
     useEffect(() => {
         loadContacts()
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [debouncedSearch, sort, direction, page])
+    }, [search, sort, direction, page])
 
+    // Clicking the active column flips direction; a new column starts ascending. Either way the
+    // page number is dropped, since page 3 of the old ordering means nothing in the new one.
     const handleSort = (column: Sort) => {
-        if (sort === column) setDirection(d => d === 'asc' ? 'desc' : 'asc')
-        else { setSort(column); setDirection('asc') }
-        setPage(1)
+        updateParams({
+            sort: column,
+            direction: sort === column && direction === 'asc' ? 'desc' : 'asc',
+            page: null,
+        })
     }
 
     const openCreate = () => {
@@ -217,8 +249,8 @@ const Clients = () => {
                 <TextInput
                     placeholder="Search by name, email or phone..."
                     leftSection={<IconSearch size={14} />}
-                    value={search}
-                    onChange={e => setSearch(e.target.value)}
+                    value={searchInput}
+                    onChange={e => setSearchInput(e.target.value)}
                     className="w-full max-w-sm"
                 />
                 <span className="text-sm text-gray-400 shrink-0">
@@ -279,7 +311,7 @@ const Clients = () => {
                 {loading && <p className="text-sm text-gray-400 text-center py-12">Loading...</p>}
                 {!loading && contacts.length === 0 && (
                     <p className="text-sm text-gray-400 text-center py-12">
-                        {debouncedSearch ? 'No clients match that search.' : 'No clients yet.'}
+                        {search ? 'No clients match that search.' : 'No clients yet.'}
                     </p>
                 )}
 
@@ -288,14 +320,14 @@ const Clients = () => {
                         <span className="text-xs text-gray-400">Page {page} of {lastPage}</span>
                         <div className="flex gap-1">
                             <button
-                                onClick={() => setPage(p => p - 1)}
+                                onClick={() => updateParams({ page: String(page - 1) })}
                                 disabled={page === 1}
                                 className="p-1.5 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
                             >
                                 <IconChevronLeft size={16} />
                             </button>
                             <button
-                                onClick={() => setPage(p => p + 1)}
+                                onClick={() => updateParams({ page: String(page + 1) })}
                                 disabled={page >= lastPage}
                                 className="p-1.5 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 disabled:opacity-30 disabled:hover:bg-transparent transition-colors"
                             >

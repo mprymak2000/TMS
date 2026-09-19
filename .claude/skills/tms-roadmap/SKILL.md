@@ -127,7 +127,22 @@ rather than trips through the slot picker, so a retired link's rules are read by
      occurrences are many — do responses attach to the `BookingSeries` (occurrences resolve through
      it), or get copied onto each `Booking` at materialization (consistent with every other frozen
      field, but duplicated N times)? Not yet decided.
-9. **Email + auth** — last. Auth gates at the route level (protected-route wrappers), so doing
+9. **`created` / `last_modified` on `Booking`** — quick, do it first. `BookingSeries` has both;
+   `Booking` has neither, purely because they arrived with the series lifecycle pass (item 4) and
+   were never backfilled. Same declarations: `server_default=func.now()`, plus `onupdate=func.now()`
+   on `last_modified`. "When was this booked" currently has no answer except the calendar event.
+   **The second payoff is optimistic concurrency for the admin edit panel (item 12):** the panel
+   sends back the `last_modified` it loaded and the server 409s if the row moved underneath, which
+   is the clean fix for the stale-PUT hazard (a full-replacement PUT built from stale list data can
+   otherwise silently move a booking). That fix was rejected while planning the panel *only* because
+   the column didn't exist. Needs a DB wipe — no Alembic — so fold it in with the contact-split
+   reseed rather than paying for a second one.
+10. **Enrollments page** — `/clients` is contacts only by decision, so `Student` currently has no UI
+   at all (the old `/students` placeholder was removed with the customer routes). Plain CRUD over
+   `contact_id`, `rate`, `start_date`, `is_active`, `grade`, `birthday`, on a contact picker. Small
+   and self-contained. Also the natural moment to rename `Student` → `Enrollment` if that's
+   happening, since this is the first code written against it. No plan doc needed.
+11. **Email + auth** — Auth gates at the route level (protected-route wrappers), so doing
     this after the subroute split (3) means gating the final route structure once, not redoing it
     after a later refactor.
     - **Email**: build only the minimal sending capability (pick a transactional provider, a
@@ -146,6 +161,72 @@ rather than trips through the slot picker, so a retired link's rules are read by
       from client-supplied input (cursor content, query params, body fields). Came up while
       designing cursor pagination (`cursor-pagination-and-endpoint-split.md`) — an unsigned cursor
       is fine precisely because tenant scope will never be sourced from it.
+12. **Admin booking edit — pass 1: occurrences.** Plan: `.claude/plans/admin-booking-edit-pass-1-occurrences.md`. A
+    right-side detail panel on the bookings list, read-only until you hit Edit, then one Save. Backed
+    by `PUT /bookings/{ref}` (full DTO, admin only, mutates in place) alongside the existing
+    `POST /bookings/{ref}/reschedule` (saga, rules enforced, admin or customer). Quick actions become
+    narrow `PATCH /bookings/{ref}` calls. Series *occurrences* are included except the tutor field,
+    which is disabled pending the calendar bug in Known TODOs. Absorbs the policy modal, the reassign
+    modal and the expanded-row contact panel.
+13. **Admin booking edit — pass 2: series.** Plan:
+    `.claude/plans/admin-booking-edit-pass-2-series.md` — read it for the full reasoning, including
+    the unresolved `tutor_id` question that needs approval before implementation.
+
+    **Three endpoints, five entry points.** The split is mutate-vs-fork, mirroring pass 1:
+
+    | endpoint | scope | behaviour |
+    |---|---|---|
+    | `PUT /bookings/{ref}` | this occurrence | mutate in place (pass 1) |
+    | `PUT /booking-series/{id}` | whole series | mutate in place, admin only |
+    | `POST /booking-series/{id}/reschedule` | from a pivot onward | fork |
+
+    - **`PUT /booking-series/{id}`** takes metadata *and* time. A time change is a genuine mutation:
+      patch the Google **master** (which shifts every instance), mutate `dtstart`/`dtend` on the
+      series row, rewrite the occurrence rows onto the new grid — past included. Same row, same
+      `public_id`. This is Google's "all events". Reached from the series card *or* from an
+      occurrence's **all** option — same endpoint, two entry points.
+      **Today's `PUT /booking-series/{id}` is the fork**, which the API-cleanup entry already flags as
+      backwards, so pass 2 swaps the two endpoints' meanings.
+    - **`POST /booking-series/{id}/reschedule`** takes an optional **`pivot`**, defaulting to now.
+      A customer rescheduling "the series" *is* "this and following from now", so it's one operation:
+      customer → `pivot=now` with the link's rules enforced; admin "this and following" from an
+      occurrence → `pivot` = that occurrence's date, rules skipped. The rules difference is
+      authorization on one endpoint — the one legitimate case where role changes enforcement without
+      changing what the operation does. The body describes the *new* series, so metadata changes ride
+      along naturally. **New work:** `_reschedule_series` currently hard-codes the pivot at `now` —
+      CLAUDE.md states "the pivot is always `now`, never a chosen occurrence" — so it needs a pivot
+      parameter and that line needs updating.
+
+    **Occurrences already moved individually keep their times** when the series time changes — an
+    override stays overridden, matching Google. When rewriting occurrence rows onto the new grid,
+    skip any whose `google_event_id` differs from the series' (the existing `is_exception` test).
+    The panel warns: "N sessions were moved individually and will stay where they are."
+
+    **Both `all` and a past `pivot` can rewrite delivered sessions**, which may have `Lesson` rows
+    pointing at them. Warn, don't block — admin is king.
+
+    **No scope prompt for customers.** Scoped edits are admin-only precisely because admin bypasses
+    policy. A customer's "this and following" would span N bookings each with its own frozen policy
+    and notice window, some past and unconditionally blocked — every rule for resolving that is
+    arbitrary. That is exactly what the series-level policy pair
+    (`series_cancel_mode`/`series_reschedule_mode`, no notice window) exists to avoid.
+
+    **Considered and rejected: deleting `BookingSeries` entirely**, moving the recurrence columns onto
+    `Booking` as nullables and grouping by `series_id`. Appealing — one policy model, no
+    series-vs-occurrence split — but the rule is *one fact, not N*: copying `freq`/`interval`/`until`/
+    `count`/`dtstart` onto every occurrence makes a recurrence change an N-row update that can go
+    half-done, and indefinite series need a rule to generate *from* (`extend_all_series` walks series
+    rows; `available_slots.py` reads them to subtract weekly bands in `(weekday, time)` space before
+    any date resolves). Putting the rule only on the first booking makes that row a series row in
+    disguise, orphaned when it's cancelled. And the "copy Google" argument cuts the other way —
+    Google has a master event carrying the RRULE with instances generated from it, which *is* this
+    two-level model.
+
+    Still open: **C**, changing `tutor_id` on a single occurrence — see the separate bug entry in
+    Known TODOs. Google won't move one instance between calendars, so it would mean detaching the
+    occurrence into a standalone event, and a detached booking then outlives a series deletion while
+    a normal exception dies with it. Leaning toward rejecting the operation outright (400) and making
+    the admin cancel-and-rebook, which is explicit and what Google effectively forces.
 
 ## Known TODOs / Planned Work
 
@@ -188,6 +269,10 @@ Concrete bugs, missing logic, and planned improvements — not yet implemented.
 - **`Booking`/`BookingSeries` need their own name — deferred.** Bookings and series carry no name of their own today; they'd get one generated at creation from a link-supplied template (a string-builder like `{first} {last} — {duration}`), so it varies per booking rather than being a shared label. Distinct from the kind, which is a shared label pointed at by many rows and used for grouping. **Point the template at the generated name, never at the type** — templating the grouping key produces a distinct bucket per booking, fragmenting grouping by construction. Not scoped: the template syntax, which variables it exposes (student first/last, tutor, duration, date?), and how literal text between tokens is handled. Also the natural home for the iCal `summary` field (see the `BookingSeries` iCal note above).
 - ~~A booking/series blocks itself from its own reschedule slot picker~~ — **done.** `get_available_slots` takes `exclude_booking_id`/`exclude_series_id`, filtered out of both `booking_q` and the `inf_rules` query (the series case mattered more — `thin_schedule_dateless` was subtracting the whole `(weekday, time)` band before any date resolved). The endpoint accepts `exclude_ref`/`exclude_series_ref` as `public_id`s and resolves them to internal PKs, no-op'ing on an unresolvable ref so a virtual occurrence doesn't 404. `BookingPage.tsx` passes them from `location.state` on both reschedule paths. Overlapping the original slot is now allowed; rescheduling to the *identical* slot is rejected by new guards in `_reschedule_booking` (exact `start`/`end`) and `_reschedule_series` (same weekday + time-of-day + tutor, since a series' identity is its pattern, not an instant).
 - **Drop `Booking.timezone`.** It's a request-time conversion input, not state: `BookingCreate`/`BookingReschedule` use it to turn client-local into UTC, and after that nothing reads it — both display paths use the viewer's live-detected zone instead. Its only claimed future use was rendering reminder emails in the booker's zone, and that's been rejected: emails render in business time with the zone named explicitly ("4:00 PM ET"), which is unambiguous and doesn't depend on a zone captured months ago still being right. Move it to schema-only (excluded before reaching the ORM, same as `fee_override`) and drop the column. Needs a migration, so it waits on Alembic. **Not to be confused with `Schedule.timezone`, which stays** — a tutor in another zone enters availability in their own local time, and that column is the only record of which zone to convert from; its model TODO calling it redundant describes today's single-local-tutor data, not the design.
+- **BUG — rescheduling a series occurrence to a different tutor leaves the calendar event on the old tutor's calendar.** `_reschedule_booking` (`routers/bookings.py`, the `if is_series:` branch around line 537) patches the RRULE instance on `old_calendar_id`, derived from `db_booking.tutor.calendar_id` *before* the change, and never looks at the new tutor's calendar. The row gets the new `tutor_id`; Google keeps the session on the old tutor. Silent drift — no error, nothing logged. The standalone branch is correct: it inserts on `db_tutor.calendar_id` and deletes the old event.
+  **Why it isn't a one-liner.** You can't move a single RRULE instance to another calendar. The fix is: cancel the instance on the old tutor's calendar, create a *standalone* event on the new tutor's, and store that new event id — which detaches the occurrence from the series' recurring event. That's the same end state Google reaches when you drag one instance of a recurring event to another calendar, so it's the right model, but it needs `google_event_id` to stop implying "belongs to the series' RRULE" and it interacts with `_ensure_occurrence` (which copies `series.google_event_id` onto new occurrences).
+  **Found while scoping the admin edit panel**, which deliberately disables the tutor field for series occurrences rather than adding a second broken path. Fix this and the panel can enable it.
+
 - **Let an admin reopen a cancelled booking.** `reschedule_booking` (`routers/bookings.py`) requires `status == 'confirmed'`, so a cancellation is terminal for everyone — an admin can't move a booking a client cancelled by mistake, they can only create a new one, which loses the link to the original. Fix is small: allow the admin PUT to set `status` back to `'confirmed'` (customer-facing routes stay locked). It also needs the Google Calendar side undone — cancelling patches the RRULE instance to `cancelled`, so reopening has to patch it back. Cancelled staying terminal is right as the *default*; this is the admin override, same shape as every other place where admin bypasses a booker-facing rule.
 - **Adopt Alembic — no migration tool exists.** `create_all` only creates missing tables, so today every schema change is answered with `docker compose down -v && up -d`. That's fine while the only data is seed data and impossible the day someone is paying. Alembic autogenerates a migration by diffing models against the live DB, versioned and reversible. **Several backlog items already assume it exists** — the `BookingSeries.status` `NULL`→explicit backfill, `Booking.student_id`→`contact_id` `NOT NULL`, `google_event_id`→`external_event_id`. Each of those is written as "needs a real migration" with no tool to write one in. Should land before real data does, and ideally before whichever of those items goes first.
   - **Once it exists, move the Python-side column defaults to `server_default`.** `Column(..., default=...)` is applied by SQLAlchemy on ORM writes and bypassed entirely by raw SQL, so any NOT NULL column carrying one is a landmine for `initialize_database*.py`, which INSERTs directly. It has already gone off twice: `public_id` (Pass 1) and `freq`/`interval` (the recurrence pass) both left the example seed dying on a NOT NULL violation with nothing to catch it — no test covers those scripts. Current set: `bookings.public_id/timezone/status/is_no_show`, `booking_series.public_id/freq/interval`. `public_id` is the one exception worth keeping Python-side, since a series occurrence's is the composite `{series.public_id}:{ts}` rather than a bare UUID.
@@ -195,6 +280,34 @@ Concrete bugs, missing logic, and planned improvements — not yet implemented.
   - **Fold `POST /{ref}/reassign` and `POST /booking-series/{id}/reassign` into the plain-column PUTs.** Setting an FK is a column write plus a validation, not an operation — it doesn't create a resource or run a saga, so it doesn't need a verb endpoint. The rule worth holding: one PUT for plain columns; separate routes only for things that create a resource, run a saga, or carry their own policy (reschedule earns it, relabelling doesn't). Left alone in 6b because they're shipped Pass 1 surface with frontend call sites attached.
   - **`PUT /booking-series/{id}` is the reschedule saga, not a plain update** — backwards. The bare PUT on a resource should be the ordinary field update; a saga that creates a new series row with a new `public_id` should be `POST /booking-series/{id}/reschedule` (it can't be a PUT at all: a GET afterwards returns the old row, so PUT's contract is broken). Rename, and give the series a real plain-column PUT — it has none today, which is why 6b's type picker on a series row needed a route invented for it.
   - **Foreign keys on `bookings`/`booking_series` are unindexed.** Postgres auto-indexes primary keys and unique constraints but *not* FKs (MySQL does, which is where the assumption comes from). `booking_link_id` and `tutor_id` are both facet keys hit by `IN (...)` and `SELECT DISTINCT` on every list request. `booking_type_id` got `index=True` in 6b; the older two didn't and should match.
+- **RESTful endpoint cleanup on `bookings.py` — medium priority, design mostly settled, nothing implemented.** Came out of designing the admin edit panel; the routes grew one at a time and several are shaped wrong. Read this whole entry before touching any route, the pieces interact.
+
+  **The rule that decides everything below**, worked out from how Stripe/GitHub/Google actually do it:
+  1. *Does the operation create something you could `GET` afterwards?* → plural-noun sub-collection (Stripe `POST /v1/refunds`, GitHub `POST /repos/{o}/{r}/forks`).
+  2. *If not, can it be stated as "make these fields equal these values"?* → `PATCH`/`PUT`.
+  3. *Otherwise* → a verb is legitimate: a state transition with preconditions and side effects a field write can't express (Stripe `/capture`, `/finalize`, `/void`; GitHub `/merge`; Google Calendar `/move` — note `/move` stays a verb precisely because it returns the *same* event, creating nothing).
+
+  **Side effects never decide the verb.** A `PATCH` that triggers a Google Calendar write is still a `PATCH`, the same way changing a user's email sends a verification mail and stays a `PATCH`. What decides it is what happens *to the resource*.
+
+  **Decided:**
+  - `DELETE /bookings/{ref}/permanent` → `DELETE /bookings/{ref}?permanent=true`. `/permanent` is an *adjective*, not a resource — the URL reads "delete the permanent of this booking." Clearest violation, cheapest fix, do it regardless of the rest. Same for the series twin.
+  - Admin edit is `PATCH /bookings/{ref}` — it sets fields, so it earns no verb (see the admin-edit plan doc).
+  - Leave `POST /booking-request/{id}/approve|deny` alone. Approving doesn't just set a status, it *applies* the change (reschedules the booking) — a transition with side effects, which is exactly when a verb is right.
+
+  **Considered, NOT decided — the open question is whether `/reschedule` becomes `/reschedules`:**
+  - The plural noun is only honest if `GET /bookings/{ref}/reschedules` also works, otherwise the URL promises a collection you can write to but never read. GitHub's `/forks` is honest because the GET lists forks.
+  - It *would* work for us — the chain is derivable from `rescheduled_to`, so the GET returns the bookings descended from this one. That's also independently useful: the edit panel wants to show "moved from Sep 3."
+  - So: implement the GET and rename to `/reschedules`, or keep the verb and accept it's an action. Leaning toward the former, undecided.
+
+  **Considered and rejected, with reasons (don't re-litigate):**
+  - **`POST /bookings/` with `rescheduled_from: <ref>`** instead of a separate reschedule route. Most RESTful on paper — a reschedule does create a booking. Killed by: three fields (`payer`, `attendee`, `booking_link_id`) become required-unless-rescheduling; the rule swap (create runs `require_link_bookable` which rejects paused, reschedule runs `require_link_not_archived` which allows it); and fatally, **rescheduling a series occurrence creates no calendar event at all** — it patches the existing RRULE instance and reuses that instance id. So "a reschedule is a creation" isn't even true at the calendar layer. Two routes sharing helpers underneath beats one route with a mode flag.
+  - **An `is_admin` boolean on the reschedule endpoint** to skip the link's rules. Two problems: the flag would have to come from the request (there's no session yet), which is client-supplied authorization and no authorization at all; and it isn't only the *checks* that differ — admin edit mutates in place while reschedule forks a row, so the flag would branch the whole function body. **Role gates access; it must never change what an endpoint does.**
+
+  **Deferred to the auth pass, where it collapses into something better rather than being renamed twice:**
+  - The four `manage-occurrence/{ref}/*` and `manage-series/{ref}/*` routes are duplicates of the booking routes with a policy gate bolted on. But "may this caller cancel?" is an **authorization** question, not a behavioural one — so once sessions exist, `DELETE /bookings/{ref}` can serve both: admin session → allowed, capability-URL holder → policy-gated. That deletes four endpoints instead of renaming them. A guest holding an unguessable `public_id` is its own capability-auth model and doesn't need a session.
+
+  **Also worth splitting while in here:** `POST /bookings/` currently creates both standalone bookings and whole series, branching on `booking_link.recurring`. The only reason it's shared is that the caller can't choose — the link decides — but the frontend already knows (it renders the recurrence picker off that flag). Splitting out `POST /booking-series/` removes ~60 lines of series-only logic (recurrence-bound resolution, `_gen_through`, the multi-occurrence conflict loop, N-row generation) from the standalone path. Genuinely shared parts move to helpers: tutor validation, link validation, `require_link_bookable`, `require_slot_in_schedule`, contact resolution, the guest-phone freeze, the compensating delete. **Independent of the admin PATCH** — that edits one `Booking` row either way.
+
 - **Revisit the hand-rolled Google Calendar saga.** Every write path (`create_booking`, `_reschedule_booking`, `_reschedule_series`) calls Google **first**, then writes the DB, then issues a compensating delete/patch if the DB fails — and if the compensation *also* fails, logs a warning and moves on. The order isn't a preference: `Booking.google_event_id` is `NOT NULL`, so there's no row to insert until Google has answered.
   **What that invariant buys**, and it's real — a booking can never exist without a calendar event, so no row can end up permanently unreschedulable. Don't discard it casually.
   **Downsides of the current shape:**

@@ -55,6 +55,9 @@ def get_contacts(
         query = query.filter(or_(
             func.lower(Contact.first_name).like(term),
             func.lower(Contact.last_name).like(term),
+            # The joined name too, so "marcus chen" matches — neither column contains that string on
+            # its own, and typing a full name is the obvious thing to try.
+            func.lower(Contact.first_name + " " + Contact.last_name).like(term),
             func.lower(Contact.email).like(term),
             func.lower(Contact.phone).like(term),
         ))

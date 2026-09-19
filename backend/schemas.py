@@ -594,6 +594,11 @@ class BookingResponse(BaseModel):
 
     id: str = Field(validation_alias="public_id")
     series_id: str | None = Field(default=None, validation_alias="series_public_id")
+    # A virtual occurrence has no row, so it reports its series' timestamps — same as Google, where
+    # every instance inherits the master's. A materialized one reports its own, unlike Google, since
+    # we do edit individual occurrences and want to know when.
+    created: datetime
+    last_modified: datetime
     tutor_id: int
     booking_link_id: int
     booking_type_id: int | None = None
