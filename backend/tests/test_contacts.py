@@ -399,20 +399,51 @@ def test_delete_contact_with_enrollment_conflicts(client):
 
 
 def test_delete_unreferenced_contact_clears_its_links(client):
-    """The stray-duplicate cleanup: once nothing points at them, the relationship rows go too."""
+    """The stray-duplicate cleanup: once nothing points at them, the rows naming them go too.
+
+    Deletes from the managed side, since a manager can't be deleted at all (below)."""
     tutor, link = setup_standalone(client)
     _book(client, tutor, link, attendee={"first_name": "Leo", "last_name": "Ruiz"})
-
-    # Give the attendee a second manager who has no bookings, so deleting them is unblocked.
     payer_id, attendee_id = _links()[0].manager_id, _links()[0].managed_id
-    stray = client.post("/contacts/", json={"first_name": "Stray", "last_name": "Manager"}).json()
+
+    # A second dependent under the same payer, with no bookings of their own.
+    stray = client.post("/contacts/", json={"first_name": "Stray", "last_name": "Dependent"}).json()
     with TestingSessionLocal() as db:
-        db.add(ContactManager(manager_id=stray["id"], managed_id=attendee_id))
+        db.add(ContactManager(manager_id=payer_id, managed_id=stray["id"]))
         db.commit()
     assert len(_links()) == 2
 
     assert client.delete(f"/contacts/{stray['id']}").status_code == 200
     assert [(l.manager_id, l.managed_id) for l in _links()] == [(payer_id, attendee_id)]
+
+
+# A dependent left with no manager has nobody to book or bill for them — and the booking guards
+# miss it, since a monthly enrollment bills on a schedule with no booking involved.
+def test_delete_contact_who_manages_others_conflicts(client):
+    # No bookings anywhere, so this is the manager guard firing rather than the booking one.
+    payer = client.post("/contacts/", json={"first_name": "Rita", "last_name": "Alvarez"}).json()
+    dependent = client.post("/contacts/", json={"first_name": "Marcus", "last_name": "Chen"}).json()
+    with TestingSessionLocal() as db:
+        db.add(ContactManager(manager_id=payer["id"], managed_id=dependent["id"]))
+        db.commit()
+
+    response = client.delete(f"/contacts/{payer['id']}")
+    assert response.status_code == 409
+    assert "manages others" in response.json()["detail"]
+
+
+# The guard is about managing, not about being managed: a dependent is still deletable.
+def test_delete_contact_who_is_managed_is_allowed(client):
+    payer = client.post("/contacts/", json={"first_name": "Rita", "last_name": "Alvarez"}).json()
+    dependent = client.post("/contacts/", json={"first_name": "Marcus", "last_name": "Chen"}).json()
+    with TestingSessionLocal() as db:
+        db.add(ContactManager(manager_id=payer["id"], managed_id=dependent["id"]))
+        db.commit()
+
+    assert client.delete(f"/contacts/{dependent['id']}").status_code == 200
+    assert _links() == []
+    # The manager survives, and is now deletable since they manage nobody.
+    assert client.delete(f"/contacts/{payer['id']}").status_code == 200
 
 
 def test_delete_contact_not_found(client):

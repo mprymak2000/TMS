@@ -202,6 +202,15 @@ docker-compose.yml # PostgreSQL service with named volume
   - **The one status that *is* excluded is `'rescheduled'`, and not as an exemption.** When a single occurrence is individually rescheduled, the original row stays in place at its old time (soft-deleted) *and* a replacement row is inserted. Both belong to the series. Counting the original as consumed alongside its replacement would spend one slot twice, so `consumed` skips it — the slot travelled to the replacement, it wasn't forgiven. Worked example: COUNT=10, five delivered, #6 moved into the future, then the whole series is rescheduled → `consumed = 5`, so the new series gets `count = 5` (moved-#6 plus #7–10), which is exactly what's still owed.
   - **Asymmetry between the two, accepted.** An occurrence moved *past* `until` is lost when the series is rescheduled — a date has nowhere to represent it. A `count` self-heals, because a quota can. Not worth equalising: the alternatives are silently extending the promised end date, or keeping an orphan row whose calendar event was already deleted.
   - **Where the rule ends is a different question from whether the series is still running**, answered by different code. `series_last_date()` resolves the rule's own end (arithmetic off `dtstart` for `count`) and drives *generation bounds only*. "Still running" is derived from the **bookings** — `active_series_filter` / `is_series_active` — because an occurrence rescheduled past the rule's end should keep its series alive rather than stranding it. This is also why no end date is ever stored: a denormalized one goes stale the moment an occurrence moves.
+- `created`/`last_modified` are on **both** `Booking` and `BookingSeries`, server-managed
+  (`server_default=func.now()`, plus `onupdate` on the latter) and never accepted from a request —
+  they record the act of writing, not what was written, which is why updating `last_modified` on a
+  PUT doesn't break idempotency. A **virtual occurrence reports its series' values**, since it has no
+  row; a materialized one reports its own. That mirrors Google, where every instance inherits the
+  master's `created`/`updated` — verified against the live API — except that we give a materialized
+  occurrence its own, because unlike Google we edit individual occurrences and want to know when.
+  `last_modified` is also what the planned admin edit checks against for optimistic concurrency
+  (`If-Unmodified-Since` / `If-Match`, 412 on a stale write) — see the `tms-roadmap` skill.
 - Opaque ids: `Booking`/`BookingSeries` have a `public_id` (UUID) alongside their internal integer PK; API responses (`id`, `series_id`, `rescheduled_to`) expose only `public_id` — the integer PK is never serialized. For a series-bound `Booking`, `public_id` is set explicitly at creation/materialization time (not computed at read time) to the composite form `"{series.public_id}:{unix_timestamp}"`, mirroring Google Calendar's recurring-instance-id scheme (`{baseEventId}_{timestamp}`) — write-once, not recomputed on every serialize. Standalone bookings just get a plain generated UUID.
   - **How Google's recurring instances actually behave — verified empirically against the live calendar, not from the docs.** Google's reference documents `recurringEventId` and `originalStartTime` but *not* the instance id format; the published id rules (base32hex, lowercase a–v and digits) don't even permit the underscore, so the format below is an undocumented implementation detail that a probe of real data confirmed. Don't re-derive this from the docs — they'll appear to contradict it.
     - Instance id is `{masterId}_{timestampZ}`, UTC basic ISO (`..._20250526T223000Z`), or date-only for all-day events (`..._20210228`).
@@ -266,6 +275,15 @@ rates is why rate sits on the attendee rather than the payer. `Booking` points a
 `fee_override ?? (hrs × student.rate) ?? (hrs × link.price)`. Admin-created: a guest can't supply a
 rate, and `Lesson.student_id` is NOT NULL. **TODO: rename to `Enrollment`** — "student" is
 tutoring-specific in a product also meant for therapy, training and coaching.
+
+**Enrollment is not an account, and not the same as being an attendee.** `Contact.verified_at` marks
+an account; an enrollment marks a negotiated rate. All four combinations are valid, so neither may be
+made to imply the other. Separately, *attendee* is derived from bookings while *enrolled* is a row —
+a one-off consultation attendee has no enrollment, and an admin-enrolled client may have no bookings
+yet. There is no separate enrollments page: enrollment is a child of a client, edited on the client
+itself. See the `tms-roadmap` skill (item 10) — including 10b, which replaces the single `rate` float
+with mutually exclusive `rate_per_session`/`rate_per_hour`/`rate_per_month` columns and gives
+`BookingLink` the same split, at which point the resolution chain above changes.
 
 **No contact snapshot on a booking.** The six `student_*`/`parent_*` columns are gone; a booking
 reads its person through the FK. Unlike policy or `Lesson.fee`, a name or phone change is a

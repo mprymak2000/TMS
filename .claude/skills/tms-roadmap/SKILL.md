@@ -100,11 +100,10 @@ rather than trips through the slot picker, so a retired link's rules are read by
      concurrency, and neither `ON CONFLICT` nor `SELECT FOR UPDATE` works on SQLite so tests wouldn't
      cover it); renaming `Student` to `Enrollment`.
    - **Immediate follow-ons**, all small and all now unblocked:
-     - **`/clients/:id` detail page** — rows aren't clickable yet. A client accumulates bookings,
-       series, managed dependents, enrollment and (later) notes, which outgrows a table row fast.
-     - **Enrollments page** — `/clients` is contacts only, by decision. `Student` (rate, start date,
-       grade, is_active) needs its own page; the old "Students — coming soon" placeholder is gone and
-       nothing replaced that half.
+     - ~~Client detail view and an enrollments page~~ — **both folded into item 10a**, which settled
+       them differently than these two bullets assumed: the detail is a **side panel**, not a route,
+       and there is **no enrollments page** at all. Enrollment is a child of a client, edited on the
+       client's own panel, with the list filtered to Students when you want just them.
      - **Payer facet** — `apply_scope_filters` filters on `attendee_id` only, inherited from the old
        name-pair facet. With one payer covering two dependents there's no way to ask "everything this
        payer is on," which is the invoicing question. Needs a `payer_ids` param and a fifth facet
@@ -137,14 +136,162 @@ rather than trips through the slot picker, so a retired link's rules are read by
    otherwise silently move a booking). That fix was rejected while planning the panel *only* because
    the column didn't exist. Needs a DB wipe — no Alembic — so fold it in with the contact-split
    reseed rather than paying for a second one.
-10. **Enrollments page** — `/clients` is contacts only by decision, so `Student` currently has no UI
-   at all (the old `/students` placeholder was removed with the customer routes). Plain CRUD over
-   `contact_id`, `rate`, `start_date`, `is_active`, `grade`, `birthday`, on a contact picker. Small
-   and self-contained. Also the natural moment to rename `Student` → `Enrollment` if that's
-   happening, since this is the first code written against it. No plan doc needed.
+10. **`Student` → `Enrollment`, and enrollment gets a UI.** Two passes, deliberately split — see 10a
+    and 10b. They touch the same tables but answer different questions, and keeping them apart keeps
+    each commit legible.
+
+    **Settled up front, shaping both:** there is **no separate Enrollments page**, and no new sidebar
+    entry. `/clients` is the identity surface and enrollment is a *child* of a client — the
+    characteristics of an identity, not a sibling entity. You filter the client list to the subset
+    you want and edit enrollment on the client's own panel. Keeping this lightweight is an explicit
+    goal: function-rich without a page per concept.
+
+    **Three filters on `/clients`:**
+
+    | filter | means | derived from |
+    |---|---|---|
+    | **Clients** | everyone | — |
+    | **Students** | has an enrollment | join to `enrollments` |
+    | **Payers** | manages someone | `contact_managers` |
+
+    Payers comes from `contact_managers`, **not** from `bookings_as_payer` — the standing
+    relationship is more stable than a side effect of having transacted, and it doesn't need the
+    booking counts at all. These are overlapping sets, not nested: Rita manages Marcus and may have
+    no enrollment of her own, so she appears under Payers and not Students.
+
+    **Watch the conflation:** *attendee* ≠ *enrolled*. Attendee is derived from bookings
+    (`attendee_id` appears on one); enrolled means an `Enrollment` row exists. Both gaps are real and
+    deliberate — a one-off consultation attendee has no enrollment (which is what lets someone book
+    without anyone inventing a rate), and an admin-enrolled client may have no bookings yet. Don't
+    build "Students" as an attendee filter.
+
+    **One detail view, with sections that appear when they apply — not a layout per role.** Payer and
+    attendee are roles held on individual bookings, never properties of a person, so the panel shows
+    whatever is true: *Manages* (if `contact_managers` rows exist), *Enrollment* (or an Enroll
+    button), *Their sessions* (if ever an attendee), *Pays for* (if ever a payer). An adult booking
+    for themselves populates both session sections — the two are answering different questions about
+    the same rows, so nothing conflicts. Someone who booked for themselves last year and now pays for
+    their child populates all of it. This is the payoff of roles-on-the-transaction: nothing ever has
+    to decide "is this person a payer or an attendee," so the UI doesn't either.
+
+    **Account and enrollment are independent axes.** `Contact.verified_at` means "has an account";
+    an enrollment means "has a negotiated rate." All four combinations are valid and none is broken:
+    guest-who-booked-once, admin-enrolled-without-an-account (today's normal case), account-without-
+    enrollment (a payer who isn't billed a rate themselves), and both. Enrollment must not be made to
+    require auth.
+
+    - **10a — rename, client filters, client panel.** Plan:
+      `.claude/plans/enrollment-pass-10a-rename-filters-panel.md`. Four steps, in order:
+      1. **`Student` → `Enrollment`** throughout: model, schemas, router, `/students` →
+         `/enrollments`, `Lesson.student_id` → `enrollment_id`, frontend types. Cheapest now — it's
+         the first code written against it and the DB is already being wiped for the contact split.
+      2. **The three filters** on `/clients`, server-side, in the URL like search/sort/page already
+         are.
+      3. **A generic `<SidePanel>`** — header/body/footer, knowing nothing about clients. The
+         bookings panel (item 12) wants the same shell; whichever ships first provides it. It
+         **overlays** the right of the list rather than reflowing it, Cal.com-style, so the rows'
+         hover actions sit behind it and are simply unreachable while it's open — no conditional
+         rendering needed.
+      4. **Client detail content inside it** — read-only, with **Edit** flipping to a form covering
+         identity *and* enrollment together, one Save. Enrolling is "set a rate" on a client you're
+         already looking at. **This retires the current edit modal** on `/clients`; delete and enroll
+         move into the panel too.
+
+      Build the detail as a `<ClientDetail client={...} />` **component**, not as page markup — the
+      container is ~10 lines either way, so if the panel feels cramped once enrollment and
+      relationships are both in it, promote it to a `/clients/:id` route and the content moves across
+      unchanged. That route would be reachable only from the list, like `/links/:id` today, and would
+      need a back affordance the panel doesn't.
+
+      Backend CRUD already exists in `routers/students.py` with the right guards (404 on missing
+      contact, 409 on already-enrolled, 409 on delete-with-lessons), so this pass is mostly frontend
+      plus the rename.
+
+      **Keep `rate` a single float here.** 10b replaces it; doing both at once muddles the commit.
+    - **10b — billing rates.** Replaces the bare `rate` float. Design settled in conversation, not
+      built:
+
+      ```
+      enrollment:    rate_per_session  XOR  rate_per_hour  XOR  rate_per_month
+      booking_link:  price_per_session XOR  price_per_hour      (today: one `price` column)
+      ```
+
+      Mutually exclusive nullable columns with a CHECK, **the same shape as `until`/`count`** on
+      recurrence and for the same reason: they're *different facts, not two spellings of one*. An
+      hourly rate and a monthly fee aren't one number measured differently — they generate invoices
+      on different triggers. A `billing_mode` enum plus a single `rate` would also need a third state
+      for "neither", which the nullable set expresses for free.
+
+      Per-booking charge resolution:
+
+      ```
+      fee_override
+        ?? enrollment.rate_per_session
+        ?? enrollment.rate_per_hour  × hrs
+        ?? link.price_per_session
+        ?? link.price_per_hour × hrs
+      ```
+
+      **`rate_per_month` sits outside that chain entirely** — a monthly enrollment's bookings are
+      free at booking time, and the money comes from a scheduled invoice line instead.
+
+      **Name for the trigger, not the flatness.** "Flat" means two different things: flat *per
+      session* on a link (still charged at booking time, just not multiplied by hours) versus flat
+      *per month* on an enrollment (not charged at booking time at all). Three of those five columns
+      charge per booking; one doesn't.
+
+      **Invoicing: one bill per payer, one line per enrollment.** Rates live on the *attendee* —
+      siblings genuinely differ — and billing rolls up to whoever pays, using `contact_managers` to
+      find the household. This is what practice-management software does (Teachworks, TutorCruncher,
+      SimplePractice), and it's **not** Miro's seat model: seats are fungible, students aren't, so
+      `quantity × unit price` breaks the moment two children cost different amounts. Rita with two
+      children on monthly plans has two enrollments billed together, which is also how Stripe models
+      it — subscription *items* under one customer rather than a quantity.
+
+      **Deliberately out of scope:** collecting payment, proration, dunning. Cancelling a monthly
+      plan means it runs to the end of the paid period with no refund. This is invoice *generation*
+      only, which is why it's a small feature rather than a payments integration.
+
+      **Self-enrollment isn't a thing yet**, and may never be — a client can't set their own rate,
+      that's the business's call. If plans ever become customer-selectable, an account requirement
+      comes with it, because picking a plan is a commitment and you need to know who's committing.
+
+      Note `Lesson`'s fee model predates the current architecture and should be treated as legacy
+      internal tooling rather than a constraint on this design.
 11. **Email + auth** — Auth gates at the route level (protected-route wrappers), so doing
     this after the subroute split (3) means gating the final route structure once, not redoing it
     after a later refactor.
+    - **Unify human identity — before or during this pass, not after.** Today `Tutor` and `Contact`
+      are unrelated tables that happen to both store a name. That's tolerable only because tutors
+      have no email; the moment they log in, one email has to mean one identity across staff and
+      clients, and bolting a second login table on is how you end up with two sources of truth.
+      Auth is what forces it, which is why it belongs here rather than as its own pass.
+
+      Target shape — a shared identity with two sibling extensions, class-table style (each child's
+      PK **is** the parent's id, the same pattern item 10a establishes for enrollment):
+
+      ```
+      <person>     first_name, last_name, email, phone, verified_at
+      employees    <person>_id PK, pay_rate, calendar_id, is_active
+      enrollments  <person>_id PK, rate, start_date, grade, is_active
+      ```
+
+      **Name not settled** — `Person`, `Party` (the accounting term for any billable entity),
+      `Individual`. Pick before starting; it renames a lot.
+
+      **There is no `contacts` table in the middle.** Once `verified_at` moves up (staff need
+      accounts too), Contact has no columns of its own, so it collapses into a *word* for a person
+      rather than a table. Bookings' `payer_id`/`attendee_id` point at the identity table directly.
+
+      **Employees and enrollments don't overlap** — a tutor is staff and is never enrolled. They're
+      siblings, not a hierarchy, and nothing should permit both. (The owner-practitioner case is
+      an employee with `pay_rate=0`, which is already how it works.)
+
+      **Blast radius is why it isn't bundled with 10a:** every FK naming a human moves —
+      `bookings.payer_id`/`attendee_id`/`tutor_id`, `booking_series` the same, `schedules.tutor_id`,
+      `booking_link_availability.tutor_id`, `lessons.tutor_id`/`enrollment_id`. 10a's
+      `enrollments.contact_id` → `<person>_id` is a mechanical rename once this lands.
+
     - **Email**: build only the minimal sending capability (pick a transactional provider, a
       thin `send_email(to, subject, body)` wrapper) — not the full confirmation/reminder email
       *feature* (see "Background jobs" below), which is separate, larger, and not needed for

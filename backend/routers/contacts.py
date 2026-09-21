@@ -145,11 +145,12 @@ def delete_contact(contact_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=409, detail="Cannot delete a contact with existing series")
     if db.query(Student).filter(Student.contact_id == contact_id).first():
         raise HTTPException(status_code=409, detail="Cannot delete an enrolled contact")
-    # Relationship links are this contact's own rows, not a reference worth protecting. The FKs are
-    # ON DELETE CASCADE; clearing them here keeps SQLite in step with Postgres.
-    db.query(ContactManager).filter(
-        or_(ContactManager.manager_id == contact_id, ContactManager.managed_id == contact_id)
-    ).delete(synchronize_session=False)
+    # Their dependents would be left with nobody to book or bill for them. The booking guards miss
+    # this: a monthly enrollment bills on a schedule, with no booking involved.
+    if db.query(ContactManager).filter(ContactManager.manager_id == contact_id).first():
+        raise HTTPException(status_code=409, detail="Cannot delete a contact who manages others")
+    # Only "someone manages them" rows can remain. Cleared explicitly so SQLite matches Postgres.
+    db.query(ContactManager).filter(ContactManager.managed_id == contact_id).delete(synchronize_session=False)
     db.delete(db_contact)
     db.commit()
     return db_contact
