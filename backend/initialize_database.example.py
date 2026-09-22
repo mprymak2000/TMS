@@ -9,7 +9,7 @@ DB_URL = "postgresql://postgres:password@localhost:5432/tms"
 
 # Template only — replace with your real data in a local, gitignored initialize_database.py.
 # Identity and enrollment are separate rows: the name and email make a Contact, the rate and dates
-# make the Student that bills them.
+# make the Enrollment that bills them.
 students = [
     {"first_name": "Jane", "last_name": "Doe", "email": "jane.doe@example.com", "phone": "555-0100",
      "rate": 50, "start_date": "2026-01-01", "is_active": True},
@@ -28,7 +28,7 @@ cur.execute("""
         booking_requests, bookings, booking_series,
         lessons, booking_link_availability, schedule_days,
         schedules, booking_links, booking_types,
-        contact_managers, students, contacts, tutors
+        contact_managers, enrollments, contacts, tutors
     RESTART IDENTITY CASCADE;
 """)
 conn.commit()
@@ -47,15 +47,15 @@ for s in students:
         "email": s["email"],
         "phone": s["phone"],
     }).json()
-    r = requests.post(f"{API}/students", json={
-        "contact_id": contact["id"],
+    # PUT, not POST: an enrollment's id is the contact's, so the URL names it before it exists.
+    r = requests.put(f"{API}/contacts/{contact['id']}/enrollment", json={
         "rate": s["rate"],
         "start_date": s["start_date"],
         "is_active": s["is_active"],
     })
     print(r.status_code, s["first_name"], s["last_name"])
 
-print("\nAll students created\n")
+print("\nAll enrollments created\n")
 
 for t in tutors:
     r = requests.post(f"{API}/tutors", json=t)
@@ -63,7 +63,7 @@ for t in tutors:
 
 print("\nAll tutors created\n")
 
-students_response = requests.get(f"{API}/students").json()
+students_response = requests.get(f"{API}/contacts/?enrolled=true").json()["items"]
 tutors_response = requests.get(f"{API}/tutors").json()
 
 weekday_days = [
@@ -121,15 +121,15 @@ print(f"Event type created: {booking_link_standalone['slug']} (id={booking_link_
 # Python -> xlsx -> Python round trip. The real initialize_database.py still imports
 # actual historical lessons from a real xlsx, since that's a genuine one-time data
 # migration need, not something worth mirroring in a demo template).
-jane = next(s for s in students_response if s["contact"]["first_name"] == "Jane")
-john = next(s for s in students_response if s["contact"]["first_name"] == "John")
-jane_id, john_id = jane["id"], john["id"]              # enrollment ids, what Lesson points at
-jane_contact, john_contact = jane["contact_id"], john["contact_id"]  # what a Booking points at
+jane = next(c for c in students_response if c["first_name"] == "Jane")
+john = next(c for c in students_response if c["first_name"] == "John")
+# One id serves both: an enrollment's id IS the contact's, so it works for Lesson and Booking alike.
+jane_id, john_id = jane["id"], john["id"]
 tutor_id = tutors_response[0]["id"]
 
 lesson_students = [
-    {"student_id": jane_id, "day_offset": 0},  # Mondays
-    {"student_id": john_id, "day_offset": 2},  # Wednesdays
+    {"enrollment_id": jane_id, "day_offset": 0},  # Mondays
+    {"enrollment_id": john_id, "day_offset": 2},  # Wednesdays
 ]
 notes_cycle = ["Great progress", "Review session", "Quiz prep", "Homework review", ""]
 start = date(2026, 1, 5)  # first Monday of Jan 2026
@@ -141,7 +141,7 @@ for week in range(weeks):
         lesson_date = start + timedelta(weeks=week, days=s["day_offset"])
         lessons.append({
             "date": str(lesson_date),
-            "student_id": s["student_id"],
+            "enrollment_id": s["enrollment_id"],
             "tutor_id": tutor_id,
             "hrs": 1.0,
             "pay_status": True,

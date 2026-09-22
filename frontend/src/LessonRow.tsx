@@ -1,11 +1,11 @@
 import { Fragment } from 'react'
-import type { Lesson, Student, Tutor, LessonEdit } from './types'
+import type { Lesson, ContactListRow, Tutor, LessonEdit } from './types'
 import type { LessonEditErrors } from './useLessons'
 import { tutorBubbleClass, tutorInitials } from './utils'
 
 interface Props {
   lesson: Lesson
-  student: Student | undefined
+  student: ContactListRow | undefined
   tutor: Tutor | undefined
   isExpanded: boolean
   isEditing: boolean
@@ -50,7 +50,7 @@ export default function LessonRow({
             className={`h-4 w-4 rounded border-gray-300 accent-indigo-600 cursor-pointer ${selectionMode ? 'visible' : 'invisible'}`}
           />
         </td>
-        <td className="px-4 py-3 font-medium text-gray-900">{student?.contact.first_name} {student?.contact.last_name}</td>
+        <td className="px-4 py-3 font-medium text-gray-900">{student?.first_name} {student?.last_name}</td>
         <td className="px-4 py-3">
           {tutor && (
             <span className={`inline-flex items-center justify-center w-5 h-5 rounded-full text-[13px] font-black overflow-hidden pt-[0.5px] uppercase ${tutorBubbleClass(tutor)}`}>

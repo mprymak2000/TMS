@@ -13,8 +13,7 @@ export interface Contact {
 // booking and an attendee on another. 0/0 means added by hand, not yet booked.
 export interface ContactListRow extends Contact {
   created: string
-  bookings_as_payer: number
-  bookings_as_attendee: number
+  enrollment: Enrollment | null   // null for anyone not enrolled
 }
 
 // Page numbers, not a cursor: the roster is jumped around and shows a total, which is the random
@@ -24,11 +23,15 @@ export interface ContactPagedResponse {
   total: number
 }
 
-// Enrollment, not identity: what's true of a contact because they're billed here.
-export interface Student {
+export interface ContactRelationships {
+  manages: Contact[]
+  managed_by: Contact[]
+}
+
+// Enrollment, not identity: what's true of a contact because they're billed here. Its id IS the
+// contact's id — an extension of the person, never reassigned, so it has no identity of its own.
+export interface Enrollment {
   id: number
-  contact_id: number
-  contact: Contact
   rate: number
   start_date: string
   is_active: boolean
@@ -48,7 +51,7 @@ export interface Tutor {
 
 export interface Lesson {
   id: number
-  student_id: number
+  enrollment_id: number
   tutor_id: number
   date: string
   hrs: number | null

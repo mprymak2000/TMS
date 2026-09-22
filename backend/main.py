@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from database import Base, engine
-from routers import contacts, students, tutors, lessons, schedules, booking_links, booking_types, booking_link_availability, available_slots, bookings, settings  # cancellation_policies unregistered — policy fields moved onto BookingLink directly
+from routers import contacts, tutors, lessons, schedules, booking_links, booking_types, booking_link_availability, available_slots, bookings, settings  # cancellation_policies unregistered — policy fields moved onto BookingLink directly
 import models
 
 @asynccontextmanager
@@ -22,7 +22,6 @@ app.add_middleware(
 
 app.include_router(settings.router)
 app.include_router(contacts.router)
-app.include_router(students.router)
 app.include_router(tutors.router)
 app.include_router(lessons.router)
 app.include_router(schedules.router)

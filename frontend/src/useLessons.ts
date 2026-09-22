@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { Lesson, Student, Tutor, LessonEdit } from './types'
+import type { Lesson, ContactListRow, Tutor, LessonEdit } from './types'
 import { startOfWeek, toLocalDateStr, parseLocalDateStr } from './utils'
 
 export interface LessonEditErrors {
@@ -26,7 +26,7 @@ const filterLessons = (
   dateTo: string | null
 ): Lesson[] =>
   lessons.filter(lesson => {
-    if (studentId && lesson.student_id !== studentId) return false
+    if (studentId && lesson.enrollment_id !== studentId) return false
     if (tutorId && lesson.tutor_id !== tutorId) return false
     if (dateFrom && lesson.date < dateFrom) return false
     if (dateTo && lesson.date > dateTo) return false
@@ -38,7 +38,8 @@ const sortLessons = (lessons: Lesson[]): Lesson[] =>
 
 export function useLessons() {
   const [lessons, setLessons] = useState<Lesson[]>([])
-  const [students, setStudents] = useState<Record<number, Student>>({})
+  // Keyed by contact id, which is also the enrollment id — one key serves both.
+  const [students, setStudents] = useState<Record<number, ContactListRow>>({})
   const [tutors, setTutors] = useState<Record<number, Tutor>>({})
   const [reload, setReload] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -69,11 +70,11 @@ export function useLessons() {
       try {
         const [lessonsRes, studentsRes, tutorsRes] = await Promise.all([
           fetch(`${import.meta.env.VITE_API_URL}/lessons/`),
-          fetch(`${import.meta.env.VITE_API_URL}/students/`),
+          fetch(`${import.meta.env.VITE_API_URL}/contacts/?enrolled=true&page_size=200`),
           fetch(`${import.meta.env.VITE_API_URL}/tutors/`),
         ])
         setLessons(await lessonsRes.json())
-        const studentsData: Student[] = await studentsRes.json()
+        const studentsData: ContactListRow[] = (await studentsRes.json()).items
         const tutorsData: Tutor[] = await tutorsRes.json()
         setStudents(Object.fromEntries(studentsData.map(s => [s.id, s])))
         setTutors(Object.fromEntries(tutorsData.map(t => [t.id, t])))
@@ -243,7 +244,7 @@ export function useLessons() {
 
   const handleExport = () => {
     const params = new URLSearchParams()
-    if (filterStudent) params.set('student_id', filterStudent.toString())
+    if (filterStudent) params.set('enrollment_id', filterStudent.toString())
     if (filterTutor) params.set('tutor_id', filterTutor.toString())
     if (filterDateFrom) params.set('date_from', filterDateFrom)
     if (filterDateTo) params.set('date_to', filterDateTo)

@@ -1,36 +1,27 @@
 import { useState, useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { TextInput, Button } from '@mantine/core'
+import { TextInput, Button, Checkbox } from '@mantine/core'
 import AppModal, { ModalFooter } from './AppModal'
-import { IconSearch, IconPencil, IconTrash, IconChevronLeft, IconChevronRight, IconArrowUp, IconArrowDown } from '@tabler/icons-react'
+import { IconSearch, IconChevronLeft, IconChevronRight, IconArrowUp, IconArrowDown } from '@tabler/icons-react'
 import type { ContactListRow, ContactPagedResponse } from './types'
 import { extractError } from './utils'
 import Toast from './Toast'
 import { useToast } from './useToast'
+import SidePanel from './SidePanel'
+import ClientDetail from './ClientDetail'
 
 const API = import.meta.env.VITE_API_URL
 const PAGE_SIZE = 50
 
 type Sort = 'name' | 'email' | 'created'
 
-// Roles are derived from the bookings, never stored — the same person is a payer on one booking and
-// an attendee on another, so both can show at once. Neither showing means they were added by hand
-// and haven't booked yet, which is a normal state rather than a gap.
-const RoleBadges = ({ c }: { c: ContactListRow }) => {
-    if (!c.bookings_as_payer && !c.bookings_as_attendee)
-        return <span className="text-xs text-gray-300">—</span>
+// Enrollment is what the roster shows about a person beyond identity: the rate, and whether they're
+// still active. Roles (payer / attendee) live on bookings, not here — the filters answer those.
+const EnrollmentCell = ({ e }: { e: ContactListRow['enrollment'] }) => {
+    if (!e) return <span className="text-xs text-gray-300">—</span>
     return (
-        <span className="flex gap-1.5">
-            {c.bookings_as_attendee > 0 && (
-                <span className="text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full">
-                    Attendee · {c.bookings_as_attendee}
-                </span>
-            )}
-            {c.bookings_as_payer > 0 && (
-                <span className="text-xs bg-emerald-50 text-emerald-600 px-2 py-0.5 rounded-full">
-                    Payer · {c.bookings_as_payer}
-                </span>
-            )}
+        <span className={`text-xs ${e.is_active ? 'text-gray-700' : 'text-gray-400'}`}>
+            ${e.rate}/hr{!e.is_active && ' · Inactive'}
         </span>
     )
 }
@@ -73,6 +64,9 @@ const Clients = () => {
     const sort = (params.get('sort') ?? 'name') as Sort
     const direction = (params.get('direction') ?? 'asc') as 'asc' | 'desc'
     const page = Number(params.get('page') ?? 1)
+    // Two independent booleans, not one mode: a payer can also be enrolled, and ticking both finds them.
+    const enrolled = params.get('enrolled') === 'true'
+    const manages = params.get('manages') === 'true'
 
     // setParams replaces the whole query string, so merge onto the previous one. An empty value is
     // deleted rather than written, otherwise clearing the search box leaves a trailing "?search=".
@@ -108,13 +102,30 @@ const Clients = () => {
         setSearchInput(search)
     }, [search])
 
-    // null = closed, 'new' = create, a row = edit. One modal for both, since the fields are identical.
-    const [editing, setEditing] = useState<ContactListRow | 'new' | null>(null)
+    // Create is a modal; everything about an existing client happens in the side panel.
+    const [creating, setCreating] = useState(false)
     const [form, setForm] = useState<ContactForm>(EMPTY_FORM)
     const [formError, setFormError] = useState<string | null>(null)
     const [saving, setSaving] = useState(false)
-    const [deleting, setDeleting] = useState<ContactListRow | null>(null)
-    const [deleteError, setDeleteError] = useState<string | null>(null)
+
+    // The panel holds its own row rather than looking one up in the list: a hop to a related
+    // person can land on someone who isn't on the current page.
+    const [selected, setSelected] = useState<ContactListRow | null>(null)
+    const [confirming, setConfirming] = useState<'delete' | 'unenroll' | null>(null)
+    const [confirmError, setConfirmError] = useState<string | null>(null)
+
+    const selectById = async (id: number) => {
+        const onPage = contacts.find(c => c.id === id)
+        if (onPage) { setSelected(onPage); return }
+        const res = await fetch(`${API}/contacts/${id}`)
+        if (res.ok) setSelected(await res.json())
+    }
+
+    // Our own writes are the only thing that changes a row, so update both places we hold it.
+    const patchRow = (updated: ContactListRow) => {
+        setContacts(prev => prev.map(c => (c.id === updated.id ? updated : c)))
+        setSelected(updated)
+    }
 
     const loadContacts = async () => {
         setLoading(true)
@@ -126,6 +137,8 @@ const Clients = () => {
                 page_size: String(PAGE_SIZE),
             })
             if (search.trim()) query.set('search', search.trim())
+            if (enrolled) query.set('enrolled', 'true')
+            if (manages) query.set('manages', 'true')
             const res = await fetch(`${API}/contacts/?${query}`)
             if (!res.ok) {
                 setLoadError(extractError(await res.json(), 'Failed to load clients'))
@@ -145,7 +158,11 @@ const Clients = () => {
     useEffect(() => {
         loadContacts()
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [search, sort, direction, page])
+    }, [search, sort, direction, page, enrolled, manages])
+
+    // Flipping a filter drops the page: page 3 of one set means nothing in another.
+    const toggleFilter = (key: 'enrolled' | 'manages', on: boolean) =>
+        updateParams({ [key]: on ? 'true' : null, page: null })
 
     // Clicking the active column flips direction; a new column starts ascending. Either way the
     // page number is dropped, since page 3 of the old ordering means nothing in the new one.
@@ -160,47 +177,32 @@ const Clients = () => {
     const openCreate = () => {
         setForm(EMPTY_FORM)
         setFormError(null)
-        setEditing('new')
+        setCreating(true)
     }
 
-    const openEdit = (c: ContactListRow) => {
-        setForm({
-            first_name: c.first_name,
-            last_name: c.last_name,
-            email: c.email ?? '',
-            phone: c.phone ?? '',
-        })
-        setFormError(null)
-        setEditing(c)
-    }
-
-    const handleSave = async () => {
+    const handleCreate = async () => {
         if (!form.first_name.trim() || !form.last_name.trim()) {
             setFormError('First and last name are required.')
             return
         }
         setSaving(true)
         try {
-            const isNew = editing === 'new'
-            const res = await fetch(
-                isNew ? `${API}/contacts/` : `${API}/contacts/${(editing as ContactListRow).id}`,
-                {
-                    method: isNew ? 'POST' : 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        first_name: form.first_name.trim(),
-                        last_name: form.last_name.trim(),
-                        email: form.email.trim() || null,
-                        phone: form.phone.trim() || null,
-                    }),
-                },
-            )
+            const res = await fetch(`${API}/contacts/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    first_name: form.first_name.trim(),
+                    last_name: form.last_name.trim(),
+                    email: form.email.trim() || null,
+                    phone: form.phone.trim() || null,
+                }),
+            })
             if (!res.ok) {
                 setFormError(extractError(await res.json(), 'Failed to save client'))
                 return
             }
-            setEditing(null)
-            showToast(isNew ? 'Client added' : 'Client updated')
+            setCreating(false)
+            showToast('Client added')
             loadContacts()
         } catch {
             setFormError('An unknown error occurred while saving.')
@@ -209,22 +211,31 @@ const Clients = () => {
         }
     }
 
-    // Restricted server-side while any booking, series or enrollment points here, so a 409 is the
-    // expected answer rather than an edge case — surface its message instead of a generic failure.
-    const handleDelete = async () => {
-        if (!deleting) return
+    // Both restricted server-side (bookings, lessons, dependents), so a 409 is the expected answer
+    // rather than an edge case — surface its message instead of a generic failure.
+    const handleConfirm = async () => {
+        if (!selected || !confirming) return
         setSaving(true)
         try {
-            const res = await fetch(`${API}/contacts/${deleting.id}`, { method: 'DELETE' })
+            const url = confirming === 'delete'
+                ? `${API}/contacts/${selected.id}`
+                : `${API}/contacts/${selected.id}/enrollment`
+            const res = await fetch(url, { method: 'DELETE' })
             if (!res.ok) {
-                setDeleteError(extractError(await res.json(), 'Failed to delete client'))
+                setConfirmError(extractError(await res.json(), 'Failed to delete'))
                 return
             }
-            setDeleting(null)
-            showToast('Client deleted')
-            loadContacts()
+            setConfirming(null)
+            if (confirming === 'delete') {
+                setSelected(null)
+                showToast('Client deleted')
+                loadContacts()
+            } else {
+                patchRow({ ...selected, enrollment: null })
+                showToast('Enrollment removed')
+            }
         } catch {
-            setDeleteError('An unknown error occurred while deleting.')
+            setConfirmError('An unknown error occurred while deleting.')
         } finally {
             setSaving(false)
         }
@@ -246,13 +257,17 @@ const Clients = () => {
             </div>
 
             <div className="flex items-center justify-between mb-4 gap-4">
-                <TextInput
-                    placeholder="Search by name, email or phone..."
-                    leftSection={<IconSearch size={14} />}
-                    value={searchInput}
-                    onChange={e => setSearchInput(e.target.value)}
-                    className="w-full max-w-sm"
-                />
+                <div className="flex items-center gap-4">
+                    <TextInput
+                        placeholder="Search by name, email or phone..."
+                        leftSection={<IconSearch size={14} />}
+                        value={searchInput}
+                        onChange={e => setSearchInput(e.target.value)}
+                        className="w-80"
+                    />
+                    <Checkbox label="Enrolled" checked={enrolled} onChange={e => toggleFilter('enrolled', e.currentTarget.checked)} />
+                    <Checkbox label="Manages someone" checked={manages} onChange={e => toggleFilter('manages', e.currentTarget.checked)} />
+                </div>
                 <span className="text-sm text-gray-400 shrink-0">
                     {total} {total === 1 ? 'client' : 'clients'}
                 </span>
@@ -267,14 +282,17 @@ const Clients = () => {
                             <SortableHeader label="Name" column="name" sort={sort} direction={direction} onSort={handleSort} />
                             <SortableHeader label="Email" column="email" sort={sort} direction={direction} onSort={handleSort} />
                             <th className="px-5 py-3 font-medium">Phone</th>
-                            <th className="px-5 py-3 font-medium">Bookings</th>
+                            <th className="px-5 py-3 font-medium">Enrollment</th>
                             <SortableHeader label="Added" column="created" sort={sort} direction={direction} onSort={handleSort} />
-                            <th className="px-5 py-3" />
                         </tr>
                     </thead>
                     <tbody>
                         {contacts.map(c => (
-                            <tr key={c.id} className="group border-b border-gray-50 last:border-0 hover:bg-gray-50/60">
+                            <tr
+                                key={c.id}
+                                onClick={() => setSelected(c)}
+                                className={`border-b border-gray-50 last:border-0 cursor-pointer transition-colors ${c.id === selected?.id ? 'bg-indigo-50/60' : 'hover:bg-gray-50/60'}`}
+                            >
                                 <td className="px-5 py-3 font-medium text-gray-800">
                                     {c.first_name} {c.last_name}
                                     {c.verified_at && (
@@ -283,25 +301,9 @@ const Clients = () => {
                                 </td>
                                 <td className="px-5 py-3 text-gray-600">{c.email ?? <span className="text-gray-300">—</span>}</td>
                                 <td className="px-5 py-3 text-gray-600">{c.phone ?? <span className="text-gray-300">—</span>}</td>
-                                <td className="px-5 py-3"><RoleBadges c={c} /></td>
+                                <td className="px-5 py-3"><EnrollmentCell e={c.enrollment} /></td>
                                 <td className="px-5 py-3 text-gray-400 text-xs">
                                     {new Date(c.created).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
-                                </td>
-                                <td className="px-5 py-3 text-right">
-                                    <div className="flex justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                        <button
-                                            onClick={() => openEdit(c)}
-                                            className="p-1.5 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors"
-                                        >
-                                            <IconPencil size={15} />
-                                        </button>
-                                        <button
-                                            onClick={() => { setDeleteError(null); setDeleting(c) }}
-                                            className="p-1.5 rounded-md text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors"
-                                        >
-                                            <IconTrash size={15} />
-                                        </button>
-                                    </div>
                                 </td>
                             </tr>
                         ))}
@@ -338,13 +340,33 @@ const Clients = () => {
                 )}
             </div>
 
+            <SidePanel
+                open={selected !== null}
+                onClose={() => setSelected(null)}
+                title={selected && (
+                    <h2 className="text-lg font-semibold text-gray-900 truncate">
+                        {selected.first_name} {selected.last_name}
+                    </h2>
+                )}
+            >
+                {/* Keyed so switching rows remounts the form instead of carrying a draft over. */}
+                {selected && (
+                    <ClientDetail
+                        key={selected.id}
+                        client={selected}
+                        onSaved={updated => { patchRow(updated); showToast('Client updated') }}
+                        onSelect={selectById}
+                        onDelete={() => { setConfirmError(null); setConfirming('delete') }}
+                        onRemoveEnrollment={() => { setConfirmError(null); setConfirming('unenroll') }}
+                    />
+                )}
+            </SidePanel>
+
             <AppModal
-                opened={editing !== null}
-                onClose={() => setEditing(null)}
-                title={editing === 'new' ? 'Add client' : 'Edit client'}
-                caption={editing === 'new'
-                    ? 'Only needed for someone who hasn\'t booked — a booking creates its own client.'
-                    : 'Corrections reach every booking this person is on, past included.'}
+                opened={creating}
+                onClose={() => setCreating(false)}
+                title="Add client"
+                caption="Only needed for someone who hasn't booked — a booking creates its own client."
             >
                 {/* Paired two-up: a name or a phone number is short, and a full-bleed input across
                     the whole dialog reads as a text area rather than a field. */}
@@ -374,21 +396,27 @@ const Clients = () => {
                 </div>
                 {formError && <p className="text-sm text-red-500 mt-5">{formError}</p>}
                 <ModalFooter>
-                    <Button variant="subtle" color="gray" onClick={() => setEditing(null)}>Cancel</Button>
-                    <Button loading={saving} onClick={handleSave}>Save</Button>
+                    <Button variant="subtle" color="gray" onClick={() => setCreating(false)}>Cancel</Button>
+                    <Button loading={saving} onClick={handleCreate}>Save</Button>
                 </ModalFooter>
             </AppModal>
 
             <AppModal
-                opened={deleting !== null}
-                onClose={() => setDeleting(null)}
-                title={deleting ? `Delete ${deleting.first_name} ${deleting.last_name}?` : ''}
-                caption="This can't be undone. A client with bookings or an enrollment can't be deleted — repoint those first, or leave the row in place."
+                opened={confirming !== null}
+                onClose={() => setConfirming(null)}
+                title={!selected ? '' : confirming === 'delete'
+                    ? `Delete ${selected.first_name} ${selected.last_name}?`
+                    : `Remove ${selected.first_name}'s enrollment?`}
+                caption={confirming === 'delete'
+                    ? 'This can\'t be undone. A client with bookings, lessons or dependents can\'t be deleted — repoint those first, or leave the row in place.'
+                    : 'This throws away their rate, start date and grade. If they just stopped coming, mark the enrollment inactive instead.'}
             >
-                {deleteError && <p className="text-sm text-red-500 mb-3">{deleteError}</p>}
+                {confirmError && <p className="text-sm text-red-500 mb-3">{confirmError}</p>}
                 <ModalFooter>
-                    <Button variant="subtle" color="gray" onClick={() => setDeleting(null)}>Keep</Button>
-                    <Button color="red" loading={saving} onClick={handleDelete}>Delete</Button>
+                    <Button variant="subtle" color="gray" onClick={() => setConfirming(null)}>Keep</Button>
+                    <Button color="red" loading={saving} onClick={handleConfirm}>
+                        {confirming === 'delete' ? 'Delete' : 'Remove'}
+                    </Button>
                 </ModalFooter>
             </AppModal>
 

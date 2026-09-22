@@ -50,33 +50,30 @@ def client():
 
 @pytest.fixture
 def setup(client):
-    # Identity first, then enrollment: a Student is a billing relationship on a Contact, not a person.
+    # Identity first, then enrollment: enrollment is a rate on a contact, not a person of its own.
     contact = client.post("/contacts/", json={
         "first_name": "Student",
         "last_name": "Test",
         "email": "student@example.com",
     }).json()
-    student_test = {
-        "contact_id": contact["id"],
+    enrollment = client.put(f"/contacts/{contact['id']}/enrollment", json={
         "rate": 50,
         "start_date": "2026-01-01",
-        "is_active": True
-    }
-    tutor_test = {
+        "is_active": True,
+    }).json()
+    tutor = client.post("/tutors/", json={
         "first_name": "Tutor",
         "last_name": "Test",
-        "pay_rate": 30
-        }
-    student = client.post("/students/", json=student_test).json()
-    tutor = client.post("/tutors/", json=tutor_test).json()
+        "pay_rate": 30,
+    }).json()
     lesson = {
-        "student_id": student["id"],
+        "enrollment_id": enrollment["id"],
         "tutor_id": tutor["id"],
         "date": "2024-01-01"
     }
-    return student, tutor, lesson
+    return enrollment, tutor, lesson
 
 @pytest.fixture
 def setup_update(setup):
-    student, tutor, lesson = setup
-    return student, tutor, {**lesson, "pay_status": False}
+    enrollment, tutor, lesson = setup
+    return enrollment, tutor, {**lesson, "pay_status": False}

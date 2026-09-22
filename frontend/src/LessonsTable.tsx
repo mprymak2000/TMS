@@ -63,7 +63,7 @@ export default function LessonsTable() {
       <LessonRow
         key={lesson.id}
         lesson={lesson}
-        student={students[lesson.student_id]}
+        student={students[lesson.enrollment_id]}
         tutor={tutors[lesson.tutor_id]}
         isExpanded={expandedId === lesson.id}
         isEditing={editingId === lesson.id}
@@ -150,7 +150,6 @@ export default function LessonsTable() {
 
         <LessonAddModal
           opened={modalOpen}
-          students={students}
           tutors={tutors}
           onSave={triggerReload}
           onClose={() => setModalOpen(false)}
@@ -272,7 +271,7 @@ export default function LessonsTable() {
                       <Select
                         size="xs"
                         placeholder="All Students"
-                        data={Object.values(students).map(s => ({ value: s.id.toString(), label: `${s.contact.first_name} ${s.contact.last_name}` }))}
+                        data={Object.values(students).map(s => ({ value: s.id.toString(), label: `${s.first_name} ${s.last_name}` }))}
                         onChange={v => setFilterStudent(v ? Number(v) : null)}
                         clearable
                         styles={{ input: { borderColor: '#e5e7eb', height: '40px', borderRadius: '8px', fontFamily: 'inherit', fontWeight: 'normal' } }}

@@ -10,7 +10,7 @@ not a launch blocker). Each open item has its own design doc in `.claude/plans/`
 
 **Denormalization boundary, stated once here since several items below depend on it**: whether a
 field is a live FK or a frozen copy is decided by *when it gets read*, not by what it's about.
-`Tutor` and `Contact`/`Student` stay live FKs — editing one is instantly reflected on every booking
+`Tutor` and `Contact`/`Enrollment` stay live FKs — editing one is instantly reflected on every booking
 referencing it, past and future. `BookingLink` is a **factory**, and splits
 down the middle: its *calendar rules* (duration, buffers, caps, lead time, horizon, tutor roster) are
 read **live** on every slot computation — including a customer rescheduling an existing booking —
@@ -79,7 +79,7 @@ rather than trips through the slot picker, so a retired link's rules are read by
    `available_slots` inner sweep made step-driven, `require_slot_in_schedule` added to the write
    path, and `UNTIL` fixed to emit a UTC date-time as the spec requires.
 8. ~~**Contact/Student identity split**~~ — **done, backend and frontend.** Plan:
-   `.claude/plans/contact-identity-split.md`. Full model: CLAUDE.md's "Contact identity".
+   `.claude/plans/done-contact-identity-split.md`. Full model: CLAUDE.md's "Contact identity".
    `contacts` + `contact_managers` shipped; `Student` became enrollment on a `contact_id`;
    `Booking`/`BookingSeries` carry `payer_id`/`attendee_id` NOT NULL and the six `student_*`/
    `parent_*` columns are gone. The attendee facet replaced the `(first, last)` name-pair matching,
@@ -98,12 +98,20 @@ rather than trips through the slot picker, so a retired link's rules are read by
      contact); a `relationship` type on `contact_managers` (no reader); race-safety on the resolvers
      (see the TODO in `booking_utils.py` — find-then-insert can duplicate an emailless attendee under
      concurrency, and neither `ON CONFLICT` nor `SELECT FOR UPDATE` works on SQLite so tests wouldn't
-     cover it); renaming `Student` to `Enrollment`.
+     cover it). ~~Renaming `Student` to `Enrollment`~~ — done in 10a.
    - **Immediate follow-ons**, all small and all now unblocked:
-     - ~~Client detail view and an enrollments page~~ — **both folded into item 10a**, which settled
-       them differently than these two bullets assumed: the detail is a **side panel**, not a route,
-       and there is **no enrollments page** at all. Enrollment is a child of a client, edited on the
-       client's own panel, with the list filtered to Students when you want just them.
+     - ~~Client detail view and an enrollments page~~ — **done in 10a**, differently than these two
+       bullets assumed: the detail is a **side panel**, not a route, and there is **no enrollments
+       page** at all. Enrollment is a child of a client, edited on the client's own panel, with the
+       list filtered to Enrolled when you want just them.
+     - **Booking sections in the client panel** (*Their sessions*, *Pays for*) — the panel shows
+       identity, enrollment and relationships today, not bookings. Wants the payer facet below
+       (`payer_ids`) and a compact bookings list embedded in the panel; if it gets cramped, promote
+       to `/clients/:id`.
+     - **Manual relationship editing** — `contact_managers` rows are only ever written by
+       `resolve_attendee` during a booking. An admin enrolling a child by hand before any booking
+       can't say who pays for them. Needs `POST`/`DELETE /contacts/{id}/managers/{other}` and a
+       picker in the panel.
      - **Payer facet** — `apply_scope_filters` filters on `attendee_id` only, inherited from the old
        name-pair facet. With one payer covering two dependents there's no way to ask "everything this
        payer is on," which is the invoicing question. Needs a `payer_ids` param and a fifth facet
@@ -126,19 +134,15 @@ rather than trips through the slot picker, so a retired link's rules are read by
      occurrences are many — do responses attach to the `BookingSeries` (occurrences resolve through
      it), or get copied onto each `Booking` at materialization (consistent with every other frozen
      field, but duplicated N times)? Not yet decided.
-9. **`created` / `last_modified` on `Booking`** — quick, do it first. `BookingSeries` has both;
-   `Booking` has neither, purely because they arrived with the series lifecycle pass (item 4) and
-   were never backfilled. Same declarations: `server_default=func.now()`, plus `onupdate=func.now()`
-   on `last_modified`. "When was this booked" currently has no answer except the calendar event.
-   **The second payoff is optimistic concurrency for the admin edit panel (item 12):** the panel
-   sends back the `last_modified` it loaded and the server 409s if the row moved underneath, which
-   is the clean fix for the stale-PUT hazard (a full-replacement PUT built from stale list data can
-   otherwise silently move a booking). That fix was rejected while planning the panel *only* because
-   the column didn't exist. Needs a DB wipe — no Alembic — so fold it in with the contact-split
-   reseed rather than paying for a second one.
+9. ~~**`created` / `last_modified` on `Booking`**~~ — **done.** Same declarations as `BookingSeries`
+   (`server_default=func.now()`, `onupdate` on `last_modified`); a virtual occurrence reports its
+   series' values. **The second payoff is optimistic concurrency for the admin edit panel (item 12):**
+   the panel sends back the `last_modified` it loaded and the server 412s if the row moved underneath,
+   which is the clean fix for the stale-PUT hazard (a full-replacement PUT built from stale list data
+   can otherwise silently move a booking).
 10. **`Student` → `Enrollment`, and enrollment gets a UI.** Two passes, deliberately split — see 10a
-    and 10b. They touch the same tables but answer different questions, and keeping them apart keeps
-    each commit legible.
+    (**done**) and 10b. They touch the same tables but answer different questions, and keeping them
+    apart keeps each commit legible.
 
     **Settled up front, shaping both:** there is **no separate Enrollments page**, and no new sidebar
     entry. `/clients` is the identity surface and enrollment is a *child* of a client — the
@@ -146,18 +150,19 @@ rather than trips through the slot picker, so a retired link's rules are read by
     you want and edit enrollment on the client's own panel. Keeping this lightweight is an explicit
     goal: function-rich without a page per concept.
 
-    **Three filters on `/clients`:**
+    **Two filters on `/clients`, as independent booleans** (built; an earlier draft had three pills):
 
     | filter | means | derived from |
     |---|---|---|
-    | **Clients** | everyone | — |
-    | **Students** | has an enrollment | join to `enrollments` |
-    | **Payers** | manages someone | `contact_managers` |
+    | **Enrolled** | has an enrollment, inactive included | `Contact.enrollment.has()` |
+    | **Manages someone** | has dependents | `contact_managers.manager_id` |
 
-    Payers comes from `contact_managers`, **not** from `bookings_as_payer` — the standing
-    relationship is more stable than a side effect of having transacted, and it doesn't need the
-    booking counts at all. These are overlapping sets, not nested: Rita manages Marcus and may have
-    no enrollment of her own, so she appears under Payers and not Students.
+    Booleans rather than an enum so they AND — an adult who pays for a child and is enrolled
+    themselves is in both sets, and only the intersection finds them. Manages comes from
+    `contact_managers`, **not** from booking counts — the standing relationship is more stable than a
+    side effect of having transacted. Per-contact booking counts were tried and ripped out: an
+    indefinite series' future occurrences have no rows, so a `GROUP BY` undercounts. A "payers only"
+    filter (ever a `payer_id` on a booking) is a possible third boolean, not built.
 
     **Watch the conflation:** *attendee* ≠ *enrolled*. Attendee is derived from bookings
     (`attendee_id` appears on one); enrolled means an `Enrollment` row exists. Both gaps are real and
@@ -180,34 +185,31 @@ rather than trips through the slot picker, so a retired link's rules are read by
     enrollment (a payer who isn't billed a rate themselves), and both. Enrollment must not be made to
     require auth.
 
-    - **10a — rename, client filters, client panel.** Plan:
-      `.claude/plans/enrollment-pass-10a-rename-filters-panel.md`. Four steps, in order:
-      1. **`Student` → `Enrollment`** throughout: model, schemas, router, `/students` →
-         `/enrollments`, `Lesson.student_id` → `enrollment_id`, frontend types. Cheapest now — it's
-         the first code written against it and the DB is already being wiped for the contact split.
-      2. **The three filters** on `/clients`, server-side, in the URL like search/sort/page already
-         are.
-      3. **A generic `<SidePanel>`** — header/body/footer, knowing nothing about clients. The
-         bookings panel (item 12) wants the same shell; whichever ships first provides it. It
-         **overlays** the right of the list rather than reflowing it, Cal.com-style, so the rows'
-         hover actions sit behind it and are simply unreachable while it's open — no conditional
-         rendering needed.
-      4. **Client detail content inside it** — read-only, with **Edit** flipping to a form covering
-         identity *and* enrollment together, one Save. Enrolling is "set a rate" on a client you're
-         already looking at. **This retires the current edit modal** on `/clients`; delete and enroll
-         move into the panel too.
+    - ~~**10a — rename, client filters, client panel.**~~ — **done.** Plan:
+      `.claude/plans/done-enrollment-pass-10a-rename-filters-panel.md`. What shipped, and where it
+      diverged from the plan:
+      1. **`Student` → `Enrollment`** as class-table inheritance: `enrollments.id` is a PK that is
+         also the FK to `contacts.id` (`ON DELETE CASCADE`, `passive_deletes=True` on the
+         relationship). `Lesson.enrollment_id`. `/students` router deleted; enrollment is a
+         **sub-resource** — `PUT /contacts/{id}/enrollment` upserts (201/200), `DELETE` removes.
+         `PUT /contacts/{id}` also takes a nested `enrollment` in the same commit. No enrollments
+         list endpoint; `GET /contacts/?enrolled=true` is that list.
+      2. **Two boolean filters**, not three pills (table above). Role counts removed from the roster.
+      3. **`SidePanel.tsx`** — generic overlay shell, as planned.
+      4. **`ClientDetail.tsx`** — read-only → Edit → one Save. Enroll is a switch in the form;
+         unenroll is `is_active`; delete-enrollment (mistakes only) and delete-client are behind a
+         dots menu with a confirm. **Relationships**: `GET /contacts/{id}/relationships` (both
+         directions, read-only), rendered as "Books for" / "Booked for by" with click-to-hop;
+         `GET /contacts/{id}` returns the roster-row shape so a hop can land off-page. Edit modal
+         retired. *Their sessions* / *Pays for* booking sections **not built** — they want the
+         `payer_ids` filter and a bookings list embedded in the panel; backlog.
 
-      Build the detail as a `<ClientDetail client={...} />` **component**, not as page markup — the
-      container is ~10 lines either way, so if the panel feels cramped once enrollment and
-      relationships are both in it, promote it to a `/clients/:id` route and the content moves across
-      unchanged. That route would be reachable only from the list, like `/links/:id` today, and would
-      need a back affordance the panel doesn't.
+      Contact delete gained a guard: 409 while they manage someone. Being enrolled is deliberately
+      not a guard (the enrollment cascades).
 
-      Backend CRUD already exists in `routers/students.py` with the right guards (404 on missing
-      contact, 409 on already-enrolled, 409 on delete-with-lessons), so this pass is mostly frontend
-      plus the rename.
+      Promote to a `/clients/:id` route only if the panel feels cramped once booking sections land.
 
-      **Keep `rate` a single float here.** 10b replaces it; doing both at once muddles the commit.
+      **`rate` stayed a single float.** 10b replaces it.
     - **10b — billing rates.** Replaces the bare `rate` float. Design settled in conversation, not
       built:
 

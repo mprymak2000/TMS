@@ -98,7 +98,9 @@ function App() {
           </header>
 
           <main className={`flex-1 overflow-y-auto ${isBookings ? 'py-4 px-6' : 'py-8 px-16'}`}>
-            <div className={`h-full ${isBookings ? '' : 'max-w-7xl mx-auto'}`}>
+            {/* Bookings scrolls inside its tabs and needs a fixed height. Every other page scrolls
+                in main, where a fixed-height wrapper lets long lists spill past the bottom padding */}
+            <div className={isBookings ? 'h-full' : 'min-h-full max-w-7xl mx-auto'}>
               <Routes>
                 <Route path="/" element={<LessonsTable />} />
                 <Route path="/clients" element={<Clients />} />

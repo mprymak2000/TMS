@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from policy import get_cancel_action, get_reschedule_action, minutes_until
 
 #todo: consider patch instead of put for updates, as it allows for partial updates and is more flexible but more complex to implement. put requires the entire object to be sent, which can be simpler but less efficient for updates that only change a few fields.
-#todo: change student rate Field(gt=0) to Field(ge=0) in StudentCreate and StudentUpdate — rate=0 should be allowed (e.g. a family member). Also check tutor_payout logic for division by zero when student.rate=0.
+#todo: change EnrollmentInput's rate Field(gt=0) to Field(ge=0) — rate=0 should be allowed (e.g. a family member). Also check tutor_payout logic for division by zero when the rate is 0.
 
 
 class _Input(BaseModel):
@@ -65,11 +65,26 @@ class ContactCreate(_Input):
     phone: str | None = None
 
 
+#todo: add auto grade incrementing every summer
+class EnrollmentInput(_Input):
+    """One schema for create and update — the URL carries the contact, and PUT upserts, so there's
+    no case where the two differ."""
+    rate: float = Field(gt=0)
+    start_date: date
+    is_active: bool = True
+    grade: int | None = None
+    birthday: date | None = None
+
+
 class ContactUpdate(_Input):
     first_name: str
     last_name: str
     email: str | None = None
     phone: str | None = None
+    # Present -> upserted in the same commit as the identity fields, so the panel's one Save is
+    # atomic. Absent -> untouched. Never "delete": that stays on DELETE .../enrollment, so forgetting
+    # the field can't wipe someone's rate.
+    enrollment: EnrollmentInput | None = None
 
 
 class ContactResponse(BaseModel):
@@ -83,16 +98,27 @@ class ContactResponse(BaseModel):
     verified_at: datetime | None = None
 
 
-class ContactListResponse(ContactResponse):
-    """ContactResponse plus how the person has actually been used, for the roster's role badges.
+class EnrollmentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
 
-    Both counts are derived from the bookings at read time, never stored: a role is held on a
-    transaction, not on a person, and the same human is a payer on one booking and an attendee on
-    another. 0/0 is normal — an admin-created contact who hasn't booked yet.
+    id: int   # the contact's id — see Enrollment's docstring
+    rate: float
+    start_date: date
+    is_active: bool
+    grade: int | None = None
+    birthday: date | None = None
+
+
+class ContactListResponse(ContactResponse):
+    """A contact as the roster shows them.
+
+    Roles aren't here: payer and attendee are held on a booking, not on a person, and counting them
+    can't be done reliably anyway — an indefinite series' future occurrences have no rows yet. The
+    filters answer "who is a student / a payer" instead, and the panel shows real booking history.
     """
     created: datetime
-    bookings_as_payer: int = 0
-    bookings_as_attendee: int = 0
+    # Nested so the client panel has everything in one fetch. Null for anyone not enrolled.
+    enrollment: EnrollmentResponse | None = None
 
 
 class ContactPagedResponse(BaseModel):
@@ -100,6 +126,13 @@ class ContactPagedResponse(BaseModel):
     exactly the random access a cursor gives up."""
     items: list[ContactListResponse]
     total: int
+
+
+class ContactRelationshipsResponse(BaseModel):
+    """Both directions of contact_managers for one person. Fetched only when their panel opens, so
+    the roster stays one query."""
+    manages: list[ContactResponse]
+    managed_by: list[ContactResponse]
 
 
 class _ContactBase(_Input):
@@ -119,39 +152,8 @@ class AttendeeInput(_ContactBase):
     email: str | None = None
 
 
-class StudentCreate(_Input):
-    contact_id: int
-    rate: float = Field(gt=0)
-    start_date: date
-    is_active: bool = True
-    grade: int | None = None
-    birthday: date | None = None
-
-
-#todo: add auto grade incrementing every summer
-class StudentUpdate(_Input):
-    rate: float = Field(gt=0)
-    start_date: date
-    is_active: bool
-    grade: int | None = None
-    birthday: date | None = None
-
-
-class StudentResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    contact_id: int
-    contact: ContactResponse
-    rate: float
-    start_date: date
-    is_active: bool
-    grade: int | None = None
-    birthday: date | None = None
-
-
 class LessonCreate(_Input):
-    student_id: int
+    enrollment_id: int
     tutor_id: int
     date: date
     hrs: float | None = Field(default=None, ge=0)
@@ -174,7 +176,7 @@ class LessonResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    student_id: int
+    enrollment_id: int
     tutor_id: int
     booking_id: int | None = None
     date: date

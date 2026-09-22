@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Lesson, Student, Tutor
+from models import Enrollment, Lesson, Tutor
 from schemas import LessonCreate, LessonUpdate, LessonResponse
 from pydantic import BaseModel
 from openpyxl import load_workbook
@@ -19,15 +19,15 @@ def get_lessons(db: Session = Depends(get_db)):
 
 @router.get("/export")
 def export_lessons(
-    student_id: int | None = Query(default=None),
+    enrollment_id: int | None = Query(default=None),
     tutor_id: int | None = Query(default=None),
     date_from: date_type | None = Query(default=None),
     date_to: date_type | None = Query(default=None),
     db: Session = Depends(get_db)
 ):
     query = db.query(Lesson)
-    if student_id:
-        query = query.filter(Lesson.student_id == student_id)
+    if enrollment_id:
+        query = query.filter(Lesson.enrollment_id == enrollment_id)
     if tutor_id:
         query = query.filter(Lesson.tutor_id == tutor_id)
     if date_from:
@@ -36,7 +36,7 @@ def export_lessons(
         query = query.filter(Lesson.date <= date_to)
     lessons = query.order_by(Lesson.date).all()
 
-    student_map = {s.id: s for s in db.query(Student).filter(Student.id.in_({l.student_id for l in lessons})).all()}
+    enrollment_map = {e.id: e for e in db.query(Enrollment).filter(Enrollment.id.in_({l.enrollment_id for l in lessons})).all()}
     tutor_map = {t.id: t for t in db.query(Tutor).filter(Tutor.id.in_({l.tutor_id for l in lessons})).all()}
 
     wb = load_workbook('lessons_4_1_26.xlsx')
@@ -46,9 +46,9 @@ def export_lessons(
     ws.append(['Date', 'WeekStart', 'DayOfWeek', 'Day', 'Student', 'Hrs', 'Fee', 'Tutor', 'Pay', 'PayStatus', 'Notes'])
 
     for i, lesson in enumerate(lessons, start=2):
-        student = student_map.get(lesson.student_id)
+        enrollment = enrollment_map.get(lesson.enrollment_id)
         tutor = tutor_map.get(lesson.tutor_id)
-        student_name = f'{student.contact.first_name} {student.contact.last_name[0]}' if student else ''
+        student_name = f'{enrollment.contact.first_name} {enrollment.contact.last_name[0]}' if enrollment else ''
         tutor_name = f'{tutor.first_name} {tutor.last_name}' if tutor else ''
         ws.append([
             lesson.date,
@@ -86,14 +86,14 @@ def get_lesson(lesson_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Lesson not found")
     return lesson
 
-def handle_fee_and_payout(new_lesson: Lesson, lesson_in: LessonCreate | LessonUpdate, db_student: Student, db_tutor: Tutor):
+def handle_fee_and_payout(new_lesson: Lesson, lesson_in: LessonCreate | LessonUpdate, db_enrollment: Enrollment, db_tutor: Tutor):
     # override fee if provided
     if lesson_in.fee_override is not None:
         new_lesson.fee = lesson_in.fee_override
         new_lesson.is_fee_overridden = True
     # or calculate it based on normal rate and hours if not
     else:
-        new_lesson.fee = (lesson_in.hrs or 0) * db_student.rate
+        new_lesson.fee = (lesson_in.hrs or 0) * db_enrollment.rate
         new_lesson.is_fee_overridden = False
 
     # Tutor payout logic:
@@ -105,7 +105,7 @@ def handle_fee_and_payout(new_lesson: Lesson, lesson_in: LessonCreate | LessonUp
         new_lesson.tutor_payout = lesson_in.tutor_pay_override
         new_lesson.is_tutor_payout_overridden = True
     elif lesson_in.hrs == 0 and lesson_in.fee_override is not None:
-        new_lesson.tutor_payout = lesson_in.fee_override * (db_tutor.pay_rate / db_student.rate)
+        new_lesson.tutor_payout = lesson_in.fee_override * (db_tutor.pay_rate / db_enrollment.rate)
         new_lesson.is_tutor_payout_overridden = False
     else:
         new_lesson.tutor_payout = (lesson_in.hrs or 0) * db_tutor.pay_rate
@@ -113,16 +113,16 @@ def handle_fee_and_payout(new_lesson: Lesson, lesson_in: LessonCreate | LessonUp
 
 @router.post("/", response_model=LessonResponse, status_code=201)
 def create_lesson(lesson_in: LessonCreate, db: Session = Depends(get_db)):
-    db_student = db.query(Student).filter(Student.id == lesson_in.student_id).first()
+    db_enrollment = db.query(Enrollment).filter(Enrollment.id == lesson_in.enrollment_id).first()
     db_tutor = db.query(Tutor).filter(Tutor.id == lesson_in.tutor_id).first()
 
-    if not db_student:
-        raise HTTPException(status_code=404, detail="Student not found")
+    if not db_enrollment:
+        raise HTTPException(status_code=404, detail="Enrollment not found")
     if not db_tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
 
     new_lesson = Lesson(**lesson_in.model_dump(exclude={"fee_override", "tutor_pay_override"}))
-    handle_fee_and_payout(new_lesson, lesson_in, db_student, db_tutor)
+    handle_fee_and_payout(new_lesson, lesson_in, db_enrollment, db_tutor)
 
     db.add(new_lesson)
     db.commit()
@@ -132,23 +132,23 @@ def create_lesson(lesson_in: LessonCreate, db: Session = Depends(get_db)):
 
 @router.post("/bulk_create", response_model=list[LessonResponse], status_code=201)
 def bulk_create_lessons(lessons_in: list[LessonCreate], db: Session = Depends(get_db)):
-    # 2 queries, as opposed to looping per lesson and querying for student and tutor each time
-    student_ids = {lesson.student_id for lesson in lessons_in}
+    # 2 queries, as opposed to looping per lesson and querying for enrollment and tutor each time
+    enrollment_ids = {lesson.enrollment_id for lesson in lessons_in}
     tutor_ids = {lesson.tutor_id for lesson in lessons_in}
 
-    students = {s.id: s for s in db.query(Student).filter(Student.id.in_(student_ids)).all()}
+    enrollments = {e.id: e for e in db.query(Enrollment).filter(Enrollment.id.in_(enrollment_ids)).all()}
     tutors = {t.id: t for t in db.query(Tutor).filter(Tutor.id.in_(tutor_ids)).all()}
 
     new_lessons = []
     for lesson_in in lessons_in:
-        if lesson_in.student_id not in students:
-            raise HTTPException(status_code=404, detail=f"Student with id {lesson_in.student_id} not found")
+        if lesson_in.enrollment_id not in enrollments:
+            raise HTTPException(status_code=404, detail=f"Enrollment with id {lesson_in.enrollment_id} not found")
         if lesson_in.tutor_id not in tutors:
             raise HTTPException(status_code=404, detail=f"Tutor with id {lesson_in.tutor_id} not found")
-        db_student = students[lesson_in.student_id]
+        db_enrollment = enrollments[lesson_in.enrollment_id]
         db_tutor = tutors[lesson_in.tutor_id]
         new_lesson = Lesson(**lesson_in.model_dump(exclude={"fee_override", "tutor_pay_override"}))
-        handle_fee_and_payout(new_lesson, lesson_in, db_student, db_tutor)
+        handle_fee_and_payout(new_lesson, lesson_in, db_enrollment, db_tutor)
         new_lessons.append(new_lesson)
     
     db.add_all(new_lessons)
@@ -164,14 +164,14 @@ def update_lesson(lesson_id: int, lesson_in: LessonUpdate, db: Session = Depends
     if not db_lesson:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
-    db_student = db.query(Student).filter(Student.id == db_lesson.student_id).first()
+    db_enrollment = db.query(Enrollment).filter(Enrollment.id == db_lesson.enrollment_id).first()
     db_tutor = db.query(Tutor).filter(Tutor.id == db_lesson.tutor_id).first()
 
     # Update non-derived fields first
     for key, value in lesson_in.model_dump(exclude={"fee_override", "tutor_pay_override"}).items():
         setattr(db_lesson, key, value)
 
-    handle_fee_and_payout(db_lesson, lesson_in, db_student, db_tutor)
+    handle_fee_and_payout(db_lesson, lesson_in, db_enrollment, db_tutor)
 
     db.commit()
     db.refresh(db_lesson)

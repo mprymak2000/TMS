@@ -41,10 +41,10 @@ Frontend's `npm run dev` already runs `vite --host`, so it's LAN-reachable by de
 poetry run pytest
 
 # Single test file
-poetry run pytest tests/test_students.py
+poetry run pytest tests/test_enrollments.py
 
 # Single test
-poetry run pytest tests/test_students.py::test_create_student
+poetry run pytest tests/test_enrollments.py::test_enroll_required_fields
 ```
 
 Tests use SQLite in-memory — no Docker required. Test setup is in `backend/tests/conftest.py` which overrides the `get_db` dependency. `backend/conftest.py` adds the backend folder to the Python path.
@@ -89,7 +89,7 @@ Frontend runs at `http://localhost:5173`. CORS is configured in `main.py` to all
 backend/
   main.py          # App entry point, registers routers, CORS middleware, runs create_all on startup
   database.py      # Engine, SessionLocal, Base, get_db() dependency
-  models.py        # SQLAlchemy ORM models (Contact, ContactManager, Student, Tutor, Lesson, Schedule, ScheduleDay, BookingLink, BookingType, BookingLinkAvailability, BookingSeries, Booking)
+  models.py        # SQLAlchemy ORM models (Contact, ContactManager, Enrollment, Tutor, Lesson, Schedule, ScheduleDay, BookingLink, BookingType, BookingLinkAvailability, BookingSeries, Booking)
   schemas.py       # Pydantic schemas: *Create, *Update, *Response per entity. Every request body
                    # inherits _Input (extra="forbid") — see "Strict request bodies" below
   initialize_database.py  # Local-only seed script (gitignored, real data) — see initialize_database.example.py for the committed template
@@ -97,9 +97,10 @@ backend/
   tasks.py         # Procrastinate app + periodic jobs (extend_all_series daily cron, weekly reminder job)
   worker.py        # Procrastinate worker entry point
   routers/
-    contacts.py               # CRUD for people; the one place a person's details change. Delete
-                              # RESTRICTs while any booking/series/enrollment references them
-    students.py               # Enrollment CRUD: a rate on a contact_id, not a person
+    contacts.py               # CRUD for people; the one place a person's details change. Also the
+                              # enrollment sub-resource (PUT/DELETE /contacts/{id}/enrollment) and
+                              # /relationships. Delete RESTRICTs while any booking/series/lesson
+                              # references them, or they manage someone
     tutors.py
     lessons.py
     schedules.py              # CRUD for tutor schedules; is_default flip logic; 409 on duplicate name per tutor
@@ -128,8 +129,17 @@ frontend/
     ScheduleTab.tsx    # /bookings index route — Day/Week/Month/custom date-range pill, paginated booking list
     RecurringTab.tsx   # /bookings/recurring — RecurringList (day-grouped SeriesRow cards), cancel-series modal
     RequestsTab.tsx    # /bookings/requests — pending-request cards, approve/deny modal
-    Clients.tsx        # /clients — the contact roster: dense table, debounced server-side search,
-                       # sortable headers, page-number pagination, role badges, create/edit/delete
+    Clients.tsx        # /clients — the contact roster: dense table, URL-backed search/sort/page/filters,
+                       # row click opens the side panel; create modal only (edit lives in the panel)
+    ClientDetail.tsx   # Panel content: read-only identity + enrollment + relationships, Edit flips to one
+                       # form, one Save -> PUT /contacts/{id} with nested enrollment; dots menu for deletes
+    SidePanel.tsx      # Generic overlay shell: fixed, full height, floats over the content shell's right
+                       # edge with the same 12px inset (Cal.com shape); knows nothing about its contents,
+                       # the bookings panel will reuse it
+    ContactPicker.tsx  # Async-search Select over /contacts/ (first page preloaded, server search on
+                       # type); `enrolled` prop scopes it. Used by the lesson forms
+    AppModal.tsx       # Shared modal chrome (size, padding, title/caption typography) + ModalFooter;
+                       # every dialog goes through it so they can't drift
     PolicyModal.tsx    # Booking- and series-level policy editors. One private Shell holds the chrome
                        # so the two can't drift; each exported dialog owns its own draft state
     BookingToolbar.tsx # Shared by all three tabs above: FiltersMenu, ActiveFilterChips, OrderToggle, LoadMoreSentinel, BookingFilters/LoadErrors types
@@ -150,36 +160,36 @@ docker-compose.yml # PostgreSQL service with named volume
 ## Key Business Logic
 
 **Lesson fee & tutor payout** (in `routers/lessons.py`):
-- Fee: use `fee_override` if provided, else `hrs * student.rate`
+- Fee: use `fee_override` if provided, else `hrs * enrollment.rate`
 - Tutor payout — three cases in priority order:
   1. `tutor_pay_override` provided → use it directly
-  2. `hrs == 0` and `fee_override` provided (cancelled lesson with penalty) → `fee_override * (tutor.pay_rate / student.rate)`
+  2. `hrs == 0` and `fee_override` provided (cancelled lesson with penalty) → `fee_override * (tutor.pay_rate / enrollment.rate)`
   3. Otherwise → `hrs * tutor.pay_rate` (normal lesson; fee_override does not affect tutor payout)
 - `is_fee_overridden` and `is_tutor_payout_overridden` flags are set accordingly
-- `Lesson.fee`/`Lesson.tutor_payout` are stored columns, computed once at creation from whatever `student.rate`/`tutor.pay_rate` was *at that time* — never re-derived live from the student/tutor's current rate. This is why a later rate change doesn't retroactively alter past lessons' recorded fee/payout: the financial history is denormalized onto each `Lesson` row, not looked up dynamically. Relevant to the planned `Contact`/`Student` identity split (see `tms-roadmap` skill) — `Student.rate` can safely stay a single current-value field (no versioning/history needed on it, no need for `Student` to become a multi-row per-enrollment-stint table) because past financial records are already immune to rate edits at the `Lesson` level.
+- `Lesson.fee`/`Lesson.tutor_payout` are stored columns, computed once at creation from whatever `enrollment.rate`/`tutor.pay_rate` was *at that time* — never re-derived live from the current rate. This is why a later rate change doesn't retroactively alter past lessons' recorded fee/payout: the financial history is denormalized onto each `Lesson` row, not looked up dynamically. It's also why `Enrollment.rate` can stay a single current-value field (no versioning, no per-stint rows) — past financial records are already immune to rate edits at the `Lesson` level.
 
 **Schema conventions**:
 - `*Create` — fields required to create a record
 - `*Update` — fields sent in PUT (full object, required fields stay required)
 - `*Response` — what the API returns; includes computed/DB fields like `id`, `fee`, `tutor_payout`
 - `fee_override` / `tutor_pay_override` exist only in schemas (excluded from `model_dump` before passing to ORM)
-- `birthday`, `first_name`, `last_name` on Student are immutable — set on create only, not in `StudentUpdate`
-- `start_date` and `is_active` are on Student — `start_date` uses first-of-month convention for month/year tracking
-- `first_name`/`last_name` are not in `TutorUpdate` either (immutable)
+- `EnrollmentInput` is the one enrollment body, used by both `PUT /contacts/{id}/enrollment` and nested on `ContactUpdate` — an upsert has no create/update split
+- `start_date` and `is_active` are on Enrollment — `start_date` uses first-of-month convention for month/year tracking
+- `first_name`/`last_name` are not in `TutorUpdate` (immutable)
 
-**Bulk create** (`POST /lessons/bulk_create`): validates all student/tutor IDs upfront using dict lookups (O(1)), then `db.add_all()` atomically. Returns 404 if any ID is invalid — entire batch rejected.
+**Bulk create** (`POST /lessons/bulk_create`): validates all enrollment/tutor IDs upfront using dict lookups (O(1)), then `db.add_all()` atomically. Returns 404 if any ID is invalid — entire batch rejected.
 
-**Naming conventions**: `_in` suffix for input params (`lesson_in`), `db_` prefix for queried ORM objects (`db_student`).
+**Naming conventions**: `_in` suffix for input params (`lesson_in`), `db_` prefix for queried ORM objects (`db_enrollment`).
 
 **Delete protection, by referenced entity** — what's allowed to reference what, and what happens on delete:
 - **Tutor** — referenced by `Lesson`, `Booking`, `BookingSeries` (all app-level RESTRICT, 409 if any exist — hard delete only succeeds with zero references of any kind, past or future; `is_active=False` is the normal offboarding path otherwise), `Schedule` (DB-level `CASCADE` — safe only because the three RESTRICTs above already guarantee zero bookings exist by the time a tutor delete reaches Postgres), `BookingLinkAvailability` (DB-level `CASCADE` — junction row, nothing worth preserving).
 - **Schedule** — referenced by `BookingLinkAvailability` (DB FK is `CASCADE`; `delete_schedule` 409s first while any **non-archived** link references it, so it behaves as a RESTRICT from the outside). Archived links are excluded from that check deliberately: their calendar rules are inert so the rows guard nothing, and since archive is terminal, counting them would make any schedule a since-archived link ever used permanently undeletable. That exclusion is the one case where the `CASCADE` actually fires — deleting a schedule held only by archived links drops those inert rows, which is also why the FK can't be RESTRICT; the *default* schedule additionally can't be deleted at all until another schedule is made default first.
 - **BookingLink** — **archive only, no hard delete at any child count.** `DELETE /booking_links/{id}` sets `status='archived'` (409s if already archived); there is no hard-delete route and no restore. Archiving makes the URL 404, calendar rules go inert, the row goes read-only, and the slug is released for reuse — but the row never leaves, so `Booking.booking_link_id` stays NOT NULL and non-dangling forever. That permanence is what lets bookings be grouped by *source* and, more importantly, bulk-reassigned to a live link to make them reschedulable again; the booking's own `booking_type_id` separately carries its *kind*. `paused` is the reversible middle state. Because nothing is ever hard-deleted, the `BookingLinkAvailability` `CASCADE` on this FK is dead code — no delete ever reaches Postgres.
 - **BookingType** — plain hard delete, unguarded at any usage count. It carries no rules and nothing branches on it, so referring rows just lose their label: every `booking_type_id` FK is `ON DELETE SET NULL`. The frontend warns first using `GET /booking_types/{id}/usage`, which counts links, bookings, and series separately (a booking losing a label off a historical record is a different loss from a link needing a new type picked).
-- **Student** — referenced by `Lesson` (app-level RESTRICT, 409; cascade delete intentionally removed to protect financial records). Deleting an enrollment leaves the `Contact` standing: identity and billing are separate rows, and a client who left gets `is_active=False` rather than a delete.
-- **Contact** — RESTRICT, same shape as Tutor: 409 while any `Booking`, `BookingSeries`, or `Student` references them. `payer_id`/`attendee_id` are NOT NULL so there's nothing to null out, and a booking with no person is meaningless. Soft delete was considered and rejected — it buys the ability to delete a referenced contact, which is the thing you don't want, at the cost of an archived state every query has to filter. The delete that actually happens is a stray duplicate: repoint the bad booking's attendee first, which leaves that row unreferenced. `contact_managers` rows are the contact's own and go with it (`ON DELETE CASCADE`, cleared explicitly so SQLite matches Postgres).
+- **Enrollment** — referenced by `Lesson` (app-level RESTRICT, 409; financial records). `DELETE /contacts/{id}/enrollment` is for mistakes only ("never was a student"); someone who left gets `is_active=False`, which keeps their rate and dates. The `Contact` stands either way.
+- **Contact** — RESTRICT: 409 while any `Booking`, `BookingSeries`, or `Lesson` references them, or while they **manage someone** (`contact_managers.manager_id`) — their dependents would be left with nobody to book or bill for them, and the booking guards miss that once monthly billing has no booking involved. `payer_id`/`attendee_id` are NOT NULL so there's nothing to null out, and a booking with no person is meaningless. **Being enrolled is deliberately not a guard**: with no lessons or bookings, a guard would only make the user delete the enrollment by hand and retry, same result. The enrollment is part of the contact (`enrollments.id` is `contacts.id`, `ON DELETE CASCADE`, `passive_deletes=True` on the relationship so the ORM doesn't try to null a PK) and goes with it. Soft delete was considered and rejected — it buys the ability to delete a referenced contact, which is the thing you don't want, at the cost of an archived state every query has to filter. The delete that actually happens is a stray duplicate: repoint the bad booking's attendee first, which leaves that row unreferenced. Rows where someone manages *them* are the contact's own and go with it (`ON DELETE CASCADE`, cleared explicitly so SQLite matches Postgres).
 
-**Tutor `is_active`**: Both Student and Tutor have `is_active`. Retiring a student/tutor means setting `is_active=False`, not deleting them. For Tutor specifically, this is enforced, not just a display flag: `create_booking`/`_reschedule_booking`/`_reschedule_series` (`routers/bookings.py`) reject an inactive `tutor_id`, `get_available_slots` excludes inactive tutors, and `extend_single_series` (`tasks.py`) stops materializing new occurrences for a series whose tutor has gone inactive. Already-confirmed/already-materialized bookings are untouched either way.
+**`is_active`**: Both Enrollment and Tutor have `is_active`. Retiring a client/tutor means setting `is_active=False`, not deleting them. For Tutor specifically, this is enforced, not just a display flag: `create_booking`/`_reschedule_booking`/`_reschedule_series` (`routers/bookings.py`) reject an inactive `tutor_id`, `get_available_slots` excludes inactive tutors, and `extend_single_series` (`tasks.py`) stops materializing new occurrences for a series whose tutor has gone inactive. Already-confirmed/already-materialized bookings are untouched either way.
 
 **Booking system** (`routers/bookings.py`):
 - `POST /bookings/` — creates Google Calendar event first, then DB record atomically. Recurring event types: creates one RRULE Google Calendar event + one `BookingSeries` row + one `Booking` row per occurrence (generated inline via a loop). Standalone: one event + one `Booking` row. If DB fails, compensating delete on Calendar. If compensating delete also fails, logs warning.
@@ -250,9 +260,10 @@ docker-compose.yml # PostgreSQL service with named volume
 ```
 contacts          id, email (unique, nullable), first_name, last_name, phone, verified_at, created
 contact_managers  manager_id, managed_id      who may book for whom; unique pair, CHECK not-self
-students          id, contact_id UNIQUE, rate, start_date, is_active, grade, birthday
+enrollments       id (PK, FK -> contacts.id, CASCADE), rate, start_date, is_active, grade, birthday
 bookings          payer_id NOT NULL, attendee_id NOT NULL -> contacts   (both indexed, facet keys)
 booking_series    same pair
+lessons           enrollment_id NOT NULL -> enrollments
 ```
 
 **Row at transaction, not at registration.** The booking creates the person whether or not they ever
@@ -267,23 +278,41 @@ they match. Roles live on the transaction, never as a column on the person, beca
 payer on one booking and an attendee on another. Anything you'd want a `role` column for is derived
 (`EXISTS (SELECT 1 FROM bookings WHERE payer_id = :id)`).
 
-**`Student` is enrollment, not identity.** Name, email and phone are on the `Contact`; what's left is
-what's true *because* they're billed here. A one-off consultation attendee is a contact with no
-student row, which is what lets someone book without anyone inventing a rate. Siblings at different
-rates is why rate sits on the attendee rather than the payer. `Booking` points at `Contact`, never at
-`Student` — enrollment is one hop away, and only when a rate is needed. Rate resolution is
-`fee_override ?? (hrs × student.rate) ?? (hrs × link.price)`. Admin-created: a guest can't supply a
-rate, and `Lesson.student_id` is NOT NULL. **TODO: rename to `Enrollment`** — "student" is
-tutoring-specific in a product also meant for therapy, training and coaching.
+**`Enrollment` extends a contact, it isn't a thing they have.** Name, email and phone are on the
+`Contact`; what's left is what's true *because* they're billed here. Class-table inheritance: the
+enrollment's `id` **is** the contact's id (PK and FK in one column), so there is at most one, it is
+never reassigned, and its URL is known before the row exists — which is why it's a sub-resource with
+a `PUT` upsert rather than a collection: `PUT /contacts/{id}/enrollment` creates (201) or replaces
+(200), `DELETE` removes it. `EnrollmentInput` is the one body. `PUT /contacts/{id}` also accepts a
+nested `enrollment`, upserted in the same commit — the client panel saves identity and rate with one
+button, and two calls could leave a renamed client on the old rate if the second failed. Absent means
+untouched, never delete. The old `/students` router is gone; there is no enrollments list endpoint,
+`GET /contacts/?enrolled=true` is that list.
+
+A one-off consultation attendee is a contact with no enrollment, which is what lets someone book
+without anyone inventing a rate. Siblings at different rates is why rate sits on the attendee rather
+than the payer. `Booking` points at `Contact`, never at `Enrollment` — enrollment is one hop away,
+and only when a rate is needed. Rate resolution is `fee_override ?? (hrs × enrollment.rate) ??
+(hrs × link.price)`. Admin-created: a guest can't supply a rate, and `Lesson.enrollment_id` is NOT
+NULL. (Renamed from `Student` — tutoring-specific in a product also meant for therapy, training and
+coaching. The frontend still says "student" in Lessons copy.)
 
 **Enrollment is not an account, and not the same as being an attendee.** `Contact.verified_at` marks
 an account; an enrollment marks a negotiated rate. All four combinations are valid, so neither may be
 made to imply the other. Separately, *attendee* is derived from bookings while *enrolled* is a row —
 a one-off consultation attendee has no enrollment, and an admin-enrolled client may have no bookings
-yet. There is no separate enrollments page: enrollment is a child of a client, edited on the client
-itself. See the `tms-roadmap` skill (item 10) — including 10b, which replaces the single `rate` float
-with mutually exclusive `rate_per_session`/`rate_per_hour`/`rate_per_month` columns and gives
+yet. There is no separate enrollments page: enrollment is a child of a client, edited in the client's
+side panel. See the `tms-roadmap` skill (item 10) — 10b replaces the single `rate` float with
+mutually exclusive `rate_per_session`/`rate_per_hour`/`rate_per_month` columns and gives
 `BookingLink` the same split, at which point the resolution chain above changes.
+
+**`GET /contacts/` filters are two independent booleans, `enrolled` and `manages`, not one enum** —
+so they AND: an adult who pays for a child and is enrolled themselves is in both sets, and only the
+intersection finds them. `enrolled` means "has an enrollment", inactive included (someone who left
+still has history worth finding). `manages` reads `contact_managers`, the standing relationship, not
+booking counts. A "payers only" filter would be a third boolean derived from bookings — not built.
+`GET /contacts/{id}/relationships` returns both directions (`manages`, `managed_by`) for one person;
+read-only, since the rows are written by `resolve_attendee` during booking, never by hand.
 
 **No contact snapshot on a booking.** The six `student_*`/`parent_*` columns are gone; a booking
 reads its person through the FK. Unlike policy or `Lesson.fee`, a name or phone change is a
@@ -314,8 +343,9 @@ attendee facet is: `SELECT DISTINCT attendee_id` over the scoped bookings, then 
 `contacts` (`compute_timeline_facets` → `_build_facets`). `GET /contacts/` returns the same rows
 answering a different question — *who exists*, not *who was in the room this week* — so the roster
 legitimately lists people the facet never will, a payer who has never attended being the usual case.
-Its `bookings_as_payer`/`bookings_as_attendee` counts are computed per request from two `GROUP BY`
-queries, not stored.
+It carries **no per-contact booking counts** — they were tried and ripped out, because an indefinite
+series' future occurrences have no rows, so a `GROUP BY` over `bookings` undercounts unpredictably.
+The filters answer "who is enrolled / who pays for someone" instead.
 
 **There is only an attendee facet, not a payer one.** `apply_scope_filters` filters on
 `attendee_id` alone, inherited from the old `(student_first, student_last)` facet. The gap: with
@@ -622,14 +652,21 @@ since the client roster is the only list that grows unboundedly with a practice'
 - **Dense table, not cards.** Cards suit a handful of tutors or links; a roster is scanned and sorted.
 - **Everything server-side** — search, sort, paging. Nothing is filtered in the browser, because the
   browser doesn't have the rest of the set.
-- Search is **debounced 250ms** into `debouncedSearch`, which is what the fetch effect depends on. A
-  new search resets `page` to 1, since the old page number means nothing against a new result set.
-- One `useEffect` keyed on `[debouncedSearch, sort, direction, page]` — every control is just state,
-  and the fetch follows.
-- One modal serves create and edit (`editing` is `null` | `'new'` | the row); the fields are identical
-  and `PUT` vs `POST` is the only branch.
-- Delete surfaces the backend's 409 text rather than a generic failure — a contact with bookings is
-  RESTRICTed, so the conflict is the *expected* answer, not an edge case.
+- **The query string is the state** (`useSearchParams`): `search`/`sort`/`direction`/`page`/
+  `enrolled`/`manages` all live in the URL, so a filtered view can be linked, bookmarked and reached
+  with the back button. `updateParams` merges onto the previous string and deletes empty values.
+- Search is **debounced 250ms** from a local input into the URL (a push, so back undoes a search —
+  safe only because the debounce collapses keystrokes into one write per pause). A reverse effect
+  copies the URL back into the box on back/forward. Any new search or filter drops `page`.
+- One `useEffect` keyed on every param — every control is just state, and the fetch follows.
+- **Row click opens `SidePanel` + `ClientDetail`**; there are no hover actions on rows. The panel
+  holds its own row (not a lookup into the page), because a relationship hop can land on someone
+  off the current page — `selectById` checks the page first, then `GET /contacts/{id}`. Saves and
+  unenrolls patch the row in place (the PUT returns it); delete refetches, since the set changed.
+  `key={selected.id}` remounts the detail so a draft never carries between people.
+- Create is the only modal. Both deletes (client, enrollment) confirm through one modal keyed on
+  `confirming`, and surface the backend's 409 text rather than a generic failure — a contact with
+  bookings or dependents is RESTRICTed, so the conflict is the *expected* answer.
 
 **Form state lives in the form, not the parent** (`PolicyModal.tsx`). A half-edited draft nobody else
 reads isn't shared state, so lifting it up is the wrong default. Both policy dialogs own their own

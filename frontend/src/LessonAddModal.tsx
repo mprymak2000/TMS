@@ -1,11 +1,11 @@
 import { useState, useRef } from 'react'
 import { Select, NumberInput, Checkbox, Textarea, Button, Group, Stack } from '@mantine/core'
 import AppModal, { ModalFooter } from './AppModal'
-import type { Student, Tutor } from './types'
+import ContactPicker from './ContactPicker'
+import type { Tutor } from './types'
 
 interface Props {
   opened: boolean  // added: Mantine Modal needs this to know when to show
-  students: Record<number, Student>
   tutors: Record<number, Tutor>
   onClose: () => void
   onSave: () => void
@@ -13,9 +13,9 @@ interface Props {
 
 
 
-const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) => {
+const LessonAddModal = ({ opened, tutors, onClose, onSave }: Props) => {
+  const [studentId, setStudentId] = useState<number | null>(null)
   // note: Mantine Select requires string | null — convert to Number when building payload
-  const [studentId, setStudentId] = useState<string | null>(null)
   const [tutorId, setTutorId] = useState<string | null>(null)
   // note: Mantine DatePickerInput uses Date | null — convert to YYYY-MM-DD string for API
   const [date, setDate] = useState<string | null>(null)
@@ -42,10 +42,6 @@ const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) =>
     if (dateInputRef.current) dateInputRef.current.value = ''
   }
 
-    const studentOptions = Object.values(students).map(s => (
-        { value: s.id.toString(), label: `${s.contact.first_name} ${s.contact.last_name}`}
-    ))
-    
     const tutorOptions = Object.values(tutors).map(t => (
         { value: t.id.toString(), label: `${t.first_name} ${t.last_name}`}
     ))
@@ -63,7 +59,7 @@ const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) =>
         setErrors([])
 
         const payload = {
-            student_id: Number(studentId),
+            enrollment_id: studentId,
             tutor_id: Number(tutorId),
             date: date, // convert to YYYY-MM-DD
             hrs: hrs === '' ? null : Number(hrs),
@@ -114,7 +110,7 @@ const LessonAddModal = ({ opened, students, tutors, onClose, onSave }: Props) =>
       <Stack>
         {/* Section 1 - Core */}
         <Group grow>
-          <Select label="Student" placeholder="Select student" data={studentOptions} value={studentId} onChange={setStudentId} searchable />
+          <ContactPicker label="Student" placeholder="Select student" enrolled value={studentId} onChange={setStudentId} />
           <Select label="Tutor" placeholder="Select tutor" data={tutorOptions} value={tutorId} onChange={setTutorId} searchable />
         </Group>
 

@@ -4,7 +4,7 @@ import procrastinate
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import SessionLocal
-from models import Booking, BookingSeries, Lesson, Settings
+from models import Booking, BookingSeries, Enrollment, Lesson, Settings
 from booking_utils import _ensure_occurrence, active_series_filter, indefinite_series_filter, is_series_active, series_step
 
 # Strip SQLAlchemy dialect prefix (+psycopg2) — psycopg3 expects plain postgresql://
@@ -125,7 +125,7 @@ def extend_single_series(series_id: int):
 @app.task
 def draft_lessons(timestamp: int):
     """Sunday 6am: create draft Lesson rows for past confirmed bookings that have no lesson yet."""
-    # TODO: review before enabling — verify fee/payout defaults, student_id null handling, and idempotency
+    # TODO: review before enabling — verify fee/payout defaults and idempotency
     db = SessionLocal()
     try:
         settings = db.query(Settings).filter(Settings.id == 1).first()
@@ -134,12 +134,14 @@ def draft_lessons(timestamp: int):
             return
         tz = ZoneInfo(settings.business_timezone)
 
+        # An enrollment is keyed on the attendee's contact id, so only bookings whose attendee is
+        # enrolled can produce a lesson — everyone else has no rate to bill at.
         bookings = (
             db.query(Booking)
+            .join(Enrollment, Enrollment.id == Booking.attendee_id)
             .filter(
                 Booking.status == "confirmed",
                 Booking.start <= datetime.now(UTC),
-                Booking.student_id != None,
                 ~Booking.lesson.has(),
             )
             .all()
@@ -147,15 +149,15 @@ def draft_lessons(timestamp: int):
 
         for booking in bookings:
             hrs = (booking.end - booking.start).total_seconds() / 3600
-            student = booking.student_record
+            enrollment = booking.attendee.enrollment
             tutor = booking.tutor
             db.add(Lesson(
                 booking_id=booking.id,
-                student_id=booking.student_id,
+                enrollment_id=enrollment.id,
                 tutor_id=booking.tutor_id,
                 date=booking.start.astimezone(tz).date(),
                 hrs=hrs,
-                fee=hrs * student.rate,
+                fee=hrs * enrollment.rate,
                 tutor_payout=hrs * tutor.pay_rate,
             ))
         db.commit()

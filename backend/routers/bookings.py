@@ -85,7 +85,7 @@ def get_booking_series_occurrences(
     settings=Depends(get_settings),
 ):
     """Cursor-paginated occurrences for one series. Separate endpoint, not a series_id filter
-    on GET /bookings/: a series already pins tutor/booking_link/student, so facets would be
+    on GET /bookings/: a series already pins tutor/booking_link/attendee, so facets would be
     meaningless here, and this is a sub-resource of one specific series, not a filterable
     collection - REST nested-resource shape."""
     if order not in ("asc", "desc"):

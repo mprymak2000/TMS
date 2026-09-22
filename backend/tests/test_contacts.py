@@ -365,23 +365,11 @@ def test_contact_list_rejects_an_unknown_sort(client):
     assert client.get("/contacts/?direction=sideways").status_code == 422
 
 
-# Roles are derived from the bookings, never stored, and one person can hold both at once.
-def test_contact_list_reports_role_counts(client):
-    tutor, link = setup_standalone(client)
-    booking = _book(client, tutor, link).json()
-    payer_id = booking["payer"]["id"]
-    attendee_id = booking["attendee"]["id"]
-
-    rows = {c["id"]: c for c in client.get("/contacts/").json()["items"]}
-    assert rows[payer_id]["bookings_as_payer"] == 1
-    assert rows[attendee_id]["bookings_as_attendee"] == 1
-
-
-def test_contact_list_reports_zero_for_someone_who_never_booked(client):
+# The roster lists everyone, whether or not they've ever been on a booking.
+def test_contact_list_includes_someone_who_never_booked(client):
     created = client.post("/contacts/", json={"first_name": "Unbooked", "last_name": "Person"}).json()
-    row = next(c for c in client.get("/contacts/").json()["items"] if c["id"] == created["id"])
-    assert row["bookings_as_payer"] == 0
-    assert row["bookings_as_attendee"] == 0
+    ids = [c["id"] for c in client.get("/contacts/").json()["items"]]
+    assert created["id"] in ids
 
 
 # ── delete guards ────────────────────────────────────────────────────────────
@@ -390,12 +378,6 @@ def test_delete_contact_with_bookings_conflicts(client):
     tutor, link = setup_standalone(client)
     booking = _book(client, tutor, link).json()
     assert client.delete(f"/contacts/{booking['payer']['id']}").status_code == 409
-
-
-def test_delete_contact_with_enrollment_conflicts(client):
-    created = client.post("/contacts/", json={"first_name": "Leo", "last_name": "Ruiz"}).json()
-    client.post("/students/", json={"contact_id": created["id"], "rate": 60, "start_date": "2026-01-01"})
-    assert client.delete(f"/contacts/{created['id']}").status_code == 409
 
 
 def test_delete_unreferenced_contact_clears_its_links(client):

@@ -30,9 +30,10 @@ class Contact(Base):
     # every contact is unverified, so the profile is last-write-wins from the newest booking.
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
-    # Named for what the row holds, not for its class: the contact IS the student, so
-    # contact.student would read as if it were someone else. Student is slated to become Enrollment.
-    enrollment = relationship("Student", back_populates="contact", uselist=False)
+    # uselist=False: the PK guarantees one row, but the ORM can't infer that from the key shape.
+    # passive_deletes: let the DB cascade. Without it SQLAlchemy tries to null the child's FK, which
+    # here is its primary key.
+    enrollment = relationship("Enrollment", back_populates="contact", uselist=False, passive_deletes=True)
 
 
 class ContactManager(Base):
@@ -53,14 +54,17 @@ class ContactManager(Base):
     managed = relationship("Contact", foreign_keys=[managed_id])
 
 
-class Student(Base):
-    """Enrollment, not identity: what's true of a contact because they're enrolled here. Admin-created,
-    since a guest can't supply a rate. TODO: rename to Enrollment, "student" is tutoring-specific.
+class Enrollment(Base):
+    """What's true of a contact because they're enrolled here — an extension of the person, not a
+    thing they have. Never reassigned, never swapped for a fresh one, so it has no identity of its
+    own: `id` is the contact's id, which is the joined-table-inheritance pattern. Admin-created,
+    since a guest can't supply a rate.
     """
-    __tablename__ = "students"
+    __tablename__ = "enrollments"
 
-    id = Column(Integer, primary_key=True, index=True)
-    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, unique=True)
+    # PK and FK in one column. Being the PK enforces one-per-contact without a separate UNIQUE;
+    # CASCADE because there's no key for the row to exist under once the contact is gone.
+    id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), primary_key=True)
     rate = Column(Float, nullable=False)
     start_date = Column(Date, nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
@@ -70,7 +74,7 @@ class Student(Base):
     birthday = Column(Date, nullable=True)
 
     contact = relationship("Contact", back_populates="enrollment")
-    lessons = relationship("Lesson", back_populates="student")
+    lessons = relationship("Lesson", back_populates="enrollment")
 
 
 class Tutor(Base):
@@ -105,11 +109,11 @@ class Lesson(Base):
     pay_status = Column(Boolean, nullable=False, default=False)
     notes = Column(Text, nullable=True)
 
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    enrollment_id = Column(Integer, ForeignKey("enrollments.id"), nullable=False)
     tutor_id = Column(Integer, ForeignKey("tutors.id"), nullable=False)
     booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=True)  # set by Sunday scheduler when lesson is generated from a booking
 
-    student = relationship("Student", back_populates="lessons")
+    enrollment = relationship("Enrollment", back_populates="lessons")
     tutor = relationship("Tutor", back_populates="lessons")
     booking = relationship("Booking", back_populates="lesson")
 

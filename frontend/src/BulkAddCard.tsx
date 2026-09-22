@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Select } from '@mantine/core'
-import type { Student, Tutor } from './types'
+import type { ContactListRow, Tutor } from './types'
 
 interface BulkRow {
   studentId: string | null
@@ -54,7 +54,7 @@ const validateRow = (row: BulkRow): BulkRowErrors => {
 }
 
 interface Props {
-  students: Record<number, Student>
+  students: Record<number, ContactListRow>
   tutors: Record<number, Tutor>
   onCancel: () => void
   onSave: () => void
@@ -69,7 +69,7 @@ export default function BulkAddCard({ students, tutors, onCancel, onSave }: Prop
 
   const studentOptions = Object.values(students).map(s => ({
     value: s.id.toString(),
-    label: `${s.contact.first_name} ${s.contact.last_name}`,
+    label: `${s.first_name} ${s.last_name}`,
   }))
 
   const tutorOptions = Object.values(tutors).map(t => ({
@@ -110,7 +110,7 @@ export default function BulkAddCard({ students, tutors, onCancel, onSave }: Prop
     if (allErrors.some(e => Object.keys(e).length > 0)) return
 
     const payload = rows.map(row => ({
-      student_id: Number(row.studentId),
+      enrollment_id: Number(row.studentId),
       tutor_id: Number(row.tutorId),
       date: row.date,
       hrs: row.hrs === '' ? null : Number(row.hrs),

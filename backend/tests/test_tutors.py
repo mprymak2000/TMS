@@ -112,7 +112,7 @@ def test_delete_tutor_not_found(client):
 
 # cannot delete a tutor with existing lessons — historical records must be preserved
 def test_delete_tutor_with_lessons(client, setup):
-    _student, tutor, lesson = setup
+    _enrollment, tutor, lesson = setup
     client.post("/lessons/", json=lesson)
     response = client.delete(f"/tutors/{tutor['id']}")
     assert response.status_code == 409
