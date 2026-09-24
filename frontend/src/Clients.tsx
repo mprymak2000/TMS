@@ -266,7 +266,9 @@ const Clients = () => {
                         className="w-80"
                     />
                     <Checkbox label="Enrolled" checked={enrolled} onChange={e => toggleFilter('enrolled', e.currentTarget.checked)} />
-                    <Checkbox label="Manages someone" checked={manages} onChange={e => toggleFilter('manages', e.currentTarget.checked)} />
+                    {/* "Payers" in the UI, `manages` on the wire: the column is booking authority,
+                        but the person it describes is the one an invoice goes to. */}
+                    <Checkbox label="Payers" checked={manages} onChange={e => toggleFilter('manages', e.currentTarget.checked)} />
                 </div>
                 <span className="text-sm text-gray-400 shrink-0">
                     {total} {total === 1 ? 'client' : 'clients'}

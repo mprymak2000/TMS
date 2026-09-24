@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { TextInput, NumberInput, Switch, Button, Menu } from '@mantine/core'
-import { IconDotsVertical, IconTrash } from '@tabler/icons-react'
-import type { Contact, ContactListRow, ContactRelationships } from './types'
+import { IconDotsVertical, IconTrash, IconPlus } from '@tabler/icons-react'
+import type { Contact, ContactListRow, ContactRelationships, Enrollment } from './types'
 import { extractError } from './utils'
 
 const API = import.meta.env.VITE_API_URL
@@ -57,8 +57,9 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
     const [email, setEmail] = useState(client.email ?? '')
     const [phone, setPhone] = useState(client.phone ?? '')
 
-    // "enrolling" toggles whether the enrollment block is sent at all. Someone who stopped coming
-    // gets is_active off, not the block removed — that's what keeps their rate and dates.
+    // Whether the form carries an enrollment block. Only ever turned on — by the row already having
+    // one, or by Enroll in the dots menu. Leaving the block out means "untouched", not "remove", so
+    // there's no switch that could pretend otherwise; removal is its own guarded action.
     const [enrolling, setEnrolling] = useState(client.enrollment !== null)
     const [rate, setRate] = useState<number | string>(client.enrollment?.rate ?? '')
     const [startDate, setStartDate] = useState(client.enrollment?.start_date ?? '')
@@ -66,10 +67,11 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
     const [grade, setGrade] = useState<number | string>(client.enrollment?.grade ?? '')
     const [birthday, setBirthday] = useState(client.enrollment?.birthday ?? '')
 
-    const startEdit = () => {
+    // withEnrollment: blank the enrollment fields and show them, for Enroll off the dots menu.
+    const startEdit = (withEnrollment = false) => {
         setFirst(client.first_name); setLast(client.last_name)
         setEmail(client.email ?? ''); setPhone(client.phone ?? '')
-        setEnrolling(client.enrollment !== null)
+        setEnrolling(withEnrollment || client.enrollment !== null)
         setRate(client.enrollment?.rate ?? ''); setStartDate(client.enrollment?.start_date ?? '')
         setIsActive(client.enrollment?.is_active ?? true)
         setGrade(client.enrollment?.grade ?? ''); setBirthday(client.enrollment?.birthday ?? '')
@@ -77,30 +79,56 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
         setEditing(true)
     }
 
+    // Both sides of the dirty check go through here, so the field list and key order match and
+    // JSON.stringify can compare them. Note there's no `id` on the enrollment: EnrollmentInput
+    // forbids extra fields, and the id is the contact's anyway.
+    const buildPayload = (
+        c: Pick<ContactListRow, 'first_name' | 'last_name' | 'email' | 'phone'>,
+        e: Enrollment | null,
+    ) => ({
+        first_name: c.first_name,
+        last_name: c.last_name,
+        email: c.email || null,
+        phone: c.phone || null,
+        ...(e && {
+            enrollment: {
+                rate: e.rate,
+                start_date: e.start_date,
+                is_active: e.is_active,
+                grade: e.grade,
+                birthday: e.birthday,
+            },
+        }),
+    })
+
     const handleSave = async () => {
         if (!first.trim() || !last.trim()) { setFormError('First and last name are required.'); return }
         if (enrolling && (rate === '' || Number(rate) <= 0)) { setFormError('Rate must be greater than 0.'); return }
         if (enrolling && !startDate) { setFormError('Start date is required.'); return }
+
+        const payload = buildPayload(
+            { first_name: first.trim(), last_name: last.trim(), email: email.trim(), phone: phone.trim() },
+            enrolling ? {
+                id: client.id,
+                rate: Number(rate),
+                start_date: startDate,
+                is_active: isActive,
+                grade: grade === '' ? null : Number(grade),
+                birthday: birthday || null,
+            } : null,
+        )
+        // Nothing changed, so Save is just Close — no request, no toast.
+        if (JSON.stringify(payload) === JSON.stringify(buildPayload(client, client.enrollment))) {
+            setEditing(false)
+            return
+        }
+
         setSaving(true)
         try {
             const res = await fetch(`${API}/contacts/${client.id}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    first_name: first.trim(),
-                    last_name: last.trim(),
-                    email: email.trim() || null,
-                    phone: phone.trim() || null,
-                    ...(enrolling && {
-                        enrollment: {
-                            rate: Number(rate),
-                            start_date: startDate,
-                            is_active: isActive,
-                            grade: grade === '' ? null : Number(grade),
-                            birthday: birthday || null,
-                        },
-                    }),
-                }),
+                body: JSON.stringify(payload),
             })
             if (!res.ok) { setFormError(extractError(await res.json(), 'Failed to save')); return }
             onSaved(await res.json())
@@ -137,17 +165,17 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                 </Section>
                 {/* Written by bookings, so shown only when there's something to show. */}
                 {relationships && relationships.manages.length > 0 && (
-                    <Section title="Books for">
+                    <Section title="Pays for">
                         {relationships.manages.map(c => <PersonLink key={c.id} c={c} onClick={() => onSelect(c.id)} />)}
                     </Section>
                 )}
                 {relationships && relationships.managed_by.length > 0 && (
-                    <Section title="Booked for by">
+                    <Section title="Payer">
                         {relationships.managed_by.map(c => <PersonLink key={c.id} c={c} onClick={() => onSelect(c.id)} />)}
                     </Section>
                 )}
                 <div className="flex items-center gap-2 mt-8">
-                    <Button onClick={startEdit}>Edit</Button>
+                    <Button onClick={() => startEdit()}>Edit</Button>
                     <Menu shadow="md" width={220} position="bottom-start">
                         <Menu.Target>
                             <button className="p-2 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition-colors">
@@ -155,11 +183,16 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                             </button>
                         </Menu.Target>
                         <Menu.Dropdown>
-                            {/* Behind the dots on purpose: removing an enrollment is for mistakes. Someone
-                                who stopped coming gets the Active switch, which keeps their rate and dates. */}
-                            {e && (
+                            {/* Enrolling and unenrolling are deliberate acts, so they live here rather
+                                than as a switch in the form. Removing is for mistakes — someone who
+                                stopped coming gets Active off, which keeps their rate and dates. */}
+                            {e ? (
                                 <Menu.Item leftSection={<IconTrash size={14} />} onClick={onRemoveEnrollment}>
                                     Remove enrollment
+                                </Menu.Item>
+                            ) : (
+                                <Menu.Item leftSection={<IconPlus size={14} />} onClick={() => startEdit(true)}>
+                                    Enroll
                                 </Menu.Item>
                             )}
                             <Menu.Item leftSection={<IconTrash size={14} />} color="red" onClick={onDelete}>
@@ -182,9 +215,8 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                     <TextInput label="Phone" value={phone} onChange={e => setPhone(e.target.value)} />
                 </div>
             </Section>
-            <Section title="Enrollment">
-                <Switch label="Enrolled" checked={enrolling} onChange={e => setEnrolling(e.currentTarget.checked)} className="mb-3" />
-                {enrolling && (
+            {enrolling && (
+                <Section title="Enrollment">
                     <div className="grid grid-cols-2 gap-3">
                         <NumberInput label="Rate ($/hr)" value={rate} onChange={setRate} min={0} />
                         <TextInput label="Start date" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
@@ -192,8 +224,8 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                         <TextInput label="Birthday" type="date" value={birthday} onChange={e => setBirthday(e.target.value)} />
                         <Switch label="Active" checked={isActive} onChange={e => setIsActive(e.currentTarget.checked)} className="col-span-2" />
                     </div>
-                )}
-            </Section>
+                </Section>
+            )}
             {formError && <p className="text-sm text-red-500 mb-3">{formError}</p>}
             <div className="flex justify-end gap-2 mt-6">
                 <Button variant="subtle" color="gray" onClick={() => setEditing(false)}>Cancel</Button>

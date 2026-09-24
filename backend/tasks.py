@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import SessionLocal
 from models import Booking, BookingSeries, Enrollment, Lesson, Settings
+from billing import generate_invoices
 from booking_utils import _ensure_occurrence, active_series_filter, indefinite_series_filter, is_series_active, series_step
 
 # Strip SQLAlchemy dialect prefix (+psycopg2) — psycopg3 expects plain postgresql://
@@ -147,10 +148,16 @@ def draft_lessons(timestamp: int):
             .all()
         )
 
+        created = 0
         for booking in bookings:
             hrs = (booking.end - booking.start).total_seconds() / 3600
             enrollment = booking.attendee.enrollment
+            # rate is nullable now, and this assumes an hourly one either way. Invoicing bills
+            # clients; skip rather than record a fee of None or hrs x someone's monthly plan.
+            if enrollment.rate is None or enrollment.rate_unit != "per_hour":
+                continue
             tutor = booking.tutor
+            created += 1
             db.add(Lesson(
                 booking_id=booking.id,
                 enrollment_id=enrollment.id,
@@ -161,9 +168,37 @@ def draft_lessons(timestamp: int):
                 tutor_payout=hrs * tutor.pay_rate,
             ))
         db.commit()
-        logging.info(f"draft_lessons: created {len(bookings)} draft lesson(s)")
+        logging.info(f"draft_lessons: created {created} of {len(bookings)} candidate booking(s)")
     except Exception:
         logging.exception("draft_lessons failed")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.periodic(cron="0 3 1 * *")
+@app.task
+def draft_invoices(timestamp: int):
+    """3am on the 1st: draft invoices for the month that just closed.
+
+    Drafts only — nothing is sent. Same code the admin's generate button runs, and re-runnable, so a
+    failed month can just be run again.
+    """
+    db = SessionLocal()
+    try:
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+        if settings is None:
+            logging.error("draft_invoices: Settings row not found")
+            return
+        # First of this month back to first of last, in business time.
+        period_end = datetime.now(ZoneInfo(settings.business_timezone)).date().replace(day=1)
+        period_start = (period_end - timedelta(days=1)).replace(day=1)
+
+        invoices = generate_invoices(db, period_start, period_end, settings)
+        logging.info(f"draft_invoices: drafted {len(invoices)} invoice(s) for {period_start}")
+    except Exception:
+        logging.exception("draft_invoices failed")
         db.rollback()
         raise
     finally:

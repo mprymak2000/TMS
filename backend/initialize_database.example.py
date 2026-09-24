@@ -12,9 +12,9 @@ DB_URL = "postgresql://postgres:password@localhost:5432/tms"
 # make the Enrollment that bills them.
 students = [
     {"first_name": "Jane", "last_name": "Doe", "email": "jane.doe@example.com", "phone": "555-0100",
-     "rate": 50, "start_date": "2026-01-01", "is_active": True},
+     "rate": 50, "rate_unit": "per_hour", "start_date": "2026-01-01", "is_active": True},
     {"first_name": "John", "last_name": "Smith", "email": "john.smith@example.com", "phone": "555-0101",
-     "rate": 50, "start_date": "2025-01-01", "is_active": True},
+     "rate": 50, "rate_unit": "per_hour", "start_date": "2025-01-01", "is_active": True},
 ]
 
 tutors = [
@@ -25,6 +25,7 @@ conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 cur.execute("""
     TRUNCATE TABLE
+        invoice_lines, invoices,
         booking_requests, bookings, booking_series,
         lessons, booking_link_availability, schedule_days,
         schedules, booking_links, booking_types,
@@ -50,6 +51,7 @@ for s in students:
     # PUT, not POST: an enrollment's id is the contact's, so the URL names it before it exists.
     r = requests.put(f"{API}/contacts/{contact['id']}/enrollment", json={
         "rate": s["rate"],
+        "rate_unit": s["rate_unit"],
         "start_date": s["start_date"],
         "is_active": s["is_active"],
     })
@@ -95,6 +97,8 @@ booking_link_recurring = requests.post(f"{API}/booking_links", json={
     "description": "Recurring — books a weekly repeating slot (same tutor, day, and time every week) rather than a single date. Cancellations and reschedules are approved automatically if requested at least 24 hours before the session; requests inside that 24-hour window are held for manual approval instead.",
     "duration_minutes": 90,
     "recurring": True,
+    "price": 100,
+    "price_unit": "per_session",
     "cancel_mode": "auto_window_request",
     "cancel_notice_minutes": 1440,
     "reschedule_mode": "auto_window_request",
@@ -108,6 +112,8 @@ booking_link_standalone = requests.post(f"{API}/booking_links", json={
     "description": "Standalone — a single one-off session, not part of a recurring weekly series. Same 24-hour cancellation/reschedule policy as the recurring option: auto-approved outside the 24-hour window, held for manual approval if requested closer to the session.",
     "duration_minutes": 60,
     "recurring": False,
+    "price": 80,
+    "price_unit": "per_session",
     "cancel_mode": "auto_window_request",
     "cancel_notice_minutes": 1440,
     "reschedule_mode": "auto_window_request",

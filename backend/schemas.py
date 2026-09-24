@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from policy import get_cancel_action, get_reschedule_action, minutes_until
 
 #todo: consider patch instead of put for updates, as it allows for partial updates and is more flexible but more complex to implement. put requires the entire object to be sent, which can be simpler but less efficient for updates that only change a few fields.
-#todo: change EnrollmentInput's rate Field(gt=0) to Field(ge=0) — rate=0 should be allowed (e.g. a family member). Also check tutor_payout logic for division by zero when the rate is 0.
+#todo: tutor_payout divides by the enrollment rate when a cancelled lesson has a fee_override — guard against rate 0 and rate None.
 
 
 class _Input(BaseModel):
@@ -69,11 +69,21 @@ class ContactCreate(_Input):
 class EnrollmentInput(_Input):
     """One schema for create and update — the URL carries the contact, and PUT upserts, so there's
     no case where the two differ."""
-    rate: float = Field(gt=0)
     start_date: date
     is_active: bool = True
+    # Both optional: enrolled with no terms agreed is a real state. A mode with no rate is the
+    # half-set case (plan chosen, not yet priced); a rate with no mode says nothing.
+    rate_unit: Literal["per_session", "per_hour", "per_month"] | None = None
+    rate: float | None = Field(default=None, ge=0)
+    payer_id: int | None = None
     grade: int | None = None
     birthday: date | None = None
+
+    @model_validator(mode="after")
+    def validate_terms(self):
+        if self.rate is not None and self.rate_unit is None:
+            raise ValueError("rate_unit is required when a rate is set")
+        return self
 
 
 class ContactUpdate(_Input):
@@ -102,9 +112,11 @@ class EnrollmentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int   # the contact's id — see Enrollment's docstring
-    rate: float
     start_date: date
     is_active: bool
+    rate_unit: str | None = None
+    rate: float | None = None
+    payer_id: int | None = None
     grade: int | None = None
     birthday: date | None = None
 
@@ -364,6 +376,12 @@ _SERIES_MODES = ('blocked', 'auto', 'request')
 #     reschedule_notice_minutes: int | None = None
 
 
+def _validate_price(price, price_unit):
+    """A price with no mode says nothing — is 60 per session or per hour?"""
+    if price is not None and price_unit is None:
+        raise ValueError("price_unit is required when a price is set")
+
+
 def _validate_recurrence(count, expires_on, booker_can_set_recur_until, booker_can_set_count):
     if count is not None and expires_on is not None:
         raise ValueError("count and expires_on are mutually exclusive")
@@ -398,7 +416,9 @@ class BookingLinkCreate(_Input):
     booker_can_set_recur_until: bool = False
     booker_can_set_count: bool = False
 
-    price: float | None = None
+    # What a booking costs when its attendee has no rate of their own.
+    price_unit: Literal["per_session", "per_hour"] | None = None
+    price: float | None = Field(default=None, ge=0)
     # 'auto' rather than None — the columns are NOT NULL, so there's no "unset" to fall back to.
     cancel_mode: str = 'auto'
     cancel_notice_minutes: int | None = None
@@ -422,6 +442,7 @@ class BookingLinkCreate(_Input):
     @model_validator(mode="after")
     def validate_recurrence(self):
         _validate_recurrence(self.count, self.expires_on, self.booker_can_set_recur_until, self.booker_can_set_count)
+        _validate_price(self.price, self.price_unit)
         if self.cancel_mode not in _VALID_MODES:
             raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
         if self.reschedule_mode not in _VALID_MODES:
@@ -455,7 +476,9 @@ class BookingLinkUpdate(_Input):
     booker_can_set_recur_until: bool = False
     booker_can_set_count: bool = False
 
-    price: float | None = None
+    # What a booking costs when its attendee has no rate of their own.
+    price_unit: Literal["per_session", "per_hour"] | None = None
+    price: float | None = Field(default=None, ge=0)
     cancel_mode: str
     cancel_notice_minutes: int | None = None
     reschedule_mode: str
@@ -478,6 +501,7 @@ class BookingLinkUpdate(_Input):
     @model_validator(mode="after")
     def validate_recurrence(self):
         _validate_recurrence(self.count, self.expires_on, self.booker_can_set_recur_until, self.booker_can_set_count)
+        _validate_price(self.price, self.price_unit)
         if self.cancel_mode not in _VALID_MODES:
             raise ValueError(f"cancel_mode must be one of {_VALID_MODES}")
         if self.reschedule_mode not in _VALID_MODES:
@@ -513,7 +537,9 @@ class BookingLinkResponse(BaseModel):
     expires_on: date | None = None
     booker_can_set_recur_until: bool
 
-    price: float | None = None
+    # What a booking costs when its attendee has no rate of their own.
+    price_unit: Literal["per_session", "per_hour"] | None = None
+    price: float | None = Field(default=None, ge=0)
     cancel_mode: str
     cancel_notice_minutes: int | None = None
     reschedule_mode: str
@@ -613,6 +639,7 @@ class BookingResponse(BaseModel):
     timezone: str
     status: str
     is_no_show: bool
+    charge: float | None = None
     rescheduled_to: str | None = Field(default=None, validation_alias="rescheduled_to_public_id")
     rescheduled_from: str | None = Field(default=None, validation_alias="rescheduled_from_public_id")
     google_event_id: str
@@ -668,6 +695,7 @@ class BookingSeriesResponse(BaseModel):
     reschedule_notice_minutes: int | None = None
     series_cancel_mode: str
     series_reschedule_mode: str
+    covered_by_subscription: bool
     # Series modes carry no notice window, so the mode IS the verdict — aliased rather than computed,
     # so the frontend reads the same field name on a series as on a booking.
     cancel_action: str = Field(validation_alias="series_cancel_mode")
@@ -744,6 +772,8 @@ class BookingUpdate(_Input):
     # Contact details are not here: they live on the Contact row and are edited through /contacts.
     # Editing them per booking would fork one person into a different record on every session.
     is_no_show: bool = False
+    # Null bills this session normally; 0 is a deliberate freebie.
+    charge: float | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_policy(self):
@@ -771,6 +801,8 @@ class BookingSeriesUpdate(_Input):
     reschedule_notice_minutes: int | None = None
     series_cancel_mode: str
     series_reschedule_mode: str
+    # On when the client is on a monthly plan and these sessions are what it pays for.
+    covered_by_subscription: bool = False
 
     @model_validator(mode="after")
     def validate_policy(self):
@@ -864,3 +896,61 @@ class BookingSeriesOccurrencesResponse(BaseModel):
     """Cursor-paginated occurrence list for one series."""
     items: list[BookingResponse]
     next_cursor: str | None
+
+class InvoiceGenerate(_Input):
+    """Half-open [start, end), so consecutive months can't double-count a booking on the boundary."""
+    period_start: date
+    period_end: date
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        if self.period_end <= self.period_start:
+            raise ValueError("period_end must be after period_start")
+        return self
+
+
+class InvoiceStatusUpdate(_Input):
+    status: Literal["draft", "sent", "paid", "void"]
+
+
+class InvoiceLineResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    # Frozen at generation, not read through the FKs below — a sent invoice says what was billed then.
+    description: str
+    amount: float
+    enrollment_id: int | None = None
+    booking_id: int | None = None
+
+
+class InvoiceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str = Field(validation_alias="public_id")
+    payer_id: int
+    payer_name: str
+    period_start: date
+    period_end: date
+    status: str
+    total: float
+    sent_at: datetime | None = None
+    paid_at: datetime | None = None
+    created: datetime
+    lines: list[InvoiceLineResponse] = []
+
+
+class InvoicePagedResponse(BaseModel):
+    items: list[InvoiceResponse]
+    total: int
+
+
+class InvoiceLineInput(_Input):
+    """A line an admin writes by hand, or an edit to a generated one. Drafts only.
+
+    This is the escape hatch that keeps proration out of the codebase: when a generated line is
+    wrong — a half month, a goodwill discount — you fix the number instead of teaching the
+    generator a new rule.
+    """
+    description: str
+    amount: float

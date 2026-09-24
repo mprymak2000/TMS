@@ -93,6 +93,12 @@ def handle_fee_and_payout(new_lesson: Lesson, lesson_in: LessonCreate | LessonUp
         new_lesson.is_fee_overridden = True
     # or calculate it based on normal rate and hours if not
     else:
+        # rate is nullable since billing terms moved to rate + rate_unit, so there may be nothing to
+        # multiply. Note this still assumes an hourly rate: a per_month client's fee comes out as
+        # hrs x their monthly fee, which is nonsense. Invoicing is what bills clients now; use
+        # fee_override here. See the todo in schemas.py.
+        if db_enrollment.rate is None:
+            raise HTTPException(status_code=400, detail="Client has no rate set — set one, or pass fee_override")
         new_lesson.fee = (lesson_in.hrs or 0) * db_enrollment.rate
         new_lesson.is_fee_overridden = False
 
@@ -105,6 +111,9 @@ def handle_fee_and_payout(new_lesson: Lesson, lesson_in: LessonCreate | LessonUp
         new_lesson.tutor_payout = lesson_in.tutor_pay_override
         new_lesson.is_tutor_payout_overridden = True
     elif lesson_in.hrs == 0 and lesson_in.fee_override is not None:
+        # The proportional cut needs a rate to be proportional to. Null or zero, and there isn't one.
+        if not db_enrollment.rate:
+            raise HTTPException(status_code=400, detail="Client has no rate set — pass tutor_pay_override")
         new_lesson.tutor_payout = lesson_in.fee_override * (db_tutor.pay_rate / db_enrollment.rate)
         new_lesson.is_tutor_payout_overridden = False
     else:

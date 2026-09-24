@@ -18,13 +18,13 @@ def _contact(client, first="Student", last="A", email=None):
 
 
 enrollment_required = {
-    "rate": 55,
     "start_date": "2021-04-01",
 }
 
 #will be updated in every mutable field
 enrollment_wrong = {
     "rate": 1,
+    "rate_unit": "per_session",
     "start_date": "1999-01-01",
     "is_active": False,
     "grade": 150,
@@ -33,6 +33,7 @@ enrollment_wrong = {
 
 enrollment_correct = {
     "rate": 65,
+    "rate_unit": "per_hour",
     "start_date": "2022-10-01",
     "is_active": True,
     "grade": 11,
@@ -55,9 +56,11 @@ def test_enroll_required_fields(client):
     response = client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_required)
     assert response.status_code == 201
     data = response.json()
-    assert data["rate"] == enrollment_required["rate"]
     assert data["start_date"] == enrollment_required["start_date"]
     assert data["is_active"]  # true is default value
+    # Enrolled with no terms agreed yet. Their bookings fall back to the link's price meanwhile.
+    assert data["rate"] is None
+    assert data["rate_unit"] is None
     assert data["grade"] is None
     assert data["birthday"] is None
 
@@ -150,7 +153,7 @@ def test_contact_put_can_carry_the_enrollment(client):
     assert response.status_code == 200
     body = response.json()
     assert body["last_name"] == "Chen-Alvarez"
-    assert body["enrollment"]["rate"] == enrollment_required["rate"]
+    assert body["enrollment"]["start_date"] == enrollment_required["start_date"]
 
 
 def test_contact_put_without_enrollment_leaves_it_alone(client):
@@ -183,7 +186,7 @@ def test_enrollment_is_nested_on_the_contact(client):
     contact = _contact(client)
     client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_required)
     row = next(c for c in client.get("/contacts/").json()["items"] if c["id"] == contact["id"])
-    assert row["enrollment"]["rate"] == enrollment_required["rate"]
+    assert row["enrollment"]["start_date"] == enrollment_required["start_date"]
 
 
 def test_unenrolled_contact_has_null_enrollment(client):
