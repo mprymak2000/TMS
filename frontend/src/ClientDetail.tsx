@@ -1,10 +1,12 @@
 import { useState, useEffect } from 'react'
-import { TextInput, NumberInput, Switch, Button, Menu } from '@mantine/core'
+import { TextInput, NumberInput, Select, Button, Menu } from '@mantine/core'
 import { IconDotsVertical, IconTrash, IconPlus } from '@tabler/icons-react'
 import type { Contact, ContactListRow, ContactRelationships, Enrollment } from './types'
 import { extractError } from './utils'
 
 const API = import.meta.env.VITE_API_URL
+
+const RATE_LABEL = { per_session: ' per session', per_hour: '/hr', per_month: '/mo' } as const
 
 interface Props {
     client: ContactListRow
@@ -62,8 +64,10 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
     // there's no switch that could pretend otherwise; removal is its own guarded action.
     const [enrolling, setEnrolling] = useState(client.enrollment !== null)
     const [rate, setRate] = useState<number | string>(client.enrollment?.rate ?? '')
-    const [startDate, setStartDate] = useState(client.enrollment?.start_date ?? '')
-    const [isActive, setIsActive] = useState(client.enrollment?.is_active ?? true)
+    const [rateUnit, setRateUnit] = useState<string | null>(client.enrollment?.rate_unit ?? null)
+    const [startedOn, setStartedOn] = useState(client.enrollment?.started_on ?? '')
+    // Setting this closes the stint. The next save then opens a new one, which is what re-enrolling is.
+    const [endedOn, setEndedOn] = useState(client.enrollment?.ended_on ?? '')
     const [grade, setGrade] = useState<number | string>(client.enrollment?.grade ?? '')
     const [birthday, setBirthday] = useState(client.enrollment?.birthday ?? '')
 
@@ -72,16 +76,16 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
         setFirst(client.first_name); setLast(client.last_name)
         setEmail(client.email ?? ''); setPhone(client.phone ?? '')
         setEnrolling(withEnrollment || client.enrollment !== null)
-        setRate(client.enrollment?.rate ?? ''); setStartDate(client.enrollment?.start_date ?? '')
-        setIsActive(client.enrollment?.is_active ?? true)
+        setRate(client.enrollment?.rate ?? ''); setRateUnit(client.enrollment?.rate_unit ?? null)
+        setStartedOn(client.enrollment?.started_on ?? ''); setEndedOn(client.enrollment?.ended_on ?? '')
         setGrade(client.enrollment?.grade ?? ''); setBirthday(client.enrollment?.birthday ?? '')
         setFormError(null)
         setEditing(true)
     }
 
     // Both sides of the dirty check go through here, so the field list and key order match and
-    // JSON.stringify can compare them. Note there's no `id` on the enrollment: EnrollmentInput
-    // forbids extra fields, and the id is the contact's anyway.
+    // JSON.stringify can compare them. Only the fields EnrollmentInput accepts — it forbids extras,
+    // so `id`, `contact_id` and `payer_id` stay out.
     const buildPayload = (
         c: Pick<ContactListRow, 'first_name' | 'last_name' | 'email' | 'phone'>,
         e: Enrollment | null,
@@ -92,9 +96,10 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
         phone: c.phone || null,
         ...(e && {
             enrollment: {
+                started_on: e.started_on,
+                ended_on: e.ended_on,
+                rate_unit: e.rate_unit,
                 rate: e.rate,
-                start_date: e.start_date,
-                is_active: e.is_active,
                 grade: e.grade,
                 birthday: e.birthday,
             },
@@ -103,16 +108,18 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
 
     const handleSave = async () => {
         if (!first.trim() || !last.trim()) { setFormError('First and last name are required.'); return }
-        if (enrolling && (rate === '' || Number(rate) <= 0)) { setFormError('Rate must be greater than 0.'); return }
-        if (enrolling && !startDate) { setFormError('Start date is required.'); return }
+        if (enrolling && !startedOn) { setFormError('Start date is required.'); return }
+        // A rate needs a unit to mean anything. A unit with no rate is fine: plan picked, not priced.
+        if (enrolling && rate !== '' && !rateUnit) { setFormError('Pick how they are charged.'); return }
 
         const payload = buildPayload(
             { first_name: first.trim(), last_name: last.trim(), email: email.trim(), phone: phone.trim() },
             enrolling ? {
-                id: client.id,
-                rate: Number(rate),
-                start_date: startDate,
-                is_active: isActive,
+                id: 0, contact_id: client.id, payer_id: null,   // not sent; buildPayload drops them
+                started_on: startedOn,
+                ended_on: endedOn || null,
+                rate_unit: (rateUnit as Enrollment['rate_unit']) ?? null,
+                rate: rate === '' ? null : Number(rate),
                 grade: grade === '' ? null : Number(grade),
                 birthday: birthday || null,
             } : null,
@@ -153,9 +160,13 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                 <Section title="Enrollment">
                     {e ? (
                         <>
-                            <Row label="Rate">${e.rate}/hr</Row>
-                            <Row label="Started">{e.start_date}</Row>
-                            <Row label="Status">{e.is_active ? 'Active' : <span className="text-gray-400">Inactive</span>}</Row>
+                            <Row label="Rate">
+                                {e.rate === null
+                                    ? <span className="text-gray-400">No rate set</span>
+                                    : `$${e.rate}${e.rate_unit ? RATE_LABEL[e.rate_unit] : ''}`}
+                            </Row>
+                            <Row label="Started">{e.started_on}</Row>
+                            {e.ended_on && <Row label="Ended">{e.ended_on}</Row>}
                             {e.grade !== null && <Row label="Grade">{e.grade}</Row>}
                             {e.birthday && <Row label="Birthday">{e.birthday}</Row>}
                         </>
@@ -218,11 +229,23 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
             {enrolling && (
                 <Section title="Enrollment">
                     <div className="grid grid-cols-2 gap-3">
-                        <NumberInput label="Rate ($/hr)" value={rate} onChange={setRate} min={0} />
-                        <TextInput label="Start date" type="date" value={startDate} onChange={e => setStartDate(e.target.value)} />
+                        <NumberInput label="Rate" value={rate} onChange={setRate} min={0} />
+                        <Select
+                            label="Charged"
+                            data={[
+                                { value: 'per_session', label: 'Per session' },
+                                { value: 'per_hour', label: 'Per hour' },
+                                { value: 'per_month', label: 'Per month' },
+                            ]}
+                            value={rateUnit}
+                            onChange={setRateUnit}
+                            clearable
+                        />
+                        <TextInput label="Started" type="date" value={startedOn} onChange={e => setStartedOn(e.target.value)} />
+                        {/* Setting this closes the stint. Saving again afterwards opens a new one. */}
+                        <TextInput label="Ended" type="date" value={endedOn} onChange={e => setEndedOn(e.target.value)} />
                         <NumberInput label="Grade" value={grade} onChange={setGrade} min={0} />
                         <TextInput label="Birthday" type="date" value={birthday} onChange={e => setBirthday(e.target.value)} />
-                        <Switch label="Active" checked={isActive} onChange={e => setIsActive(e.currentTarget.checked)} className="col-span-2" />
                     </div>
                 </Section>
             )}

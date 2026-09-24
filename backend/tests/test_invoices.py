@@ -21,7 +21,7 @@ def _contact(client, first, last="Test"):
 
 
 def _enroll(client, contact_id, **terms):
-    body = {"start_date": "2026-01-01", **terms}
+    body = {"started_on": "2026-01-01", **terms}
     return client.put(f"/contacts/{contact_id}/enrollment", json=body).json()
 
 
@@ -94,14 +94,14 @@ def _amounts(invoice):
 
 def test_rate_without_unit_rejected(client):
     c = _contact(client, "NoUnit")
-    r = client.put(f"/contacts/{c['id']}/enrollment", json={"start_date": "2026-01-01", "rate": 50})
+    r = client.put(f"/contacts/{c['id']}/enrollment", json={"started_on": "2026-01-01", "rate": 50})
     assert r.status_code == 422
 
 
 def test_unknown_rate_unit_rejected(client):
     c = _contact(client, "BadUnit")
     r = client.put(f"/contacts/{c['id']}/enrollment",
-                   json={"start_date": "2026-01-01", "rate": 50, "rate_unit": "per_fortnight"})
+                   json={"started_on": "2026-01-01", "rate": 50, "rate_unit": "per_fortnight"})
     assert r.status_code == 422
 
 
@@ -109,7 +109,7 @@ def test_unit_without_rate_is_allowed(client):
     """Plan picked, admin hasn't priced it yet — the state three exclusive columns couldn't express."""
     c = _contact(client, "Pending")
     r = client.put(f"/contacts/{c['id']}/enrollment",
-                   json={"start_date": "2026-01-01", "rate_unit": "per_month"})
+                   json={"started_on": "2026-01-01", "rate_unit": "per_month"})
     assert r.status_code == 201
     assert r.json()["rate"] is None
 
@@ -203,14 +203,24 @@ def test_plan_line_appears_without_any_bookings(client):
 
 def test_plan_not_billed_before_it_starts(client):
     c = _contact(client, "StartsLater")
-    _enroll(client, c["id"], rate=400, rate_unit="per_month", start_date="2026-04-01")
+    _enroll(client, c["id"], rate=400, rate_unit="per_month", started_on="2026-04-01")
     assert _generate(client) == []
 
 
-def test_inactive_plan_is_not_billed(client):
+def test_closed_stint_is_not_billed(client):
+    """They left in February, so March owes nothing."""
     c = _contact(client, "Left")
-    _enroll(client, c["id"], rate=400, rate_unit="per_month", is_active=False)
+    _enroll(client, c["id"], rate=400, rate_unit="per_month", ended_on="2026-02-15")
     assert _generate(client) == []
+
+
+def test_stint_closing_mid_period_still_bills(client):
+    """Overlap is what counts, not whether it's still open. Proration is backlogged, so it's the
+    full amount — see the roadmap."""
+    c = _contact(client, "LeftMidMonth")
+    _enroll(client, c["id"], rate=400, rate_unit="per_month", ended_on="2026-03-20")
+    inv = _generate(client)[0]
+    assert _amounts(inv) == [400]
 
 
 # --- booking.charge override ---
@@ -303,13 +313,27 @@ def test_no_payer_means_they_are_billed_themselves(client):
 
 # --- re-running ---
 
-def test_regenerating_rebuilds_rather_than_duplicating(client, link, tutor):
+# Create only, so a re-run is a no-op rather than a rebuild. That's what stops a bulk job silently
+# undoing hand-edits on someone else's draft.
+def test_regenerating_skips_what_already_exists(client, link, tutor):
     c = _contact(client, "Rerun")
     _booking(link, tutor, c["id"], c["id"])
     first = _generate(client)[0]
-    second = _generate(client)[0]
-    assert second["id"] == first["id"]          # same row, drafts are rebuilt in place
-    assert _amounts(second) == [80]
+
+    assert _generate(client) == []
+    after = client.get(f"/invoices/{first['id']}").json()
+    assert _amounts(after) == [80]
+
+
+def test_new_work_needs_a_refresh_not_a_regenerate(client, link, tutor):
+    c = _contact(client, "MoreWork")
+    _booking(link, tutor, c["id"], c["id"], day=5)
+    inv = _generate(client)[0]
+    _booking(link, tutor, c["id"], c["id"], day=12)
+
+    assert _generate(client) == []                        # the invoice exists, so generate leaves it
+    refreshed = client.post(f"/invoices/{inv['id']}/refresh").json()
+    assert _amounts(refreshed) == [80, 80]
 
 
 def test_a_sent_invoice_is_left_alone(client, link, tutor):

@@ -1,10 +1,12 @@
 import logging
 import os
 import procrastinate
+from sqlalchemy import and_
+from sqlalchemy.orm import joinedload
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import SessionLocal
-from models import Booking, BookingSeries, Enrollment, Lesson, Settings
+from models import Booking, BookingSeries, Contact, Enrollment, Lesson, Settings
 from billing import generate_invoices
 from booking_utils import _ensure_occurrence, active_series_filter, indefinite_series_filter, is_series_active, series_step
 
@@ -135,11 +137,20 @@ def draft_lessons(timestamp: int):
             return
         tz = ZoneInfo(settings.business_timezone)
 
-        # An enrollment is keyed on the attendee's contact id, so only bookings whose attendee is
-        # enrolled can produce a lesson — everyone else has no rate to bill at.
+        # Only bookings whose attendee has an open enrollment can produce a lesson — everyone else
+        # has no rate to bill at.
         bookings = (
             db.query(Booking)
-            .join(Enrollment, Enrollment.id == Booking.attendee_id)
+            .join(Enrollment, and_(
+                Enrollment.contact_id == Booking.attendee_id,
+                Enrollment.ended_on.is_(None),
+            ))
+            # The join filters but doesn't populate, so preload what the loop walks — otherwise it's
+            # three lazy queries per booking.
+            .options(
+                joinedload(Booking.attendee).selectinload(Contact.enrollments),
+                joinedload(Booking.tutor),
+            )
             .filter(
                 Booking.status == "confirmed",
                 Booking.start <= datetime.now(UTC),
@@ -151,7 +162,7 @@ def draft_lessons(timestamp: int):
         created = 0
         for booking in bookings:
             hrs = (booking.end - booking.start).total_seconds() / 3600
-            enrollment = booking.attendee.enrollment
+            enrollment = booking.attendee.current_enrollment
             # rate is nullable now, and this assumes an hourly one either way. Invoicing bills
             # clients; skip rather than record a fee of None or hrs x someone's monthly plan.
             if enrollment.rate is None or enrollment.rate_unit != "per_hour":

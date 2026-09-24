@@ -34,14 +34,18 @@ class Contact(Base):
     # every contact is unverified, so the profile is last-write-wins from the newest booking.
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
-    # uselist=False: the PK guarantees one row, but the ORM can't infer that from the key shape.
-    # passive_deletes: let the DB cascade. Without it SQLAlchemy tries to null the child's FK, which
-    # here is its primary key.
-    # foreign_keys: Enrollment points here twice — its PK, and payer_id.
-    enrollment = relationship(
-        "Enrollment", back_populates="contact", uselist=False, passive_deletes=True,
-        foreign_keys="Enrollment.id",
+    # Every stint, newest first. passive_deletes: let the DB cascade instead of SQLAlchemy nulling
+    # the children's FK first. foreign_keys: Enrollment points here twice, contact_id and payer_id.
+    enrollments = relationship(
+        "Enrollment", back_populates="contact", passive_deletes=True,
+        foreign_keys="Enrollment.contact_id",
+        order_by="Enrollment.started_on.desc()",
     )
+
+    @property
+    def current_enrollment(self):
+        """The open stint, if they're a client right now. At most one — see the partial index."""
+        return next((e for e in self.enrollments if e.ended_on is None), None)
 
 
 class ContactManager(Base):
@@ -71,13 +75,19 @@ _PRICE_UNITS_SQL = str(PRICE_UNITS)
 
 
 class Enrollment(Base):
-    """What's true of a contact because they're enrolled here — an extension of the person, not a
-    thing they have. Never reassigned, never swapped for a fresh one, so it has no identity of its
-    own: `id` is the contact's id, which is the joined-table-inheritance pattern. Admin-created,
-    since a guest can't supply a rate.
+    """One stint of being a client here. Many per contact, at most one open.
+
+    Clients leave for the summer and come back, sometimes at a new rate, so this is a relationship
+    over time rather than a property of the person — employment records, not a subclass. Terms sit on
+    the stint so a past one knows what it charged. The open stint is edited in place; a rate change
+    doesn't fork it. New row only when someone actually left and came back.
     """
     __tablename__ = "enrollments"
     __table_args__ = (
+        # One open stint per contact. Partial, so closed ones pile up freely.
+        Index("uq_enrollment_open_per_contact", "contact_id", unique=True,
+              sqlite_where=text("ended_on IS NULL"), postgresql_where=text("ended_on IS NULL")),
+        CheckConstraint("ended_on IS NULL OR ended_on >= started_on", name="chk_enrollment_dates_order"),
         CheckConstraint(
             f"rate_unit IS NULL OR rate_unit IN {_RATE_UNITS_SQL}",
             name="chk_enrollment_rate_unit",
@@ -87,27 +97,32 @@ class Enrollment(Base):
         CheckConstraint("rate IS NULL OR rate >= 0", name="chk_enrollment_rate_non_negative"),
     )
 
-    # PK and FK in one column. Being the PK enforces one-per-contact without a separate UNIQUE;
-    # CASCADE because there's no key for the row to exist under once the contact is gone.
-    id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), primary_key=True)
-    start_date = Column(Date, nullable=False)
-    is_active = Column(Boolean, nullable=False, default=True)
+    id = Column(Integer, primary_key=True, index=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False, index=True)
+    started_on = Column(Date, nullable=False)
+    # Null means current. Replaces an is_active flag — the date derives the boolean, and two fields
+    # for one fact drift apart.
+    ended_on = Column(Date, nullable=True)
 
     # Both nullable: enrolled with no terms agreed is a real state, and bookings fall back to the link's price meanwhile.
     rate_unit = Column(String, nullable=True)
     rate = Column(Float, nullable=True)
     # Who gets the invoice; null means they pay for themselves. Not contact_managers, which grants
     # permission to book — a grandparent can pay while a parent books, and two parents on one child
-    # leave that table with no way to pick.
+    # leave that table with no way to pick. Per stint, so it can change year to year.
     payer_id = Column(Integer, ForeignKey("contacts.id"), nullable=True, index=True)
 
     # Here rather than on Contact because they're only ever collected for a student, never a payer.
     grade = Column(Integer, nullable=True)
     birthday = Column(Date, nullable=True)
 
-    contact = relationship("Contact", foreign_keys=[id], back_populates="enrollment")
+    contact = relationship("Contact", foreign_keys=[contact_id], back_populates="enrollments")
     payer = relationship("Contact", foreign_keys=[payer_id])
     lessons = relationship("Lesson", back_populates="enrollment")
+
+    @property
+    def is_active(self) -> bool:
+        return self.ended_on is None
 
 
 class Tutor(Base):
@@ -602,7 +617,7 @@ class Invoice(Base):
     paid_at = Column(DateTime(timezone=True), nullable=True)
     created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_modified = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
-``
+
     payer = relationship("Contact")
     lines = relationship("InvoiceLine", back_populates="invoice", cascade="all, delete-orphan")
 
@@ -627,6 +642,9 @@ class InvoiceLine(Base):
     booking_id = Column(Integer, ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True)
     description = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
+    # What the rules produced, set only when a human then changed the amount. Doubles as the
+    # "leave me alone" marker: refreshing invoice recomputes the lines where this is null and leaves the marked ones alone.
+    computed = Column(Float, nullable=True)
 
     invoice = relationship("Invoice", back_populates="lines")
 

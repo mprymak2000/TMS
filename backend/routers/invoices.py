@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 
-from billing import generate_invoices
+from billing import generate_invoices, refresh_invoice
 from database import get_db, get_settings
 from models import Invoice, InvoiceLine
 from schemas import (
@@ -20,6 +20,17 @@ _NEXT_STATUS = {
     "paid": {"void"},
     "void": set(),
 }
+
+
+def _editable_invoice(public_id: str, db: Session) -> Invoice:
+    """Drafts only. Once finalised, the lines are what the client was told they owe, so a mistake is
+    voided and reissued rather than edited underneath them."""
+    invoice = db.query(Invoice).filter(Invoice.public_id == public_id).first()
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+    if invoice.status != "draft":
+        raise HTTPException(status_code=409, detail="Only a draft invoice can be edited")
+    return invoice
 
 
 @router.get("/", response_model=InvoicePagedResponse)
@@ -64,9 +75,18 @@ def generate(
 ):
     """Draft invoices for a period, on demand. The monthly job calls the same code.
 
-    Re-runnable: a draft is rebuilt from scratch, anything already sent is left alone.
+    Create only: an invoice that already exists is skipped whatever its status. Rebuilding one is
+    /refresh, which you ask for rather than have happen to you.
     """
     return generate_invoices(db, body.period_start, body.period_end, settings)
+
+
+@router.post("/{public_id}/refresh", response_model=InvoiceResponse)
+def refresh(public_id: str, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Rebuild a draft against current data. Lines a human edited keep their amounts; the rest are
+    recomputed. Drafts only — a finalised invoice is a record, not a calculation."""
+    invoice = _editable_invoice(public_id, db)
+    return refresh_invoice(db, invoice, settings)
 
 
 @router.put("/{public_id}/status", response_model=InvoiceResponse)
@@ -93,19 +113,6 @@ def update_status(public_id: str, body: InvoiceStatusUpdate, db: Session = Depen
 
 
 # ── lines ────────────────────────────────────────────────────────────────────
-# Drafts only. Once an invoice is sent its lines are what the client was told they owe, so a mistake
-# is voided and reissued rather than edited underneath them.
-
-
-def _editable_invoice(public_id: str, db: Session) -> Invoice:
-    invoice = db.query(Invoice).filter(Invoice.public_id == public_id).first()
-    if not invoice:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-    if invoice.status != "draft":
-        raise HTTPException(status_code=409, detail="Only a draft invoice can be edited")
-    return invoice
-
-
 def _retotal(db: Session, invoice: Invoice) -> Invoice:
     db.flush()
     invoice.total = round(sum(line.amount for line in invoice.lines), 2)
@@ -124,12 +131,16 @@ def add_line(public_id: str, body: InvoiceLineInput, db: Session = Depends(get_d
 
 @router.put("/{public_id}/lines/{line_id}", response_model=InvoiceResponse)
 def update_line(public_id: str, line_id: int, body: InvoiceLineInput, db: Session = Depends(get_db)):
-    """Correct a generated line. Its booking_id/enrollment_id stay put, so the line still says where
-    it came from even once the number is hand-adjusted."""
+    """Correct a generated line. Its source FK stays put, so the line still says where it came from.
+
+    The first edit saves the generated amount into `computed`, which is both the record of what the
+    rules produced and the signal that a refresh must not overwrite this line."""
     invoice = _editable_invoice(public_id, db)
     line = next((l for l in invoice.lines if l.id == line_id), None)
     if line is None:
         raise HTTPException(status_code=404, detail="Line not found on this invoice")
+    if line.computed is None:
+        line.computed = line.amount   # later edits keep the original, not the previous edit
     line.description = body.description
     line.amount = body.amount
     return _retotal(db, invoice)

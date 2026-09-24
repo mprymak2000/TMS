@@ -19,6 +19,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, UTC
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from models import Booking, Enrollment, Invoice, InvoiceLine
@@ -39,7 +40,7 @@ def _link_amount(booking: Booking) -> float | None:
     return link.price * _hours(booking) if link.price_unit == "per_hour" else link.price
 
 
-def line_amount(booking: Booking, enrollment: Enrollment | None) -> float | None:
+def _line_amount(booking: Booking, enrollment: Enrollment | None) -> float | None:
     """Determine what this one booking bills. None means no line, so either covered by a subscription or unpriced."""
     
     # Admin override charge on booking. Always wins over enrollment or default link pricing.
@@ -71,77 +72,125 @@ def _period_bounds(period_start: date, period_end: date, settings) -> tuple[date
     )
 
 
-def generate_invoices(db: Session, period_start: date, period_end: date, settings) -> list[Invoice]:
-    """Draft one invoice per payer for the period. Re-runnable: a draft is rebuilt from scratch, a
-    sent or paid one is left alone — once it's gone out, it's a record, not a calculation."""
-    tz = ZoneInfo(settings.business_timezone)
-    start_utc, end_utc = _period_bounds(period_start, period_end, settings)
-    lines_by_payer: dict[int, list[InvoiceLine]] = defaultdict(list)
-
-    # get all bookings that STARTED inside the billing period (if lesson started in period 1 and ended in period 2, it's under period 1)
-    bookings = (
-        db.query(Booking)
-        .filter(Booking.status == "confirmed", Booking.start >= start_utc, Booking.start < end_utc)
-        .all()
+def _subscriptions(db: Session, period_start: date, period_end: date):
+    """Monthly stints overlapping the period. Started in June isn't billed for May, and someone who
+    left in April isn't billed for May either."""
+    return db.query(Enrollment).filter(
+        Enrollment.rate_unit == "per_month",
+        Enrollment.rate.isnot(None),
+        Enrollment.started_on < period_end,
+        or_(Enrollment.ended_on.is_(None), Enrollment.ended_on > period_start),
     )
 
-    # for every booking, get the attendee and calculate the line amount: 
-    # (either default link pricing, enrollment rate if exists, nothing if under a subscription or admin override charge).
-    # If an amount exists, add it to the lines_by_payer dictionary under who the booking bills to. 
-    # [payer 1: list of charges, payer 2: list of charges, etc.]
+
+def payers_with_activity(db: Session, period_start: date, period_end: date, settings) -> set[int]:
+    """Anyone the period could owe something for: bookings they paid for, or a monthly plan."""
+    start_utc, end_utc = _period_bounds(period_start, period_end, settings)
+    payers = {
+        payer_id for (payer_id,) in db.query(Booking.payer_id).filter(
+            Booking.status == "confirmed", Booking.start >= start_utc, Booking.start < end_utc,
+        ).distinct()
+    }
+    for enrollment in _subscriptions(db, period_start, period_end):
+        # client is attendee, either bill to them or a payer if they have one under their enrollment.
+        payers.add(enrollment.payer_id or enrollment.contact_id)
+    return payers
+
+
+def _lines_for_payer(db: Session, payer_id: int, period_start: date, period_end: date, settings) -> list[InvoiceLine]:
+    """Everything one payer owes for the period. The unit of work: generating and refreshing both
+    build an invoice out of exactly this."""
+    tz = ZoneInfo(settings.business_timezone)
+    start_utc, end_utc = _period_bounds(period_start, period_end, settings)
+    lines: list[InvoiceLine] = []
+
+    # bookings that STARTED inside the billing period (if a session started in period 1 and ended in
+    # period 2, it's under period 1)
+    bookings = (
+        db.query(Booking)
+        .filter(
+            Booking.payer_id == payer_id,
+            Booking.status == "confirmed",
+            Booking.start >= start_utc,
+            Booking.start < end_utc,
+        )
+        .all()
+    )
+    # either default link pricing, enrollment rate if one exists, or nothing at all if the session is
+    # covered by a subscription. An admin charge on the booking beats all of it.
     for booking in bookings:
         attendee = booking.attendee
-        amount = line_amount(booking, attendee.enrollment)
+        amount = _line_amount(booking, attendee.current_enrollment)
         if amount is None:
             continue
         start = booking.start if booking.start.tzinfo else booking.start.replace(tzinfo=UTC)
-        lines_by_payer[booking.payer_id].append(InvoiceLine(
+        lines.append(InvoiceLine(
             booking_id=booking.id,
             description=f"{attendee.first_name} {attendee.last_name} — session {start.astimezone(tz):%b %-d}",
             amount=amount,
         ))
 
-    ## Same process as above but for subscription lines. First, gather all active subscriptions from enrollments (ignore booking status like cancelled, no show, etc.)
-    # Append subscription lines to the lines_by_payer dictionary on the enrolled person or their assigned payer if one exists.
-    subscriptions = (
-        db.query(Enrollment)
-        .filter(
-            Enrollment.rate_unit == "per_month",
-            Enrollment.rate.isnot(None),
-            Enrollment.is_active.is_(True),
-            Enrollment.start_date < period_end, # new subscription in June isn't added to billing May 1-31st
-        )
-        .all()
-    )
-    for enrollment in subscriptions:
-        # client is attendee, either bill to them or a payer if they have one under their enrollment.
+    # Subscription lines aren't derived from bookings at all — a monthly fee is owed whether or not
+    # anyone showed up.
+    for enrollment in _subscriptions(db, period_start, period_end):
+        if (enrollment.payer_id or enrollment.contact_id) != payer_id:
+            continue
         client = enrollment.contact
-        lines_by_payer[enrollment.payer_id or enrollment.id].append(InvoiceLine(
+        lines.append(InvoiceLine(
             enrollment_id=enrollment.id,
             description=f"{client.first_name} {client.last_name} — monthly plan",
             amount=enrollment.rate,
         ))
 
-    # Turn each payer's pile of lines into one invoice. Payer + period is unique, so finding an
-    # existing row means this job is being re-run: reuse it if it's still a draft (keeping its id and
-    # public_id) and leave it alone entirely once it's been sent. At that point it's a record of
-    # what the client was told they owe, not a number we're still free to recalculate.
-    invoices = []
-    for payer_id, lines in lines_by_payer.items():
-        existing = (
-            db.query(Invoice)
-            .filter(Invoice.payer_id == payer_id, Invoice.period_start == period_start)
-            .first()
-        )
-        if existing is not None and existing.status != "draft":
-            continue
-        invoice = existing or Invoice(payer_id=payer_id, period_start=period_start, period_end=period_end)
-        invoice.lines = lines          # delete-orphan drops the last run's lines instead of appending
-        invoice.total = round(sum(line.amount for line in lines), 2)
-        db.add(invoice)
-        invoices.append(invoice)
+    return lines
 
+
+def _is_generated(line: InvoiceLine) -> bool:
+    """Produced by the rules and untouched since, so a refresh is free to replace it. A hand-added
+    line has no source, and an adjusted one kept what the rules said in `computed`."""
+    return line.computed is None and (line.booking_id is not None or line.enrollment_id is not None)
+
+
+def generate_invoice_for_payer(db: Session, payer_id: int, period_start: date, period_end: date,
+                               settings) -> Invoice | None:
+    """Create only. An existing invoice for this payer and period means this already ran, and a bulk
+    job has no business rewriting it — rebuilding one is refresh_invoice, which is something you ask
+    for rather than something that happens to you."""
+    exists = (
+        db.query(Invoice)
+        .filter(Invoice.payer_id == payer_id, Invoice.period_start == period_start)
+        .first()
+    )
+    if exists is not None:
+        return None
+    lines = _lines_for_payer(db, payer_id, period_start, period_end, settings)
+    if not lines:
+        return None
+    invoice = Invoice(payer_id=payer_id, period_start=period_start, period_end=period_end, lines=lines)
+    invoice.total = round(sum(line.amount for line in lines), 2)
+    db.add(invoice)
     db.commit()
-    for invoice in invoices:
-        db.refresh(invoice)   # pick up public_id / created / status defaults
+    db.refresh(invoice)   # pick up public_id / created / status defaults
+    return invoice
+
+
+def generate_invoices(db: Session, period_start: date, period_end: date, settings) -> list[Invoice]:
+    """Draft one invoice per payer for the period. One commit each, so a bad row costs that payer
+    their invoice rather than rolling back everyone's."""
+    invoices = []
+    for payer_id in payers_with_activity(db, period_start, period_end, settings):
+        invoice = generate_invoice_for_payer(db, payer_id, period_start, period_end, settings)
+        if invoice is not None:
+            invoices.append(invoice)
     return invoices
+
+
+def refresh_invoice(db: Session, invoice: Invoice, settings) -> Invoice:
+    """Rebuild a draft's generated lines against current data, keeping anything a human touched."""
+    kept = [line for line in invoice.lines if not _is_generated(line)]
+    invoice.lines = kept + _lines_for_payer(db, invoice.payer_id, invoice.period_start, invoice.period_end, settings)
+    db.flush()
+    invoice.total = round(sum(line.amount for line in invoice.lines), 2)
+    db.commit()
+    db.refresh(invoice)
+    return invoice

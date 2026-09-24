@@ -18,15 +18,14 @@ def _contact(client, first="Student", last="A", email=None):
 
 
 enrollment_required = {
-    "start_date": "2021-04-01",
+    "started_on": "2021-04-01",
 }
 
 #will be updated in every mutable field
 enrollment_wrong = {
     "rate": 1,
     "rate_unit": "per_session",
-    "start_date": "1999-01-01",
-    "is_active": False,
+    "started_on": "1999-01-01",
     "grade": 150,
     "birthday": "2009-01-01",
 }
@@ -34,8 +33,7 @@ enrollment_wrong = {
 enrollment_correct = {
     "rate": 65,
     "rate_unit": "per_hour",
-    "start_date": "2022-10-01",
-    "is_active": True,
+    "started_on": "2022-10-01",
     "grade": 11,
     "birthday": "2009-01-01",
 }
@@ -56,8 +54,8 @@ def test_enroll_required_fields(client):
     response = client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_required)
     assert response.status_code == 201
     data = response.json()
-    assert data["start_date"] == enrollment_required["start_date"]
-    assert data["is_active"]  # true is default value
+    assert data["started_on"] == enrollment_required["started_on"]
+    assert data["ended_on"] is None  # the open stint
     # Enrolled with no terms agreed yet. Their bookings fall back to the link's price meanwhile.
     assert data["rate"] is None
     assert data["rate_unit"] is None
@@ -65,11 +63,11 @@ def test_enroll_required_fields(client):
     assert data["birthday"] is None
 
 
-# The shared key is the whole point: an enrollment has no identity of its own to look up.
-def test_enrollment_id_is_the_contact_id(client):
+# A stint has its own id now — it's the contact it belongs to, not the contact itself.
+def test_enrollment_points_at_the_contact(client):
     contact = _contact(client)
     created = client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_required).json()
-    assert created["id"] == contact["id"]
+    assert created["contact_id"] == contact["id"]
 
 
 def test_enroll_all_fields(client):
@@ -77,7 +75,7 @@ def test_enroll_all_fields(client):
     response = client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_wrong)
     assert response.status_code == 201
     data = response.json()
-    assert not data["is_active"]
+    assert data["started_on"] == enrollment_wrong["started_on"]
     assert data["birthday"] == enrollment_wrong["birthday"]
     assert data["grade"] == enrollment_wrong["grade"]
 
@@ -99,14 +97,57 @@ def test_enroll_invalid_rate(client):
 
 def test_enroll_invalid_date(client):
     contact = _contact(client)
-    response = client.put(f"/contacts/{contact['id']}/enrollment", json={**enrollment_required, "start_date": "not-a-date"})
+    response = client.put(f"/contacts/{contact['id']}/enrollment", json={**enrollment_required, "started_on": "not-a-date"})
     assert response.status_code == 422
+
+
+# --- STINTS ---
+# Being a client is a relationship over time, not a property of the person: they leave for the
+# summer and come back, sometimes at a new rate.
+
+def test_closing_then_re_enrolling_makes_a_second_stint(client):
+    contact = _contact(client)
+    first = client.put(f"/contacts/{contact['id']}/enrollment",
+                       json={**enrollment_correct, "ended_on": "2025-06-30"}).json()
+    # No open stint now, so this opens one rather than editing the closed one.
+    second = client.put(f"/contacts/{contact['id']}/enrollment",
+                        json={"started_on": "2025-09-01", "rate": 80, "rate_unit": "per_hour"})
+    assert second.status_code == 201
+    assert second.json()["id"] != first["id"]
+
+    history = client.get(f"/contacts/{contact['id']}/enrollments").json()
+    assert len(history) == 2
+    # The closed one keeps what it charged — terms live on the stint, not the person.
+    assert history[0]["rate"] == 80 and history[0]["ended_on"] is None
+    assert history[1]["rate"] == enrollment_correct["rate"] and history[1]["ended_on"] == "2025-06-30"
+
+
+def test_the_roster_shows_only_the_open_stint(client):
+    contact = _contact(client)
+    client.put(f"/contacts/{contact['id']}/enrollment", json={**enrollment_correct, "ended_on": "2025-06-30"})
+    row = next(c for c in client.get("/contacts/").json()["items"] if c["id"] == contact["id"])
+    assert row["enrollment"] is None       # they left; history is a panel concern
+
+    client.put(f"/contacts/{contact['id']}/enrollment", json={"started_on": "2025-09-01", "rate": 80, "rate_unit": "per_hour"})
+    row = next(c for c in client.get("/contacts/").json()["items"] if c["id"] == contact["id"])
+    assert row["enrollment"]["rate"] == 80
+
+
+def test_ended_on_cannot_precede_started_on(client):
+    contact = _contact(client)
+    response = client.put(f"/contacts/{contact['id']}/enrollment",
+                          json={**enrollment_required, "ended_on": "2020-01-01"})
+    assert response.status_code == 422
+
+
+def test_enrollments_history_unknown_contact(client):
+    assert client.get("/contacts/9999/enrollments").status_code == 404
 
 
 # --- UPSERT ---
 
-# There can only ever be one, so the second call replaces rather than conflicting. That's what lets
-# the client save without first knowing whether this person is enrolled.
+# The PUT names the *open* stint, so a second call edits it rather than conflicting. That's what
+# lets the client save without first knowing whether this person is enrolled.
 def test_second_put_replaces_rather_than_conflicting(client):
     contact = _contact(client)
     assert client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_wrong).status_code == 201
@@ -135,8 +176,7 @@ def test_update_enrollment(client, enrolled):
     assert response.status_code == 200
     data = response.json()
     assert data["rate"] == enrollment_correct["rate"]
-    assert data["start_date"] == enrollment_correct["start_date"]
-    assert data["is_active"] == enrollment_correct["is_active"]
+    assert data["started_on"] == enrollment_correct["started_on"]
     assert data["grade"] == enrollment_correct["grade"]
 
 
@@ -153,7 +193,7 @@ def test_contact_put_can_carry_the_enrollment(client):
     assert response.status_code == 200
     body = response.json()
     assert body["last_name"] == "Chen-Alvarez"
-    assert body["enrollment"]["start_date"] == enrollment_required["start_date"]
+    assert body["enrollment"]["started_on"] == enrollment_required["started_on"]
 
 
 def test_contact_put_without_enrollment_leaves_it_alone(client):
@@ -186,7 +226,7 @@ def test_enrollment_is_nested_on_the_contact(client):
     contact = _contact(client)
     client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_required)
     row = next(c for c in client.get("/contacts/").json()["items"] if c["id"] == contact["id"])
-    assert row["enrollment"]["start_date"] == enrollment_required["start_date"]
+    assert row["enrollment"]["started_on"] == enrollment_required["started_on"]
 
 
 def test_unenrolled_contact_has_null_enrollment(client):
@@ -197,8 +237,8 @@ def test_unenrolled_contact_has_null_enrollment(client):
 
 # --- DELETE ---
 
-# For mistakes only. Someone who stopped coming gets is_active=False, which keeps their rate,
-# start date and grade; this throws all of it away.
+# For mistakes only. Someone who stopped coming gets an ended_on, which keeps their rate, dates and
+# grade; this throws all of it away.
 def test_delete_enrollment_leaves_the_contact(client):
     contact = _contact(client, first="ToDelete", last="Lastname")
     client.put(f"/contacts/{contact['id']}/enrollment", json=enrollment_wrong)
@@ -242,12 +282,12 @@ def test_enrolled_filter_only_returns_the_enrolled(client):
     assert client.get("/contacts/").json()["total"] == 2
 
 
-# Someone who left still has history worth finding, so the filter is "has an enrollment", not
-# "is currently enrolled".
-def test_enrolled_filter_includes_inactive(client):
+# The two filters answer different questions, so a closed stint passes one and not the other.
+def test_enrolled_is_ever_currently_enrolled_is_now(client):
     contact = _contact(client)
-    client.put(f"/contacts/{contact['id']}/enrollment", json={**enrollment_required, "is_active": False})
+    client.put(f"/contacts/{contact['id']}/enrollment", json={**enrollment_required, "ended_on": "2024-06-30"})
     assert client.get("/contacts/?enrolled=true").json()["total"] == 1
+    assert client.get("/contacts/?currently_enrolled=true").json()["total"] == 0
 
 
 def test_enrolled_filter_composes_with_search(client):

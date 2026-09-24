@@ -59,8 +59,7 @@ def setup(client):
     enrollment = client.put(f"/contacts/{contact['id']}/enrollment", json={
         "rate": 50,
         "rate_unit": "per_hour",   # what Lesson's fee math assumes
-        "start_date": "2026-01-01",
-        "is_active": True,
+        "started_on": "2026-01-01",
     }).json()
     tutor = client.post("/tutors/", json={
         "first_name": "Tutor",

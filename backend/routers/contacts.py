@@ -40,7 +40,8 @@ def _list_row(contact: Contact) -> ContactListResponse:
     return ContactListResponse(
         **ContactResponse.model_validate(contact).model_dump(),
         created=contact.created,
-        enrollment=EnrollmentResponse.model_validate(contact.enrollment) if contact.enrollment else None,
+        # The open stint only. Past ones are read through /contacts/{id}/enrollments.
+        enrollment=EnrollmentResponse.model_validate(contact.current_enrollment) if contact.current_enrollment else None,
     )
 
 
@@ -48,6 +49,7 @@ def _list_row(contact: Contact) -> ContactListResponse:
 def get_contacts(
     search: str | None = Query(default=None),
     enrolled: bool = Query(default=False),
+    currently_enrolled: bool = Query(default=False),
     manages: bool = Query(default=False),
     sort: str = Query(default="name"),
     direction: str = Query(default="asc"),
@@ -58,10 +60,13 @@ def get_contacts(
     """Search, sort and paging happen here rather than in the browser: a large practice's roster is
     too big to ship whole, and the page needs a total it can't compute from one page.
 
-    Two independent booleans rather than one enum, so they combine — a payer can also be enrolled.
-    `enrolled` means "has an enrollment", inactive included: someone who left still has history worth
-    finding. It's not "has ever attended", which is a different set. `manages` comes from
-    contact_managers, not booking counts — the standing relationship, not having transacted."""
+    Independent booleans rather than one enum, so they combine — a payer can also be enrolled — and
+    search ANDs with all of them. `enrolled` is ever, `currently_enrolled` is an open stint; neither
+    is "has ever attended", which is a different set again. `manages` comes from contact_managers,
+    not booking counts — the standing relationship, not having transacted.
+
+    Note the roster carries only the *current* enrollment per row. History is a panel concern, read
+    through /contacts/{id}/enrollments."""
     if sort not in SORT_COLUMNS:
         raise HTTPException(status_code=422, detail=f"sort must be one of {sorted(SORT_COLUMNS)}")
     if direction not in ("asc", "desc"):
@@ -69,7 +74,9 @@ def get_contacts(
 
     query = db.query(Contact)
     if enrolled:
-        query = query.filter(Contact.enrollment.has())
+        query = query.filter(Contact.enrollments.any())
+    if currently_enrolled:
+        query = query.filter(Contact.enrollments.any(Enrollment.ended_on.is_(None)))
     if manages:
         query = query.filter(
             db.query(ContactManager).filter(ContactManager.manager_id == Contact.id).exists()
@@ -192,15 +199,23 @@ def delete_contact(contact_id: int, db: Session = Depends(get_db)):
 
 
 # ── enrollment ───────────────────────────────────────────────────────────────
-# A sub-resource, not a table of its own: an enrollment extends one contact, is never reassigned,
-# and its id IS that contact's id — so the URL names it before the row exists.
+# A sub-resource: /contacts/{id}/enrollment names *the open stint*, which is an address that exists
+# whether or not a row does. Past stints are read through /enrollments.
+
+
+def _open_enrollment(db: Session, contact_id: int) -> Enrollment | None:
+    return (
+        db.query(Enrollment)
+        .filter(Enrollment.contact_id == contact_id, Enrollment.ended_on.is_(None))
+        .first()
+    )
 
 
 def _upsert_enrollment(db: Session, contact_id: int, enrollment_in: EnrollmentInput) -> tuple[Enrollment, bool]:
     """Write only — no commit, so a caller can fold it into a larger transaction. Returns (row, created)."""
-    db_enrollment = db.query(Enrollment).filter(Enrollment.id == contact_id).first()
+    db_enrollment = _open_enrollment(db, contact_id)
     if db_enrollment is None:
-        db_enrollment = Enrollment(id=contact_id, **enrollment_in.model_dump())
+        db_enrollment = Enrollment(contact_id=contact_id, **enrollment_in.model_dump())
         db.add(db_enrollment)
         return db_enrollment, True
     for key, value in enrollment_in.model_dump().items():
@@ -208,10 +223,26 @@ def _upsert_enrollment(db: Session, contact_id: int, enrollment_in: EnrollmentIn
     return db_enrollment, False
 
 
+@router.get("/{contact_id:int}/enrollments", response_model=list[EnrollmentResponse])
+def get_enrollments(contact_id: int, db: Session = Depends(get_db)):
+    """Every stint, newest first. The roster carries only the open one."""
+    if not db.query(Contact).filter(Contact.id == contact_id).first():
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return (
+        db.query(Enrollment)
+        .filter(Enrollment.contact_id == contact_id)
+        .order_by(Enrollment.started_on.desc())
+        .all()
+    )
+
+
 @router.put("/{contact_id:int}/enrollment", response_model=EnrollmentResponse)
 def upsert_enrollment(contact_id: int, enrollment_in: EnrollmentInput, response: Response, db: Session = Depends(get_db)):
-    """One call for enrolling and for editing. There can only ever be one, and the address doesn't
-    depend on whether it exists, so PUT covers both — 201 when it creates, 200 when it replaces."""
+    """One call for enrolling, re-enrolling and editing — they're the same operation against the open
+    stint. 201 when there wasn't one, 200 when there was.
+
+    Closing a stint is this same PUT with `ended_on` set; the next one then creates a new row.
+    """
     if not db.query(Contact).filter(Contact.id == contact_id).first():
         raise HTTPException(status_code=404, detail="Contact not found")
     db_enrollment, created = _upsert_enrollment(db, contact_id, enrollment_in)
@@ -224,18 +255,15 @@ def upsert_enrollment(contact_id: int, enrollment_in: EnrollmentInput, response:
 
 @router.delete("/{contact_id:int}/enrollment", response_model=EnrollmentResponse)
 def delete_enrollment(contact_id: int, db: Session = Depends(get_db)):
-    """For mistakes only — it says "this person was never a student", which is usually false.
+    """Removes the open stint. For mistakes only, a quick delete which undoes the enrollment. 
+    Someone who stopped coming gets an `ended_on` instead, which keeps the row and its terms.
 
-    The row holds their rate, start date, grade and birthday. Someone who stopped coming gets
-    is_active=False, which keeps all of it; deleting throws it away.
-
-    The contact is untouched either way — they just have no negotiated rate, so bookings fall back
-    to the link's price. Bookings never reference the enrollment at all, only lessons do, which is
-    why lessons are the only thing that can block this."""
-    db_enrollment = db.query(Enrollment).filter(Enrollment.id == contact_id).first()
+    The contact stays. With no enrollment their pricing just falls back to the link's. Only lessons
+    block this, since nothing else points at an enrollment."""
+    db_enrollment = _open_enrollment(db, contact_id)
     if not db_enrollment:
-        raise HTTPException(status_code=404, detail="Contact is not enrolled")
-    if db.query(Lesson).filter(Lesson.enrollment_id == contact_id).first():
+        raise HTTPException(status_code=404, detail="Contact is not currently enrolled")
+    if db.query(Lesson).filter(Lesson.enrollment_id == db_enrollment.id).first():
         raise HTTPException(status_code=409, detail="Cannot delete an enrollment with recorded lessons")
     response = EnrollmentResponse.model_validate(db_enrollment)
     db.delete(db_enrollment)

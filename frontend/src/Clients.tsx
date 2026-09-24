@@ -15,13 +15,18 @@ const PAGE_SIZE = 50
 
 type Sort = 'name' | 'email' | 'created'
 
-// Enrollment is what the roster shows about a person beyond identity: the rate, and whether they're
-// still active. Roles (payer / attendee) live on bookings, not here — the filters answer those.
+const RATE_SUFFIX = { per_session: '/session', per_hour: '/hr', per_month: '/mo' } as const
+
+// What the roster shows beyond identity: their terms, and whether the stint is still open. Roles
+// (payer / attendee) live on bookings, not here — the filters answer those. The roster carries only
+// the open stint; history is a panel concern.
 const EnrollmentCell = ({ e }: { e: ContactListRow['enrollment'] }) => {
     if (!e) return <span className="text-xs text-gray-300">—</span>
+    const open = e.ended_on === null
     return (
-        <span className={`text-xs ${e.is_active ? 'text-gray-700' : 'text-gray-400'}`}>
-            ${e.rate}/hr{!e.is_active && ' · Inactive'}
+        <span className={`text-xs ${open ? 'text-gray-700' : 'text-gray-400'}`}>
+            {e.rate === null ? 'No rate set' : `$${e.rate}${e.rate_unit ? RATE_SUFFIX[e.rate_unit] : ''}`}
+            {!open && ` · Ended ${e.ended_on}`}
         </span>
     )
 }

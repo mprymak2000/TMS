@@ -69,10 +69,11 @@ class ContactCreate(_Input):
 class EnrollmentInput(_Input):
     """One schema for create and update — the URL carries the contact, and PUT upserts, so there's
     no case where the two differ."""
-    start_date: date
-    is_active: bool = True
-    # Both optional: enrolled with no terms agreed is a real state. A mode with no rate is the
-    # half-set case (plan chosen, not yet priced); a rate with no mode says nothing.
+    started_on: date
+    # Set it to close the stint. The next PUT then opens a new one, which is what re-enrolling is.
+    ended_on: date | None = None
+    # Both optional: enrolled with no terms agreed is a real state. A unit with no rate is the
+    # half-set case (plan chosen, not yet priced); a rate with no unit says nothing.
     rate_unit: Literal["per_session", "per_hour", "per_month"] | None = None
     rate: float | None = Field(default=None, ge=0)
     payer_id: int | None = None
@@ -83,6 +84,8 @@ class EnrollmentInput(_Input):
     def validate_terms(self):
         if self.rate is not None and self.rate_unit is None:
             raise ValueError("rate_unit is required when a rate is set")
+        if self.ended_on is not None and self.ended_on < self.started_on:
+            raise ValueError("ended_on cannot be before started_on")
         return self
 
 
@@ -111,9 +114,10 @@ class ContactResponse(BaseModel):
 class EnrollmentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int   # the contact's id — see Enrollment's docstring
-    start_date: date
-    is_active: bool
+    id: int
+    contact_id: int
+    started_on: date
+    ended_on: date | None = None   # null = the open stint
     rate_unit: str | None = None
     rate: float | None = None
     payer_id: int | None = None
@@ -920,6 +924,8 @@ class InvoiceLineResponse(BaseModel):
     # Frozen at generation, not read through the FKs below — a sent invoice says what was billed then.
     description: str
     amount: float
+    # Set only when adjusted, so the UI can show what the rules had said.
+    computed: float | None = None
     enrollment_id: int | None = None
     booking_id: int | None = None
 

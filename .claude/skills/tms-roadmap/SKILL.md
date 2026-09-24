@@ -190,7 +190,11 @@ rather than trips through the slot picker, so a retired link's rules are read by
       diverged from the plan:
       1. **`Student` → `Enrollment`** as class-table inheritance: `enrollments.id` is a PK that is
          also the FK to `contacts.id` (`ON DELETE CASCADE`, `passive_deletes=True` on the
-         relationship). `Lesson.enrollment_id`. `/students` router deleted; enrollment is a
+         relationship). **Superseded by 10b Pass B** — one row per person forever rests on
+         enrollment being "a single state per person, not a repeatable one-to-many relationship,"
+         which is false here: clients re-enroll annually. Enrollment becomes a sequence of stints
+         with its own PK. Everything else in this list still holds, the sub-resource URL included.
+         `Lesson.enrollment_id`. `/students` router deleted; enrollment is a
          **sub-resource** — `PUT /contacts/{id}/enrollment` upserts (201/200), `DELETE` removes.
          `PUT /contacts/{id}` also takes a nested `enrollment` in the same commit. No enrollments
          list endpoint; `GET /contacts/?enrolled=true` is that list.
@@ -210,56 +214,56 @@ rather than trips through the slot picker, so a retired link's rules are read by
       Promote to a `/clients/:id` route only if the panel feels cramped once booking sections land.
 
       **`rate` stayed a single float.** 10b replaces it.
-    - **10b — billing rates.** Replaces the bare `rate` float. Design settled in conversation, not
-      built:
+    - **10b — billing and invoicing.** Two passes. **Pass A shipped** (commit `8067859`): terms on
+      the enrollment and the link, and a working invoice generator. **Pass B** is the remodel plus
+      the lifecycle fixes Pass A left open — see `.claude/plans/enrollment-pass-10b-billing-and-invoicing.md`.
 
-      ```
-      enrollment:    rate_per_session  XOR  rate_per_hour  XOR  rate_per_month
-      booking_link:  price_per_session XOR  price_per_hour      (today: one `price` column)
-      ```
+      **Pass B, in short** — the enrollment remodel plus an invoice lifecycle cross-checked against
+      Lago's schema and Stripe's docs, stage by stage. Enrollment becomes a sequence of stints (own
+      PK, `contact_id`, `started_on`/`ended_on`, `is_active` dropped, partial unique on the open one)
+      because clients re-enroll annually — see the supersession note on 10a.
 
-      Mutually exclusive nullable columns with a CHECK, **the same shape as `until`/`count`** on
-      recurrence and for the same reason: they're *different facts, not two spellings of one*. An
-      hourly rate and a monthly fee aren't one number measured differently — they generate invoices
-      on different triggers. A `billing_mode` enum plus a single `rate` would also need a third state
-      for "neither", which the nullable set expresses for free.
+      On the invoicing side: `generate` becomes create-only and `POST /invoices/{id}/refresh` is the
+      deliberate rebuild, keeping anything a human touched (`InvoiceLine.computed`, our one-column
+      stand-in for Lago's `adjusted_fees` table); `invoice_items` gives a charge somewhere to live
+      before a draft exists, which also makes invoice lines undeletable across the board the way
+      Lago has them; one-off invoices let a guest be billed at booking time rather than waiting for
+      the month (`invoice_type`, and the unique constraint scoped to period invoices); staleness is
+      computed on read rather than flagged, so it can't go wrong; plus the `status`/`payment_status`
+      split, `sent` → `finalized`, invoice numbers at finalisation, the void partial index,
+      cancelled bookings with a `charge` billing as late fees, per-payer generation, and money moving
+      off `Float`. `ready_to_be_refreshed` is borrowed from Lago but used as a guard rather than a
+      work queue — finalising a stale draft 409s, so you can't commit a number you haven't looked at.
+      Frontend slides to Pass C.
 
-      Per-booking charge resolution:
+      **What shipped, and where it diverged from the original spec.** The spec called for
+      `rate_per_session` XOR `rate_per_hour` XOR `rate_per_month` as three exclusive columns. That
+      can't express *"they picked a monthly plan, admin hasn't priced it yet"* — the unit is chosen
+      by one person and the amount by another, at different times. So it's **`rate` + `rate_unit`**
+      (and `price` + `price_unit` on the link), two columns that say more than three. This does
+      **not** contradict the `UNTIL`/`COUNT` rule it was modelled on: those are a date and an
+      integer, so mode-plus-value would need two value types. All the rates are floats.
 
-      ```
-      fee_override
-        ?? enrollment.rate_per_session
-        ?? enrollment.rate_per_hour  × hrs
-        ?? link.price_per_session
-        ?? link.price_per_hour × hrs
-      ```
+      A **rate** belongs to a person and a **price** to an offering, which is why they keep separate
+      names. `bookings.charge` is the per-session override; 0 is a deliberate freebie.
 
-      **`rate_per_month` sits outside that chain entirely** — a monthly enrollment's bookings are
-      free at booking time, and the money comes from a scheduled invoice line instead.
+      **The billing rule** lives in `billing.py`: skip cancelled and rescheduled (a no-show bills),
+      skip if the client is monthly and the series is `covered_by_subscription`, then
+      `charge ?? enrollment rate by unit ?? link price by unit`. Plus one flat line per active
+      monthly enrollment. So a monthly client's recurring sessions produce no line, and a second
+      series or a standalone extra bills at the link price.
 
-      **Name for the trigger, not the flatness.** "Flat" means two different things: flat *per
-      session* on a link (still charged at booking time, just not multiplied by hours) versus flat
-      *per month* on an enrollment (not charged at booking time at all). Three of those five columns
-      charge per booking; one doesn't.
+      **Money is computed at the billing run, never pushed as it accrues** — cross-checked against
+      Lago, which stores raw usage events and rates them into fees at cycle end. The rule:
+      *derivable from something you already store → rate it late, so every edit up to invoice day
+      lands correctly. A human invented it → record it when they invent it.* Only the second needs
+      `invoice_items` (backlogged below).
 
-      **Invoicing: one bill per payer, one line per enrollment.** Rates live on the *attendee* —
-      siblings genuinely differ — and billing rolls up to whoever pays, using `contact_managers` to
-      find the household. This is what practice-management software does (Teachworks, TutorCruncher,
-      SimplePractice), and it's **not** Miro's seat model: seats are fungible, students aren't, so
-      `quantity × unit price` breaks the moment two children cost different amounts. Rita with two
-      children on monthly plans has two enrollments billed together, which is also how Stripe models
-      it — subscription *items* under one customer rather than a quantity.
+      **One invoice per payer per period**, matching Lago's default consolidation of a customer's
+      subscriptions onto one invoice. Rates live on the attendee since siblings differ, and
+      `enrollments.payer_id` says who is billed — **not** `contact_managers`, which grants booking
+      permission and can't choose between two parents sharing a child.
 
-      **Deliberately out of scope:** collecting payment, proration, dunning. Cancelling a monthly
-      plan means it runs to the end of the paid period with no refund. This is invoice *generation*
-      only, which is why it's a small feature rather than a payments integration.
-
-      **Self-enrollment isn't a thing yet**, and may never be — a client can't set their own rate,
-      that's the business's call. If plans ever become customer-selectable, an account requirement
-      comes with it, because picking a plan is a commitment and you need to know who's committing.
-
-      Note `Lesson`'s fee model predates the current architecture and should be treated as legacy
-      internal tooling rather than a constraint on this design.
 11. **Email + auth** — Auth gates at the route level (protected-route wrappers), so doing
     this after the subroute split (3) means gating the final route structure once, not redoing it
     after a later refactor.
@@ -547,6 +551,84 @@ Concrete bugs, missing logic, and planned improvements — not yet implemented.
 - **Links/Availability pattern divergence** — `Links.tsx` moved to a separate routed page (`LinkPage.tsx`, tab-based) while `Availability.tsx` still uses the older inline card-swap-to-form pattern. Worth a deliberate decision on whether to bring Availability in line with the routed-page pattern, or leave them intentionally different — currently just an artifact of when each was last touched, not a designed choice.
 
 ## Future Features to Evaluate
+
+### Billing — deferred out of 10b
+
+All of these came out of cross-referencing Lago (open-source usage billing) and Stripe Billing
+against what 10b built. Nothing here blocks anything; each is additive.
+
+- **Proration — part of calendar billing, not a separate feature.** Calendar cycles and proration
+  come as a pair: Lago's `calendar` billing time prorates the first period, its `anniversary` one
+  bills full periods and never has a stub. We chose calendar, so proration is the piece we owe it.
+  Design: bound the plan line by `max(started_on, period_start)` and `min(ended_on, period_end)`,
+  then `rate × days_covered / days_in_period`. Half-open both ends, **actual** calendar days (so a
+  full month is always the flat fee — the fraction only ever applies to a stub), round per line, and
+  put the range in the description so the client can check it.
+  **Deliberately not prorating on a rate change** — that needs effective-dated rates, a second
+  table, and rate history, which contradicts one-rate-per-stint. A mid-period rate change applies to
+  the whole period; that's a policy line, not a bug.
+  **Why it's deferred:** day-proration assumes value accrues continuously, which is true of SaaS and
+  false of "four sessions for $400". Join on the 26th and daily maths bills $77 for a session worth
+  $100. The session-shaped equivalent — start the plan on the 1st and let the stub bill per session
+  through the link price — needs no code and is explainable on the phone. Build daily proration only
+  when hand-adjusting the stub becomes routine.
+
+- **Anniversary billing** — `billing_time` per enrollment (`calendar` | `anniversary`) plus an
+  anchor date, Lago's shape. Calendar for everyone today. The real blocker isn't the column: a payer
+  can hold a subscription line *and* session lines in the same month, and session lines are
+  inherently calendar, so mixed cycles would put two period definitions on one document. Gyms get
+  away with anniversary because add-ons are settled at point of sale and never reach the invoice.
+  **So the actual dependency is payment collection** — take money at booking and the cycles stop
+  needing to agree.
+
+- **Included sessions + overage** — `included_sessions` and `overage_rate` on a monthly enrollment,
+  so extras compute themselves instead of being marked by hand. The phone-plan model, and Stripe's
+  tiered pricing. Right at scale, wrong now: it forces rulings on rollover, proration, and what
+  counts as a used session. And `bookings.charge` survives it as the manual override either way, so
+  nothing built now is wasted.
+
+- **Payment collection** — the dependency under anniversary billing, receipts, dunning and due
+  dates. `payment_status` exists as the hook. Deliberately skipped for now: due dates were
+  considered and dropped, so nothing can be overdue and "who owes me what, since when" isn't
+  answerable until this lands.
+
+- **Grace period and auto-finalisation** — Lago's shape: a draft is created at period end, stays
+  editable for N days, then finalises itself. They snapshot the window onto the invoice
+  (`applied_grace_period`, `expected_finalization_date`) rather than reading the setting live, so
+  changing the default doesn't retroactively move an open draft's deadline. Wanted, and cheap: the
+  manual window we have is the same thing with N unset, so it's a `Settings` field plus a daily job,
+  not a change of model.
+
+- **Auto-refreshing drafts** — Lago's `ready_to_be_refreshed` is a *work queue*: the flag feeds a
+  sweeper that recomputes flagged drafts every few minutes, kept cheap by a partial index
+  (`WHERE ready_to_be_refreshed = true`). We build the flag in 10b but use it only to block
+  finalising a stale draft, so refresh stays manual. Adding the sweeper later turns the same column
+  into their version — a periodic job and an index, nothing structural.
+
+- **`payer_id` targeting on generate** — much less urgent once generation is per-payer and `refresh`
+  rebuilds a single invoice.
+
+- **Quantity on a line, and adjusting by units** — Lago's fees carry `units` because they roll many
+  events into one line; ours is always one dated session, so the count would always be 1. The two go
+  together: the moment a line has a quantity, `computed` stops being enough — "what it was before"
+  needs several fields, which is a row, and that's exactly why Lago's `adjusted_fees` is a table
+  rather than a column. Trigger for both: wanting to collapse like charges, e.g. three late fees as
+  one row.
+
+- **Pre-adjusting a charge** — Lago's `adjusted_fees.fee_id` is nullable, so an override can be
+  recorded before the line it applies to exists ("next month bill this at 200"). Ours needs the line
+  first. No use case yet; noted because it falls out of their shape for free and not out of ours.
+
+- **Invoice revisions** — Stripe's link from a reissued invoice back to the one it replaced
+  (`voided_invoice_id` in Lago). Today void-and-reissue works but the two aren't connected.
+
+- **Credit notes** — the other half of post-finalisation correction, for an invoice already *paid*.
+  Stripe splits them deliberately: revise when unpaid, credit note when paid, and the two can't be
+  combined on one invoice.
+
+- **`POST /invoice-runs/`** — the RESTful replacement for `POST /invoices/generate`, worth doing if
+  generation ever needs a history ("what did the March run produce, who ran it"). Belongs with the
+  existing endpoint-cleanup entry.
 
 ⭐ = high priority for TMS. Sources vary — several below were observed from Cal.com; where an idea
 comes from a specific product, the entry says so.

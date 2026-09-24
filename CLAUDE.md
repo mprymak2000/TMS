@@ -615,6 +615,28 @@ The series pair carries **no notice window** on purpose. "24 hours' notice" is a
 
 **Booking contact rules**: at least one email (student or parent) AND at least one phone required. Enforced at both router and DB (`CheckConstraint`) level.
 
+**Billing and invoicing** (`billing.py`) — the pipeline is the standard one, cross-checked against Lago's schema and docs:
+
+```
+bookings (raw)  ->  rate at the billing run  ->  invoice_lines  ->  invoice
+```
+
+**Nothing is money until the run.** A booking is a raw fact; `_line_amount` prices it when the period closes. That's *arrears* billing, and it's deliberate — reading the source as late as possible means every edit up to invoice day lands correctly. The alternative (create the line when the session happens) is what Lago calls *pay-in-advance*, and it exists to move money before delivery, which needs payment collection we don't have.
+
+**We aggregate nothing, for now.** Lago rolls N events into one fee carrying `units`; every booking here is a distinct dated thing a client expects to see itemised, so the group size is always 1 and `invoice_lines` has no quantity column. Add one only if like charges ever want collapsing — three late fees as one row.
+
+**No payment collection, for now.** So none of the machinery downstream of it transfers: no due dates, nothing can be overdue, no dunning, no receipts, no credit notes. `payment_status` exists as the hook when it lands. Marking an invoice paid is a human saying the money arrived.
+
+**Finalisation is manual, for now** — a draft sits until someone sends it. Lago's shape is a *grace period*: the draft is created at period end, stays editable for N days (`applied_grace_period`, `expected_finalization_date` snapshotted onto the invoice), then auto-finalises. That's wanted, not rejected; an unbounded manual window is the same thing with N unset, so adding it is a setting plus a job rather than a change of model.
+
+**One invoice per payer per period**, consolidating everyone they pay for — the same shape as Lago consolidating a customer's subscriptions when they share a billing day. Generation is **per payer, one commit each**, so a bad row costs that payer their invoice rather than rolling back the month. `payers_with_activity` finds the set, `generate_invoice_for_payer` is the unit, `generate_invoices` loops.
+
+**Generation is create-only; rebuilding is `refresh`.** An invoice that exists is never touched by a bulk run — otherwise re-running the month silently undoes hand-edits on every draft. `refresh_invoice` recomputes one draft's generated lines and keeps anything a human touched, which `InvoiceLine.computed` marks: it holds what the rules had said, so the line both remembers its origin and is exempt from recomputation. Lago does the same thing with a separate `adjusted_fees` table, needed there because their refresh destroys every fee and has to re-match afterwards; ours keeps the row, so a column does.
+
+**Money is stored as `Float`.** A best-practice violation — integer cents or `Decimal` is correct, and it's what Lago and Stripe both do. Not a live bug at these magnitudes with `round(x, 2)` per line, but cheap to fix now and expensive once there are real invoices and an API contract.
+
+See the `tms-roadmap` skill for what's deferred: proration (which belongs to calendar billing), anniversary cycles, allowance/overage, pending charges (`invoice_items`), credit notes, and payment collection.
+
 ## Frontend Patterns
 
 **UI stack**: Mantine v7 for form controls (Select, NumberInput, Modal, etc.), Tailwind for layout/spacing. Native `<input>` elements used inside the inline edit form in `LessonRow.tsx`; Mantine components used in `LessonAddModal.tsx` and `BulkAddCard.tsx`.

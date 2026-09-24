@@ -12,9 +12,9 @@ DB_URL = "postgresql://postgres:password@localhost:5432/tms"
 # make the Enrollment that bills them.
 students = [
     {"first_name": "Jane", "last_name": "Doe", "email": "jane.doe@example.com", "phone": "555-0100",
-     "rate": 50, "rate_unit": "per_hour", "start_date": "2026-01-01", "is_active": True},
+     "rate": 50, "rate_unit": "per_hour", "started_on": "2026-01-01"},
     {"first_name": "John", "last_name": "Smith", "email": "john.smith@example.com", "phone": "555-0101",
-     "rate": 50, "rate_unit": "per_hour", "start_date": "2025-01-01", "is_active": True},
+     "rate": 50, "rate_unit": "per_hour", "started_on": "2025-01-01"},
 ]
 
 tutors = [
@@ -52,8 +52,7 @@ for s in students:
     r = requests.put(f"{API}/contacts/{contact['id']}/enrollment", json={
         "rate": s["rate"],
         "rate_unit": s["rate_unit"],
-        "start_date": s["start_date"],
-        "is_active": s["is_active"],
+        "started_on": s["started_on"],
     })
     print(r.status_code, s["first_name"], s["last_name"])
 

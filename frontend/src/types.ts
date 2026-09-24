@@ -28,13 +28,17 @@ export interface ContactRelationships {
   managed_by: Contact[]
 }
 
-// Enrollment, not identity: what's true of a contact because they're billed here. Its id IS the
-// contact's id — an extension of the person, never reassigned, so it has no identity of its own.
+// One stint of being a client here. Many per contact, at most one open — clients leave for the
+// summer and come back, sometimes at a new rate, and terms belong to the stint rather than the
+// person. `ended_on` null means it's the current one.
 export interface Enrollment {
   id: number
-  rate: number
-  start_date: string
-  is_active: boolean
+  contact_id: number
+  started_on: string
+  ended_on: string | null
+  rate_unit: 'per_session' | 'per_hour' | 'per_month' | null
+  rate: number | null
+  payer_id: number | null
   grade: number | null
   birthday: string | null
 }
