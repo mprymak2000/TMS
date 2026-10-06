@@ -213,45 +213,63 @@ rather than trips through the slot picker, so a retired link's rules are read by
 
       Promote to a `/clients/:id` route only if the panel feels cramped once booking sections land.
 
-      **`rate` stayed a single float.** 10b replaces it.
+      **`rate` stayed a single float.** 10b replaced it — see the `prices` note below.
     - **10b — billing and invoicing.** Two passes. **Pass A shipped** (commit `8067859`): terms on
       the enrollment and the link, and a working invoice generator. **Pass B** is the remodel plus
       the lifecycle fixes Pass A left open — see `.claude/plans/enrollment-pass-10b-billing-and-invoicing.md`.
 
-      **Pass B, in short** — the enrollment remodel plus an invoice lifecycle cross-checked against
-      Lago's schema and Stripe's docs, stage by stage. Enrollment becomes a sequence of stints (own
-      PK, `contact_id`, `started_on`/`ended_on`, `is_active` dropped, partial unique on the open one)
-      because clients re-enroll annually — see the supersession note on 10a.
+      **Pass B, in short** — the enrollment remodel plus an invoice lifecycle designed twice: once
+      cross-checked against Lago/Stripe's schemas (refresh + a separate `InvoiceAdjustment` table,
+      built and tested), then torn out and redesigned simpler after an extremely long session
+      surfaced that the first design was solving a problem no real platform actually has. See
+      CLAUDE.md's "Billing and invoicing" section for the authoritative final shape — this entry is
+      a pointer, not a spec. Enrollment becomes a sequence of stints (own PK, `contact_id`,
+      `started_on`/`ended_on`, `is_active` dropped, partial unique on the open one) because clients
+      re-enroll annually — see the supersession note on 10a.
 
-      On the invoicing side: `generate` becomes create-only and `POST /invoices/{id}/refresh` is the
-      deliberate rebuild, keeping anything a human touched (`InvoiceLine.computed`, our one-column
-      stand-in for Lago's `adjusted_fees` table); `invoice_items` gives a charge somewhere to live
-      before a draft exists, which also makes invoice lines undeletable across the board the way
-      Lago has them; one-off invoices let a guest be billed at booking time rather than waiting for
-      the month (`invoice_type`, and the unique constraint scoped to period invoices); staleness is
-      computed on read rather than flagged, so it can't go wrong; plus the `status`/`payment_status`
-      split, `sent` → `finalized`, invoice numbers at finalisation, the void partial index,
-      cancelled bookings with a `charge` billing as late fees, per-payer generation, and money moving
-      off `Float`. `ready_to_be_refreshed` is borrowed from Lago but used as a guard rather than a
-      work queue — finalising a stale draft 409s, so you can't commit a number you haven't looked at.
-      Frontend slides to Pass C.
+      On the invoicing side, final shape: bookings and `InvoiceItem`s share one claim-based lifecycle
+      (`invoice_id`, polymorphic between the two); there is no refresh — a line is computed once, at
+      generation, and never regenerated, matching every platform actually checked (Stripe, Lago,
+      QuickBooks, Square, Xero — none re-derive a line from its source after creation); corrections
+      are `InvoiceLine.adjustment_amount`/`adjustment_percent` (mutually exclusive, `amount` never
+      overwritten), not a separate table, since nothing destroys-and-rebuilds a line anymore for an
+      adjustment to need to survive; a period-overlap-reject guard replaces per-line staleness
+      tracking; claim-based write-protection on the booking/enrollment side (edit rejected while
+      claimed by a draft, no lock, no timeout, explicit release as the escape hatch) replaces the
+      staleness flag entirely; the monthly `per_month` fee generates straight from the enrollment's
+      price (materializing it as an `InvoiceItem` was built, then reverted — both reasons for it were
+      already covered by the overlap guard and the adjustment columns);
+      `covered_by_enrollment_id` (a real FK) replaces the old bare `covered_by_subscription` boolean;
+      money moved to `Numeric(10, 2)` with a `billing.money()` converter at the float boundary;
+      **rates and prices became immutable `prices` rows** that enrollments, links, bookings and series
+      point at, so a raise can't reprice a past session and a bulk change is one `UPDATE` with
+      grandfathering for free; automation drafts only, fanned out one job per payer. `invoice_type`/one-off-invoices-via-booking,
+      the staleness flag, and locking were all designed and explicitly dropped — see CLAUDE.md for
+      why each one specifically didn't survive. Frontend slides to Pass C.
 
       **What shipped, and where it diverged from the original spec.** The spec called for
       `rate_per_session` XOR `rate_per_hour` XOR `rate_per_month` as three exclusive columns. That
       can't express *"they picked a monthly plan, admin hasn't priced it yet"* — the unit is chosen
-      by one person and the amount by another, at different times. So it's **`rate` + `rate_unit`**
-      (and `price` + `price_unit` on the link), two columns that say more than three. This does
-      **not** contradict the `UNTIL`/`COUNT` rule it was modelled on: those are a date and an
-      integer, so mode-plus-value would need two value types. All the rates are floats.
+      by one person and the amount by another, at different times. So it became **`rate` +
+      `rate_unit`** (and `price` + `price_unit` on the link), two columns that say more than three.
+      This does **not** contradict the `UNTIL`/`COUNT` rule it was modelled on: those are a date and
+      an integer, so mode-plus-value would need two value types.
+
+      Then that split was superseded too, in the same pass: the sibling columns became a single
+      `rate_id`/`price_id` pointing at a shared, immutable **`prices`** row (`amount`, `unit`,
+      `archived_at`). Stripe's two-level Product/Price was considered and dropped — it needs two
+      levels because a Product has many coexisting live Prices, which one currency and one interval
+      don't produce. Prices are deliberately nameless; a `plans` table is the additive migration if
+      names ever become load-bearing. Both input and response wire formats still speak amount+unit.
 
       A **rate** belongs to a person and a **price** to an offering, which is why they keep separate
       names. `bookings.charge` is the per-session override; 0 is a deliberate freebie.
 
       **The billing rule** lives in `billing.py`: skip cancelled and rescheduled (a no-show bills),
-      skip if the client is monthly and the series is `covered_by_subscription`, then
-      `charge ?? enrollment rate by unit ?? link price by unit`. Plus one flat line per active
-      monthly enrollment. So a monthly client's recurring sessions produce no line, and a second
-      series or a standalone extra bills at the link price.
+      skip if the client is monthly and the series is covered (`BookingSeries.covered_by_enrollment_id`
+      set), then `charge ?? booking.rate ?? booking.price` — both pointers **frozen onto the booking at
+      creation**, so nothing is read live at sweep time. Plus one line per active monthly enrollment. So a monthly client's recurring sessions produce no line,
+      and a second series or a standalone extra bills at the link price.
 
       **Money is computed at the billing run, never pushed as it accrues** — cross-checked against
       Lago, which stores raw usage events and rates them into fees at cycle end. The rule:
@@ -599,25 +617,36 @@ against what 10b built. Nothing here blocks anything; each is additive.
   manual window we have is the same thing with N unset, so it's a `Settings` field plus a daily job,
   not a change of model.
 
-- **Auto-refreshing drafts** — Lago's `ready_to_be_refreshed` is a *work queue*: the flag feeds a
-  sweeper that recomputes flagged drafts every few minutes, kept cheap by a partial index
-  (`WHERE ready_to_be_refreshed = true`). We build the flag in 10b but use it only to block
-  finalising a stale draft, so refresh stays manual. Adding the sweeper later turns the same column
-  into their version — a periodic job and an index, nothing structural.
+- **`last_modified`-based version check, as a backstop if claim-based write-protection ever proves
+  too restrictive.** Not the staleness flag — that's gone, not deferred. Square's `PublishInvoice`
+  requires a matching `version`, confirmed as real precedent, but Square's drafts don't have a
+  claim-based source-locking mechanism the way ours do, so they need it and we currently don't. Only
+  worth building if the write-protection guard (reject editing a booking/enrollment while claimed by
+  a draft) turns out to be too restrictive in real use — a genuine possibility worth watching, not a
+  known gap today.
 
-- **`payer_id` targeting on generate** — much less urgent once generation is per-payer and `refresh`
-  rebuilds a single invoice.
+- **`payer_id` targeting on generate** — already resolved by the final design: the single sweep
+  function always takes an optional `payer_ids`/single `payer_id`, no separate "targeted mode" to add.
 
-- **Quantity on a line, and adjusting by units** — Lago's fees carry `units` because they roll many
-  events into one line; ours is always one dated session, so the count would always be 1. The two go
-  together: the moment a line has a quantity, `computed` stops being enough — "what it was before"
-  needs several fields, which is a row, and that's exactly why Lago's `adjusted_fees` is a table
-  rather than a column. Trigger for both: wanting to collapse like charges, e.g. three late fees as
-  one row.
+- ~~**Quantity on a line, and an adjustments table.**~~ — **both resolved, differently than either
+  original plan.** The adjustments table *was* built (a separate `InvoiceAdjustment`, scoped to
+  `(invoice, source)`, fixing the exact `(booking_id, enrollment_id)` collision this bullet
+  originally described) — then removed again once `refresh_invoice` itself was dropped, since the
+  table's only job was surviving a line regeneration that no longer happens. What replaced it:
+  `InvoiceLine.adjustment_amount` and `adjustment_percent` — mutually exclusive via CHECK, `amount`
+  never overwritten — confirmed against Stripe/QuickBooks/Square/Xero's actual discount-field shapes
+  before building it this way (Xero's `DiscountAmount`/`DiscountRate` are the same exclusive pair).
+  See CLAUDE.md's "Billing and invoicing" section for the full reasoning chain.
 
-- **Pre-adjusting a charge** — Lago's `adjusted_fees.fee_id` is nullable, so an override can be
-  recorded before the line it applies to exists ("next month bill this at 200"). Ours needs the line
-  first. No use case yet; noted because it falls out of their shape for free and not out of ours.
+  **Quantity remains genuinely unbuilt**, independent of the above — every booking here is still one
+  dated session, so a count column would be a permanent 1. Same trigger as before: wanting to
+  collapse like charges onto one row (three late fees as one line). Nothing about the adjustment
+  redesign changes this calculus either way.
+
+- **Pre-adjusting a charge before the line exists** — moot now, not just unbuilt. This bullet used to
+  compare against Lago's nullable `adjusted_fees.fee_id`; with no separate adjustment table at all,
+  there's no row to pre-create ahead of a charge — `InvoiceLine.adjustment` can't exist before the
+  line does, full stop, same as every other line field.
 
 - **Invoice revisions** — Stripe's link from a reissued invoice back to the one it replaced
   (`voided_invoice_id` in Lago). Today void-and-reissue works but the two aren't connected.

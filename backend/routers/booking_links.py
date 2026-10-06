@@ -4,9 +4,19 @@ from sqlalchemy.orm import Session, joinedload
 from database import get_db
 from models import BookingLink, BookingLinkAvailability, Booking, BookingSeries
 from schemas import BookingLinkCreate, BookingLinkUpdate, BookingLinkResponse, BookingLinkStatusUpdate
+from billing import resolve_price
 from booking_utils import active_series_filter
 
 router = APIRouter(prefix="/booking_links", tags=["booking_links"])
+
+
+def _link_fields(db: Session, link_in) -> dict:
+    """Resolve the submitted amount+unit to a shared Price row. PRICE_UNITS already excludes
+    per_month at the schema, since a link prices one booking at a time."""
+    price_id = None
+    if link_in.price is not None:
+        price_id = resolve_price(db, link_in.price, link_in.price_unit).id
+    return link_in.model_dump(exclude={"availability", "price", "price_unit"}) | {"price_id": price_id}
 
 
 def _slug_taken(db: Session, slug: str, ignore_link_id: int | None = None) -> bool:
@@ -68,7 +78,7 @@ def create_booking_link(link_in: BookingLinkCreate, db: Session = Depends(get_db
         raise HTTPException(status_code=400, detail="min_duration_minutes must be less than max_duration_minutes")
 
 
-    db_link = BookingLink(**link_in.model_dump(exclude={"availability"}))
+    db_link = BookingLink(**_link_fields(db, link_in))
     db.add(db_link)
     db.flush() # to get booking link id for availability entries
     for tutor_schedule in link_in.availability:
@@ -100,7 +110,7 @@ def update_booking_link(booking_link_id: int, link_in: BookingLinkUpdate, db: Se
         raise HTTPException(status_code=400, detail="min_duration_minutes must be less than max_duration_minutes")
 
 
-    for field, value in link_in.model_dump(exclude={"availability"}).items():
+    for field, value in _link_fields(db, link_in).items():
         setattr(db_link, field, value)
     db.query(BookingLinkAvailability).filter(BookingLinkAvailability.booking_link_id == booking_link_id).delete()
     for tutor_schedule in link_in.availability:

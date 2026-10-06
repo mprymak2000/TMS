@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import tuple_
 
-from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_attendee, resolve_payer, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
+from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, copy_pricing, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_attendee, resolve_payer, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
+from billing import booking_draft_claim, move_claim, release_booking_claim, release_draft_claims
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -399,6 +400,8 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
     # Guests only. A claimed contact leaves this null so reminders read contact.phone live, and
     # registering nulls it on every booking they already had.
     guest_reminder_phone = booking_in.payer.phone if payer.verified_at is None else None
+    # Frozen now, so a later rate change can't reprice this session.
+    attendee_rate_id = attendee.current_enrollment.rate_id if attendee.current_enrollment else None
 
     new_public_id = str(uuid4())
     manage_path = "manage-series" if db_booking_link.recurring else "manage-occurrence"
@@ -440,6 +443,8 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                 booking_type_id=db_booking_link.booking_type_id,
                 **occurrence_policy(db_booking_link),
                 **series_policy(db_booking_link),
+                price_id=db_booking_link.price_id,
+                rate_id=attendee_rate_id,
                 google_event_id=google_event["id"],
             )
             db.add(series)
@@ -458,6 +463,7 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
                     series_id=series.id,
                     booking_type_id=series.booking_type_id,
                     **occurrence_policy(series),
+                    **copy_pricing(series),
                     google_event_id=google_event["id"],
                     start=occ_start,
                     end=occ_start + _duration,
@@ -479,6 +485,8 @@ def create_booking(booking_in: BookingCreate, db: Session = Depends(get_db), set
             guest_reminder_phone=guest_reminder_phone,
             booking_type_id=db_booking_link.booking_type_id,
             **occurrence_policy(db_booking_link),
+            price_id=db_booking_link.price_id,
+            rate_id=attendee_rate_id,
             google_event_id=google_event["id"],
             status="confirmed",
         )
@@ -589,6 +597,7 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
         "booking_type_id": db_booking.booking_type_id,
         # Off the old row, not the link — moving a session must not restate its terms.
         **occurrence_policy(db_booking),
+        **copy_pricing(db_booking),
         "payer_id": db_booking.payer_id,
         "attendee_id": db_booking.attendee_id,
         "sms_opt_in": db_booking.sms_opt_in,
@@ -615,6 +624,9 @@ def _reschedule_booking(db_booking: Booking, booking_in: BookingReschedule, db: 
     # --- Step 3: Soft-delete original, then finalize ---
     db_booking.status = "rescheduled"
     db_booking.rescheduled_to = new_booking.id
+    # The session moved rows, so whatever was billing it has to follow — otherwise the replacement
+    # is swept as new work and the client pays twice for one session.
+    move_claim(db_booking, new_booking)
 
     # Standalone only: delete the old calendar event (series instance was already replaced by the patch above)
     if not is_series:
@@ -735,10 +747,24 @@ def update_booking_series(id: str, booking_in: BookingSeriesUpdate, db: Session 
 
 
 @router.put("/{ref}", response_model=BookingResponse)
-def update_booking(ref: str, booking_in: BookingUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
+def update_booking(
+    ref: str, booking_in: BookingUpdate, release_invoice_claim: bool = False,
+    db: Session = Depends(get_db), settings=Depends(get_settings),
+):
     """Plain-column update: contact info, no-show flag, kind label, governing link."""
     db_booking = resolve_ref(ref, db, settings)
     _validate_link_and_type(booking_in.booking_link_id, booking_in.booking_type_id, db)
+
+    if booking_in.charge != db_booking.charge:
+        invoice = booking_draft_claim(db_booking)
+        if invoice is not None:
+            if not release_invoice_claim:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Charge is claimed by draft invoice {invoice.public_id} — "
+                           f"retry with release_invoice_claim=true, or edit the line on the invoice instead",
+                )
+            release_booking_claim(db, db_booking)
 
     for key, value in booking_in.model_dump().items():
         setattr(db_booking, key, value)
@@ -892,6 +918,10 @@ def _cancel_series(db_series: BookingSeries, today: date, tz: ZoneInfo, db: Sess
         ).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to cancel future instances of the series on calendar") from e
+    doomed = db.query(Booking).filter(
+        Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC)
+    ).all()
+    release_draft_claims(db, doomed)
     db.query(Booking).filter(Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC)).delete(synchronize_session=False)
     db_series.status = 'cancelled'
     # Truncating turns any rule into one that ends on a date — count and until can't coexist.
@@ -1033,6 +1063,11 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
     # included — nothing after the pivot survives), insert a NEW series row for the new pattern,
     # close the old one, materialize under the new series. A past row whose replacement is dropped
     # here keeps status='rescheduled' with rescheduled_to SET NULL — the move still happened.
+    doomed = db.query(Booking).filter(
+        Booking.series_id == db_series.id,
+        Booking.start >= datetime.now(UTC)
+    ).all()
+    release_draft_claims(db, doomed)
     db.query(Booking).filter(
         Booking.series_id == db_series.id,
         Booking.start >= datetime.now(UTC)
@@ -1057,6 +1092,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
         # Off the old series, not the link — moving a series must not restate its terms.
         **occurrence_policy(db_series),
         **series_policy(db_series),
+        **copy_pricing(db_series),
         google_event_id=new_google_event["id"],
         payer_id=db_series.payer_id,
         attendee_id=db_series.attendee_id,
@@ -1088,6 +1124,7 @@ def _reschedule_series(db_series: BookingSeries, booking_in:
             booking_link_id=db_series.booking_link_id,
             booking_type_id=new_series.booking_type_id,
             **occurrence_policy(new_series),
+            **copy_pricing(new_series),
             timezone=booking_in.timezone,
             status="confirmed",
             payer_id=db_series.payer_id,

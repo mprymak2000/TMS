@@ -33,6 +33,7 @@ def update_settings(settings_in: schemas.SettingsUpdate, db: Session = Depends(g
 
     settings = get_or_create_settings(db)
     settings.business_timezone = settings_in.business_timezone
+    settings.billing_automation_enabled = settings_in.billing_automation_enabled
     db.commit()
     db.refresh(settings)
     return settings

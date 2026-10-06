@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime, Index, text, func
+from sqlalchemy import Column, Integer, String, Float, Numeric, Boolean, Date, Text, ForeignKey, UniqueConstraint, CheckConstraint, Time, DateTime, Index, text, func
 from sqlalchemy.orm import relationship, backref
 from database import Base
 from datetime import datetime, timedelta, UTC
@@ -66,12 +66,37 @@ class ContactManager(Base):
     managed = relationship("Contact", foreign_keys=[managed_id])
 
 
-# Amount and unit are separate columns, not one exclusive column per unit, so "plan picked, not yet
-# priced" is expressible. A rate belongs to a person, a price to an offering — hence two names.
+# A rate belongs to a person, a price to an offering. PRICE_UNITS is narrower because a per_month
+# amount means nothing as a per-booking price; enforced where a link's price is set.
 RATE_UNITS = ("per_session", "per_hour", "per_month")
 PRICE_UNITS = ("per_session", "per_hour")
 _RATE_UNITS_SQL = str(RATE_UNITS)
 _PRICE_UNITS_SQL = str(PRICE_UNITS)
+
+
+class Price(Base):
+    """One amount at one unit. Immutable — a change inserts a new row and repoints referrers.
+
+    Referrers point at the row in effect when they were created, so a raise can't reprice a past
+    session, and anyone left on the old row is grandfathered. Deduped by (amount, unit) so clients
+    on the same price share a row, which is what makes a bulk change one UPDATE. No label: naming
+    versions needs a second table, and nothing needs the name yet.
+    """
+    __tablename__ = "prices"
+    __table_args__ = (
+        CheckConstraint(f"unit IN {_RATE_UNITS_SQL}", name="chk_price_unit"),
+        CheckConstraint("amount >= 0", name="chk_price_non_negative"),
+        # Live rows only — superseded prices may collide freely.
+        Index("uq_price_amount_unit_live", "amount", "unit", unique=True,
+              sqlite_where=text("archived_at IS NULL"), postgresql_where=text("archived_at IS NULL")),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    amount = Column(Numeric(10, 2), nullable=False)
+    unit = Column(String, nullable=False)
+    # Hides a superseded price from pickers. The only column here ever updated.
+    archived_at = Column(DateTime(timezone=True), nullable=True)
+    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class Enrollment(Base):
@@ -88,13 +113,6 @@ class Enrollment(Base):
         Index("uq_enrollment_open_per_contact", "contact_id", unique=True,
               sqlite_where=text("ended_on IS NULL"), postgresql_where=text("ended_on IS NULL")),
         CheckConstraint("ended_on IS NULL OR ended_on >= started_on", name="chk_enrollment_dates_order"),
-        CheckConstraint(
-            f"rate_unit IS NULL OR rate_unit IN {_RATE_UNITS_SQL}",
-            name="chk_enrollment_rate_unit",
-        ),
-        # An amount with no unit says nothing — is 400 per session or per month?
-        CheckConstraint("rate IS NULL OR rate_unit IS NOT NULL", name="chk_enrollment_rate_needs_unit"),
-        CheckConstraint("rate IS NULL OR rate >= 0", name="chk_enrollment_rate_non_negative"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -104,9 +122,8 @@ class Enrollment(Base):
     # for one fact drift apart.
     ended_on = Column(Date, nullable=True)
 
-    # Both nullable: enrolled with no terms agreed is a real state, and bookings fall back to the link's price meanwhile.
-    rate_unit = Column(String, nullable=True)
-    rate = Column(Float, nullable=True)
+    # Null = enrolled, no terms agreed yet; bookings fall back to the link's price meanwhile.
+    rate_id = Column(Integer, ForeignKey("prices.id"), nullable=True, index=True)
     # Who gets the invoice; null means they pay for themselves. Not contact_managers, which grants
     # permission to book — a grandparent can pay while a parent books, and two parents on one child
     # leave that table with no way to pick. Per stint, so it can change year to year.
@@ -116,6 +133,7 @@ class Enrollment(Base):
     grade = Column(Integer, nullable=True)
     birthday = Column(Date, nullable=True)
 
+    rate = relationship("Price")
     contact = relationship("Contact", foreign_keys=[contact_id], back_populates="enrollments")
     payer = relationship("Contact", foreign_keys=[payer_id])
     lessons = relationship("Lesson", back_populates="enrollment")
@@ -132,7 +150,7 @@ class Tutor(Base):
     id = Column(Integer, primary_key=True, index=True)
     first_name = Column(String, nullable=False)
     last_name = Column(String, nullable=False)
-    pay_rate = Column(Float, nullable=False)
+    pay_rate = Column(Numeric(10, 2), nullable=False)
     is_active = Column(Boolean, nullable=False, default=True)
     calendar_id = Column(String, nullable=True)
     check_calendar_conflicts = Column(Boolean, nullable=False, default=False)
@@ -150,9 +168,9 @@ class Lesson(Base):
     id = Column(Integer, primary_key=True, index=True)
     date = Column(Date, nullable=False)
     hrs = Column(Float, nullable=True)
-    fee = Column(Float, nullable=False)
+    fee = Column(Numeric(10, 2), nullable=False)
     is_fee_overridden = Column(Boolean, nullable=False, default=False)
-    tutor_payout = Column(Float, nullable=False)
+    tutor_payout = Column(Numeric(10, 2), nullable=False)
     is_tutor_payout_overridden = Column(Boolean, nullable=False, default=False)
     pay_status = Column(Boolean, nullable=False, default=False)
     notes = Column(Text, nullable=True)
@@ -264,12 +282,6 @@ class BookingLink(Base):
             name="chk_booking_link_series_reschedule_mode"
         ),
         CheckConstraint(
-            f"price_unit IS NULL OR price_unit IN {_PRICE_UNITS_SQL}",
-            name="chk_booking_link_price_unit"
-        ),
-        CheckConstraint("price IS NULL OR price_unit IS NOT NULL", name="chk_booking_link_price_needs_unit"),
-        CheckConstraint("price IS NULL OR price >= 0", name="chk_booking_link_price_non_negative"),
-        CheckConstraint(
             f"cancel_mode NOT IN {_WINDOW_MODES_SQL} OR (cancel_notice_minutes IS NOT NULL AND cancel_notice_minutes > 0)",
             name="chk_booking_link_cancel_notice_required"
         ),
@@ -336,9 +348,9 @@ class BookingLink(Base):
     booker_can_set_recur_until = Column(Boolean, nullable=False, default=False)
     booker_can_set_count = Column(Boolean, nullable=False, default=False)
     #optional advanced limits
-    # What a booking from this link costs when the attendee has no rate of their own, and what a monthly client's extra sessions cost.
-    price_unit = Column(String, nullable=True)
-    price = Column(Float, nullable=True)
+    # Charged when the attendee has no rate of their own, and for a monthly client's extras. Live —
+    # edits reach later bookings only; existing ones froze their own pointer.
+    price_id = Column(Integer, ForeignKey("prices.id"), nullable=True, index=True)
     # limits 
     buffer_minutes = Column(Integer, nullable=True)
     limit_duration_minutes = Column(Integer, nullable=True) # set max duration for events if variable
@@ -445,9 +457,13 @@ class BookingSeries(Base):
     reschedule_notice_minutes = Column(Integer, nullable=True)
     series_cancel_mode = Column(String, nullable=False, server_default="auto")
     series_reschedule_mode = Column(String, nullable=False, server_default="auto")
-    # Does a monthly plan already pay for these? Only read for a per_month enrollment. Off by default
-    # so a second series bills — over-billing gets reported, under-billing is silent.
-    covered_by_subscription = Column(Boolean, nullable=False, server_default=text("false"))
+    # Frozen at creation: price off the link, rate off the attendee's enrollment. Occurrences copy
+    # these off the series, never off the link.
+    price_id = Column(Integer, ForeignKey("prices.id"), nullable=True)
+    rate_id = Column(Integer, ForeignKey("prices.id"), nullable=True)
+    # Which enrollment's monthly plan already pays for these, if any. Null by default so a second
+    # series bills — over-billing gets reported, under-billing is silent.
+    covered_by_enrollment_id = Column(Integer, ForeignKey("enrollments.id", ondelete="SET NULL"), nullable=True)
     # byday: omitted, derivable from dtstart.weekday() until multi-day-per-series is supported.
     # Real support needs an array column, not a scalar, so a placeholder now would just be replaced.
     # wkst: omitted, only defines week boundaries when grouping multi-day recurrence — moot without byday.
@@ -464,12 +480,15 @@ class BookingSeries(Base):
     guest_reminder_phone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="series")
+    price = relationship("Price", foreign_keys=[price_id])
+    rate = relationship("Price", foreign_keys=[rate_id])
     booking_link = relationship("BookingLink")
     booking_type = relationship("BookingType")
     payer = relationship("Contact", foreign_keys=[payer_id])
     attendee = relationship("Contact", foreign_keys=[attendee_id])
     bookings = relationship("Booking", back_populates="series")
     request = relationship("BookingRequest", back_populates="series", uselist=False)
+    covered_by_enrollment = relationship("Enrollment")
     # backref: rescheduled_from_series (uselist=False) — the predecessor series that got
     # rescheduled into this one, if any. Not a stored column, resolved on access.
     rescheduled_to_series = relationship(
@@ -531,9 +550,14 @@ class Booking(Base):
     google_event_id = Column(String, nullable=False) #derived after google creates the event, not passed in
     status = Column(String, nullable=False, default="confirmed")
     is_no_show = Column(Boolean, nullable=False, default=False)
-    # Admin override for what this one session costs, beating both the client's rate and the link's
-    # price. Null means bill it normally; 0 is a deliberate freebie, which is why it isn't a default.
-    charge = Column(Float, nullable=True)
+    # Beats both pointers below. Null bills normally; 0 is a deliberate freebie, hence no default.
+    charge = Column(Numeric(10, 2), nullable=True)
+    # Frozen at creation, off the series for an occurrence. Resolution is charge ?? rate ?? price.
+    price_id = Column(Integer, ForeignKey("prices.id"), nullable=True)
+    rate_id = Column(Integer, ForeignKey("prices.id"), nullable=True)
+    # Null means unbilled. Set once, when line generation includes this booking, same claim pattern
+    # InvoiceItem already uses. Never cleared automatically, including on void.
+    invoice_id = Column(Integer, ForeignKey("invoices.id", ondelete="SET NULL"), nullable=True, index=True)
     # Frozen at creation — off the series for an occurrence, off the link otherwise. Never propagated after.
     cancel_mode = Column(String, nullable=False, server_default="auto")
     cancel_notice_minutes = Column(Integer, nullable=True)
@@ -555,9 +579,12 @@ class Booking(Base):
     guest_reminder_phone = Column(String, nullable=True)
 
     tutor = relationship("Tutor", back_populates="bookings")
+    price = relationship("Price", foreign_keys=[price_id])
+    rate = relationship("Price", foreign_keys=[rate_id])
     booking_link = relationship("BookingLink")
     booking_type = relationship("BookingType")
     series = relationship("BookingSeries", back_populates="bookings")
+    invoice = relationship("Invoice")
     payer = relationship("Contact", foreign_keys=[payer_id])
     attendee = relationship("Contact", foreign_keys=[attendee_id])
     lesson = relationship("Lesson", back_populates="booking", uselist=False)
@@ -588,31 +615,50 @@ class Booking(Base):
         return self.rescheduled_from_booking.public_id if self.rescheduled_from_booking else None
 
 
-INVOICE_STATUSES = ("draft", "sent", "paid", "void")
+INVOICE_STATUSES = ("draft", "finalized", "void")
 _INVOICE_STATUSES_SQL = str(INVOICE_STATUSES)
+
+PAYMENT_STATUSES = ("unpaid", "paid")
+_PAYMENT_STATUSES_SQL = str(PAYMENT_STATUSES)
 
 
 class Invoice(Base):
     """One period's bill for one payer. Generated from bookings, never stored as it accrues.
 
-    Nothing collects payment — `paid` is marked by hand when the money lands.
+    `status` describes the document (draft -> finalized -> void); `payment_status` describes the
+    money (unpaid -> paid) and moves independently. A finalized invoice can sit unpaid for weeks,
+    and marking it paid doesn't change its document state. Nothing collects payment automatically;
+    `payment_status` is set by hand when the money lands.
     """
     __tablename__ = "invoices"
     __table_args__ = (
-        # Generation is re-runnable, so a payer can only have one invoice per period.
+        # Generation is re-runnable, so a payer can only have one invoice per period. NULLs are
+        # never equal to each other in SQL, so this already lets any number of ad-hoc invoices
+        # (period_start NULL) coexist per payer for free — no partial index needed.
         UniqueConstraint("payer_id", "period_start", name="uq_invoice_payer_period"),
         CheckConstraint(f"status IN {_INVOICE_STATUSES_SQL}", name="chk_invoice_status"),
-        CheckConstraint("period_end > period_start", name="chk_invoice_period_order"),
+        CheckConstraint(f"payment_status IN {_PAYMENT_STATUSES_SQL}", name="chk_invoice_payment_status"),
+        # Both set or both null — an ad-hoc invoice has no period at all, never half of one.
+        CheckConstraint(
+            "(period_start IS NULL) = (period_end IS NULL)", name="chk_invoice_period_both_or_neither",
+        ),
+        CheckConstraint(
+            "period_start IS NULL OR period_end > period_start", name="chk_invoice_period_order",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     public_id = Column(String, unique=True, nullable=False, default=lambda: str(uuid4()))
     payer_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
-    # Half-open [start, end), so consecutive months can't double-count a booking on the boundary.
-    period_start = Column(Date, nullable=False)
-    period_end = Column(Date, nullable=False)
+    # Half-open [start, end); null means ad-hoc, not tied to any period.
+    period_start = Column(Date, nullable=True)
+    period_end = Column(Date, nullable=True)
     status = Column(String, nullable=False, default="draft")
-    total = Column(Float, nullable=False, default=0)
+    payment_status = Column(String, nullable=False, default="unpaid")
+    # Null while draft. Allocated once, at the draft -> finalized transition, so deleting a draft
+    # never leaves a gap in the sequence.
+    number = Column(String, unique=True, nullable=True)
+    total = Column(Numeric(10, 2), nullable=False, default=0)
     sent_at = Column(DateTime(timezone=True), nullable=True)
     paid_at = Column(DateTime(timezone=True), nullable=True)
     created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -627,26 +673,61 @@ class Invoice(Base):
 
 
 class InvoiceLine(Base):
-    """One charge on an invoice.
+    """One charge on an invoice. Generated once and frozen — nothing ever re-derives a line from its
+    source after creation.
 
-    `description` and `amount` are frozen copies, not read through the FKs — an invoice asserts what
-    was billed at the time, so a later rename must not rewrite it. That's also why both source FKs
-    are nullable and SET NULL: the line outlives whatever produced it.
+    `description` and `amount` are the frozen, as-computed values. They're never overwritten. A correction
+    is always layered on top: `adjustment_amount` (flat) or `adjustment_percent` (0-100), mutually exclusive, both nullable,
+    both default unset. The total charge is 'amount' with the adjustment applied on top, so client can display 
+    the calculation and show before and after
     """
     __tablename__ = "invoice_lines"
+    __table_args__ = (
+        CheckConstraint(
+            "adjustment_amount IS NULL OR adjustment_percent IS NULL",
+            name="chk_invoice_line_adjustment_exclusive",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     invoice_id = Column(Integer, ForeignKey("invoices.id", ondelete="CASCADE"), nullable=False, index=True)
-    # Recurring lines point at the enrollment, one-offs at the booking. Never both.
+    # Recurring lines point at the enrollment, one-offs at the booking, swept charges at the item.
+    # Exactly one set — purely provenance, never read by the generator itself (which already has the
+    # source object in hand while building the line).
     enrollment_id = Column(Integer, ForeignKey("enrollments.id", ondelete="SET NULL"), nullable=True)
     booking_id = Column(Integer, ForeignKey("bookings.id", ondelete="SET NULL"), nullable=True)
+    invoice_item_id = Column(Integer, ForeignKey("invoice_items.id", ondelete="SET NULL"), nullable=True)
     description = Column(String, nullable=False)
-    amount = Column(Float, nullable=False)
-    # What the rules produced, set only when a human then changed the amount. Doubles as the
-    # "leave me alone" marker: refreshing invoice recomputes the lines where this is null and leaves the marked ones alone.
-    computed = Column(Float, nullable=True)
+    amount = Column(Numeric(10, 2), nullable=False)
+    adjustment_amount = Column(Numeric(10, 2), nullable=True)
+    adjustment_percent = Column(Numeric(5, 2), nullable=True)
 
     invoice = relationship("Invoice", back_populates="lines")
+
+
+class InvoiceItem(Base):
+    """A charge recorded before any invoice exists to put it on.
+
+    No booking_id: a charge about a specific booking is booking.charge instead, read live by the
+    same period-scoped query that generates every other booking line — it lands in the right period
+    for free, no date logic needed here. This table is only for charges with nothing to hang off —
+    materials, a goodwill credit — so *when* one is recorded never matters, only that it eventually
+    gets swept.
+
+    Like a hotel tab: charges accrue as they happen, the bill is printed at checkout. invoice_id is
+    null while pending; set once an invoice sweeps it, which is also what stops it being deleted.
+    """
+    __tablename__ = "invoice_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    payer_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
+    description = Column(String, nullable=False)
+    amount = Column(Numeric(10, 2), nullable=False)   # negative for a credit
+    invoice_id = Column(Integer, ForeignKey("invoices.id", ondelete="SET NULL"), nullable=True, index=True)
+    created = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    payer = relationship("Contact")
+    invoice = relationship("Invoice")
 
 
 class Settings(Base):
@@ -657,6 +738,7 @@ class Settings(Base):
 
     id = Column(Integer, primary_key=True, default=1)
     business_timezone = Column(String, nullable=False, default="America/New_York")
+    billing_automation_enabled = Column(Boolean, nullable=False, default=False)
 
 
 class BookingRequest(Base):

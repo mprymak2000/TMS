@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from billing import enrollment_draft_claim, release_enrollment_claims, resolve_price
 from booking_utils import normalize_email
 from database import get_db
 from models import Booking, BookingSeries, Contact, ContactManager, Enrollment, Lesson
@@ -142,7 +143,10 @@ def create_contact(contact_in: ContactCreate, db: Session = Depends(get_db)):
 
 
 @router.put("/{contact_id:int}", response_model=ContactListResponse)
-def update_contact(contact_id: int, contact_in: ContactUpdate, db: Session = Depends(get_db)):
+def update_contact(
+    contact_id: int, contact_in: ContactUpdate, release_invoice_claim: bool = False,
+    db: Session = Depends(get_db),
+):
     """The one place a person's details change. Bookings read through the FK, so a correction reaches
     their whole history rather than only the bookings made after it. A public form can't get here.
 
@@ -156,7 +160,7 @@ def update_contact(contact_id: int, contact_in: ContactUpdate, db: Session = Dep
     for key, value in data.items():
         setattr(db_contact, key, value)
     if contact_in.enrollment is not None:
-        _upsert_enrollment(db, contact_id, contact_in.enrollment)
+        _upsert_enrollment(db, contact_id, contact_in.enrollment, release_invoice_claim)
     db.commit()
     db.refresh(db_contact)
     return _list_row(db_contact)
@@ -211,14 +215,39 @@ def _open_enrollment(db: Session, contact_id: int) -> Enrollment | None:
     )
 
 
-def _upsert_enrollment(db: Session, contact_id: int, enrollment_in: EnrollmentInput) -> tuple[Enrollment, bool]:
+def _upsert_enrollment(
+    db: Session, contact_id: int, enrollment_in: EnrollmentInput, release_invoice_claim: bool = False,
+) -> tuple[Enrollment, bool]:
     """Write only — no commit, so a caller can fold it into a larger transaction. Returns (row, created)."""
+    # An amount+unit resolves to a shared Price row; many clients on the same terms share one.
+    rate_id = None
+    if enrollment_in.rate is not None:
+        rate_id = resolve_price(db, enrollment_in.rate, enrollment_in.rate_unit).id
+    fields = enrollment_in.model_dump(exclude={"rate", "rate_unit"}) | {"rate_id": rate_id}
+
     db_enrollment = _open_enrollment(db, contact_id)
     if db_enrollment is None:
-        db_enrollment = Enrollment(contact_id=contact_id, **enrollment_in.model_dump())
+        db_enrollment = Enrollment(contact_id=contact_id, **fields)
         db.add(db_enrollment)
         return db_enrollment, True
-    for key, value in enrollment_in.model_dump().items():
+
+    changed_terms = (
+        rate_id != db_enrollment.rate_id
+        or enrollment_in.started_on != db_enrollment.started_on
+        or enrollment_in.ended_on != db_enrollment.ended_on
+    )
+    if changed_terms:
+        invoice = enrollment_draft_claim(db, db_enrollment)
+        if invoice is not None:
+            if not release_invoice_claim:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Claimed by draft invoice {invoice.public_id} — "
+                           f"retry with release_invoice_claim=true, or edit the line on the invoice instead",
+                )
+            release_enrollment_claims(db, db_enrollment)
+
+    for key, value in fields.items():
         setattr(db_enrollment, key, value)
     return db_enrollment, False
 
@@ -237,7 +266,10 @@ def get_enrollments(contact_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/{contact_id:int}/enrollment", response_model=EnrollmentResponse)
-def upsert_enrollment(contact_id: int, enrollment_in: EnrollmentInput, response: Response, db: Session = Depends(get_db)):
+def upsert_enrollment(
+    contact_id: int, enrollment_in: EnrollmentInput, response: Response, release_invoice_claim: bool = False,
+    db: Session = Depends(get_db),
+):
     """One call for enrolling, re-enrolling and editing — they're the same operation against the open
     stint. 201 when there wasn't one, 200 when there was.
 
@@ -245,7 +277,7 @@ def upsert_enrollment(contact_id: int, enrollment_in: EnrollmentInput, response:
     """
     if not db.query(Contact).filter(Contact.id == contact_id).first():
         raise HTTPException(status_code=404, detail="Contact not found")
-    db_enrollment, created = _upsert_enrollment(db, contact_id, enrollment_in)
+    db_enrollment, created = _upsert_enrollment(db, contact_id, enrollment_in, release_invoice_claim)
     if created:
         response.status_code = 201
     db.commit()

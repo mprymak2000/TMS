@@ -3,11 +3,11 @@ import os
 import procrastinate
 from sqlalchemy import and_
 from sqlalchemy.orm import joinedload
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from database import SessionLocal
 from models import Booking, BookingSeries, Contact, Enrollment, Lesson, Settings
-from billing import generate_invoices
+from billing import draft_invoice_for_payer, money, payers_with_activity
 from booking_utils import _ensure_occurrence, active_series_filter, indefinite_series_filter, is_series_active, series_step
 
 # Strip SQLAlchemy dialect prefix (+psycopg2) — psycopg3 expects plain postgresql://
@@ -163,9 +163,8 @@ def draft_lessons(timestamp: int):
         for booking in bookings:
             hrs = (booking.end - booking.start).total_seconds() / 3600
             enrollment = booking.attendee.current_enrollment
-            # rate is nullable now, and this assumes an hourly one either way. Invoicing bills
-            # clients; skip rather than record a fee of None or hrs x someone's monthly plan.
-            if enrollment.rate is None or enrollment.rate_unit != "per_hour":
+            # Hourly only — invoicing bills clients, so skip rather than record hrs x a monthly plan.
+            if enrollment.rate is None or enrollment.rate.unit != "per_hour":
                 continue
             tutor = booking.tutor
             created += 1
@@ -175,8 +174,8 @@ def draft_lessons(timestamp: int):
                 tutor_id=booking.tutor_id,
                 date=booking.start.astimezone(tz).date(),
                 hrs=hrs,
-                fee=hrs * enrollment.rate,
-                tutor_payout=hrs * tutor.pay_rate,
+                fee=money(hrs) * enrollment.rate.amount,
+                tutor_payout=money(hrs) * tutor.pay_rate,
             ))
         db.commit()
         logging.info(f"draft_lessons: created {created} of {len(bookings)} candidate booking(s)")
@@ -191,10 +190,13 @@ def draft_lessons(timestamp: int):
 @app.periodic(cron="0 3 1 * *")
 @app.task
 def draft_invoices(timestamp: int):
-    """3am on the 1st: draft invoices for the month that just closed.
+    """3am on the 1st: fan out one drafting job per payer with activity last month.
 
-    Drafts only — nothing is sent. Same code the admin's generate button runs, and re-runnable, so a
-    failed month can just be run again.
+    Fanned out rather than looped inline for the same reason as extend_all_series: one payer whose
+    invoice fails shouldn't block everyone after them, and Procrastinate retries each independently.
+    A payer not invoiced is money not collected, so that isolation matters more here than anywhere.
+
+    Drafts only — nothing is sent, and finalizing stays a human action.
     """
     db = SessionLocal()
     try:
@@ -202,14 +204,49 @@ def draft_invoices(timestamp: int):
         if settings is None:
             logging.error("draft_invoices: Settings row not found")
             return
+        if not settings.billing_automation_enabled:
+            logging.info("draft_invoices: billing automation disabled, skipping")
+            return
         # First of this month back to first of last, in business time.
         period_end = datetime.now(ZoneInfo(settings.business_timezone)).date().replace(day=1)
         period_start = (period_end - timedelta(days=1)).replace(day=1)
 
-        invoices = generate_invoices(db, period_start, period_end, settings)
-        logging.info(f"draft_invoices: drafted {len(invoices)} invoice(s) for {period_start}")
+        payer_ids = payers_with_activity(db, period_start, period_end, settings)
+        for payer_id in payer_ids:
+            # Dates as ISO strings — job kwargs have to be JSON-serializable.
+            draft_invoice_for_one.defer(
+                payer_id=payer_id,
+                period_start=period_start.isoformat(),
+                period_end=period_end.isoformat(),
+            )
+        logging.info(f"draft_invoices: deferred {len(payer_ids)} payer(s) for {period_start}")
     except Exception:
         logging.exception("draft_invoices failed")
+        raise
+    finally:
+        db.close()
+
+
+@app.task
+def draft_invoice_for_one(payer_id: int, period_start: str, period_end: str):
+    """One payer's draft. Safe to retry: the overlap guard makes it a no-op once theirs exists."""
+    db = SessionLocal()
+    try:
+        settings = db.query(Settings).filter(Settings.id == 1).first()
+        if settings is None:
+            raise RuntimeError("Settings row not found")
+
+        invoice = draft_invoice_for_payer(
+            db, payer_id, settings, date.fromisoformat(period_start), date.fromisoformat(period_end),
+        )
+        # None means nothing outstanding, or they already have an invoice covering this period.
+        # Both are expected, so return cleanly rather than trigger a retry that can't succeed.
+        if invoice is None:
+            logging.info(f"draft_invoice_for_one: nothing to draft for payer {payer_id}")
+            return
+        logging.info(f"draft_invoice_for_one: drafted {invoice.public_id} for payer {payer_id}")
+    except Exception:
+        logging.exception(f"draft_invoice_for_one: failed for payer {payer_id}")
         db.rollback()
         raise
     finally:

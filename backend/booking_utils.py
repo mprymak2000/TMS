@@ -91,6 +91,12 @@ def series_policy(source) -> dict:
     }
 
 
+def copy_pricing(source) -> dict:
+    """Both price pointers, copied off a series or an existing row. At first creation they come from
+    different places (price off the link, rate off the enrollment) and are set explicitly."""
+    return {"price_id": source.price_id, "rate_id": source.rate_id}
+
+
 ## -------------- Contact resolution -------------- ##
 # A booking always lands on two contacts, whether or not anyone is logged in. Guest bookings create
 # them exactly like any other, which is what keeps the client list complete and makes registering
@@ -287,6 +293,7 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         guest_reminder_phone=series.guest_reminder_phone,
         google_event_id=series.google_event_id,
         **occurrence_policy(series),
+        **copy_pricing(series),
         start=start_utc,
         end=end_utc,
         status="confirmed",

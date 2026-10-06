@@ -4,6 +4,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from policy import get_cancel_action, get_reschedule_action, minutes_until
+from billing import line_charged_amount
 
 #todo: consider patch instead of put for updates, as it allows for partial updates and is more flexible but more complex to implement. put requires the entire object to be sent, which can be simpler but less efficient for updates that only change a few fields.
 #todo: tutor_payout divides by the enrollment rate when a cancelled lesson has a fee_override — guard against rate 0 and rate None.
@@ -22,6 +23,8 @@ class _Input(BaseModel):
 
 class SettingsUpdate(_Input):
     business_timezone: str
+    # Off by default: the monthly job drafts real invoices for real clients.
+    billing_automation_enabled: bool = False
 
 
 class SettingsResponse(BaseModel):
@@ -29,6 +32,7 @@ class SettingsResponse(BaseModel):
 
     id: int
     business_timezone: str
+    billing_automation_enabled: bool
 
 
 class TutorCreate(_Input):
@@ -111,6 +115,22 @@ class ContactResponse(BaseModel):
     verified_at: datetime | None = None
 
 
+class PriceResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    amount: float
+    unit: str
+    archived_at: datetime | None = None
+
+
+class PriceSupersede(_Input):
+    """The new amount. Unit carries over from the row being superseded, and
+    exclude_enrollment_ids are the clients left on the old price."""
+    amount: float = Field(ge=0)
+    exclude_enrollment_ids: list[int] | None = None
+
+
 class EnrollmentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -118,11 +138,22 @@ class EnrollmentResponse(BaseModel):
     contact_id: int
     started_on: date
     ended_on: date | None = None   # null = the open stint
-    rate_unit: str | None = None
-    rate: float | None = None
+    # Flattened off the Price row so the wire format stays amount+unit.
+    rate_id: int | None = None
+    rate_row: PriceResponse | None = Field(default=None, validation_alias="rate", exclude=True)
     payer_id: int | None = None
     grade: int | None = None
     birthday: date | None = None
+
+    @computed_field
+    @property
+    def rate(self) -> float | None:
+        return self.rate_row.amount if self.rate_row else None
+
+    @computed_field
+    @property
+    def rate_unit(self) -> str | None:
+        return self.rate_row.unit if self.rate_row else None
 
 
 class ContactListResponse(ContactResponse):
@@ -541,9 +572,9 @@ class BookingLinkResponse(BaseModel):
     expires_on: date | None = None
     booker_can_set_recur_until: bool
 
-    # What a booking costs when its attendee has no rate of their own.
-    price_unit: Literal["per_session", "per_hour"] | None = None
-    price: float | None = Field(default=None, ge=0)
+    # Flattened off the Price row so the wire format stays amount+unit.
+    price_id: int | None = None
+    price_row: PriceResponse | None = Field(default=None, validation_alias="price", exclude=True)
     cancel_mode: str
     cancel_notice_minutes: int | None = None
     reschedule_mode: str
@@ -699,7 +730,7 @@ class BookingSeriesResponse(BaseModel):
     reschedule_notice_minutes: int | None = None
     series_cancel_mode: str
     series_reschedule_mode: str
-    covered_by_subscription: bool
+    covered_by_enrollment_id: int | None = None
     # Series modes carry no notice window, so the mode IS the verdict — aliased rather than computed,
     # so the frontend reads the same field name on a series as on a booking.
     cancel_action: str = Field(validation_alias="series_cancel_mode")
@@ -805,8 +836,8 @@ class BookingSeriesUpdate(_Input):
     reschedule_notice_minutes: int | None = None
     series_cancel_mode: str
     series_reschedule_mode: str
-    # On when the client is on a monthly plan and these sessions are what it pays for.
-    covered_by_subscription: bool = False
+    # Set when the client's monthly plan already pays for these sessions.
+    covered_by_enrollment_id: int | None = None
 
     @model_validator(mode="after")
     def validate_policy(self):
@@ -902,9 +933,12 @@ class BookingSeriesOccurrencesResponse(BaseModel):
     next_cursor: str | None
 
 class InvoiceGenerate(_Input):
-    """Half-open [start, end), so consecutive months can't double-count a booking on the boundary."""
+    """Half-open [start, end), so consecutive months can't double-count a booking on the boundary.
+    Runs for every payer with outstanding activity in the period, unless payer_ids narrows it to a
+    specific set."""
     period_start: date
     period_end: date
+    payer_ids: list[int] | None = None
 
     @model_validator(mode="after")
     def validate_period(self):
@@ -913,8 +947,34 @@ class InvoiceGenerate(_Input):
         return self
 
 
+class InvoiceCreate(_Input):
+    """Draft one invoice for one payer. With no period and no explicit ids, sweeps everything
+    currently outstanding for them, whenever it's from. A period, if given, scopes which bookings
+    are eligible; booking_ids/item_ids narrow further within it, never escape it."""
+    payer_id: int
+    period_start: date | None = None
+    period_end: date | None = None
+    booking_ids: list[int] | None = None
+    item_ids: list[int] | None = None
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        if (self.period_start is None) != (self.period_end is None):
+            raise ValueError("period_start and period_end must be set together")
+        if self.period_start is not None and self.period_end <= self.period_start:
+            raise ValueError("period_end must be after period_start")
+        return self
+
+
 class InvoiceStatusUpdate(_Input):
-    status: Literal["draft", "sent", "paid", "void"]
+    """The document's own state. Payment is separate — see `InvoicePaymentUpdate`."""
+    status: Literal["draft", "finalized", "void"]
+
+
+class InvoicePaymentUpdate(_Input):
+    """Money received, tracked independently of the document's state — a finalized invoice can sit
+    unpaid for weeks, and this never touches `status`."""
+    payment_status: Literal["unpaid", "paid"]
 
 
 class InvoiceLineResponse(BaseModel):
@@ -924,10 +984,16 @@ class InvoiceLineResponse(BaseModel):
     # Frozen at generation, not read through the FKs below — a sent invoice says what was billed then.
     description: str
     amount: float
-    # Set only when adjusted, so the UI can show what the rules had said.
-    computed: float | None = None
+    adjustment_amount: float | None = None
+    adjustment_percent: float | None = None
     enrollment_id: int | None = None
     booking_id: int | None = None
+    invoice_item_id: int | None = None
+
+    @computed_field
+    @property
+    def charged_amount(self) -> float:
+        return line_charged_amount(self)
 
 
 class InvoiceResponse(BaseModel):
@@ -936,9 +1002,11 @@ class InvoiceResponse(BaseModel):
     id: str = Field(validation_alias="public_id")
     payer_id: int
     payer_name: str
-    period_start: date
-    period_end: date
+    period_start: date | None = None
+    period_end: date | None = None
     status: str
+    payment_status: str
+    number: str | None = None
     total: float
     sent_at: datetime | None = None
     paid_at: datetime | None = None
@@ -951,12 +1019,43 @@ class InvoicePagedResponse(BaseModel):
     total: int
 
 
-class InvoiceLineInput(_Input):
-    """A line an admin writes by hand, or an edit to a generated one. Drafts only.
+class InvoiceLineAdjustmentInput(_Input):
+    """Sets or clears one line's correction. Exactly one of the two may be set; both null clears
+    the adjustment entirely, reverting the line to its original amount."""
+    adjustment_amount: float | None = None
+    adjustment_percent: float | None = None
 
-    This is the escape hatch that keeps proration out of the codebase: when a generated line is
-    wrong — a half month, a goodwill discount — you fix the number instead of teaching the
-    generator a new rule.
-    """
+    @model_validator(mode="after")
+    def _one_or_none(self):
+        if self.adjustment_amount is not None and self.adjustment_percent is not None:
+            raise ValueError("adjustment_amount and adjustment_percent are mutually exclusive")
+        return self
+
+
+class InvoiceSourcesUpdate(_Input):
+    """The complete desired set of claimed bookings/items on a draft, not a delta — matches the
+    full-replacement PUT convention used elsewhere. The monthly line isn't included here; it isn't
+    selectable."""
+    booking_ids: list[int]
+    item_ids: list[int]
+
+
+class InvoiceItemInput(_Input):
+    """A charge with nothing to hang off — recorded now, billed whenever the next invoice for this
+    payer is drawn up. A charge tied to a booking is booking.charge instead; see InvoiceItem's
+    docstring in models.py."""
+    payer_id: int
+    description: str
+    # Negative for a credit, so no ge=0 here.
+    amount: float
+
+
+class InvoiceItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    payer_id: int
     description: str
     amount: float
+    invoice_id: int | None = None   # null while pending
+    created: datetime
