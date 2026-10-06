@@ -5,7 +5,7 @@ Billing is a pure function over rows and doesn't care how they got there — but
 and rate *pointers* frozen onto a booking, so the helpers below set those the way create_booking
 does: price off the link, rate off the attendee's open enrollment.
 """
-from datetime import date, datetime, time, UTC
+from datetime import date, datetime, time, timedelta, UTC
 from decimal import Decimal
 from uuid import uuid4
 
@@ -438,61 +438,47 @@ def test_deleting_a_line_releases_its_booking(client, link, tutor):
     assert _amounts(client.post("/invoices/", json={"payer_id": c["id"]}).json()) == [80]
 
 
-# --- write protection ---
+# --- a draft doesn't hold its sources still ---
+# Editing a booking's charge or a client's rate while a draft exists is allowed. The line's amount
+# was frozen when it was generated, so the edit can't corrupt the invoice — the draft just shows the
+# older number until someone regenerates it. Guarding this was tried and removed: no platform
+# checked does it (Cliniko only marks the appointment as invoiced), and it meant a 409 mid-workflow.
 
-def test_charge_cannot_be_edited_while_claimed_by_a_draft(client, link, tutor):
-    """The line is already frozen, so editing the source would silently diverge from it."""
-    c = _contact(client, "Locked")
+def test_charge_edits_freely_while_on_a_draft(client, link, tutor):
+    c = _contact(client, "ChargeEdit")
     b = _booking(link, tutor, c["id"], c["id"])
     inv = _generate(client)[0]
 
     r = client.put(f"/bookings/{b['public_id']}",
                    json=_booking_payload(client, b["public_id"], charge=25))
-    assert r.status_code == 409
-    assert inv["id"] in r.json()["detail"]
-
-
-def test_releasing_the_claim_lets_the_charge_through(client, link, tutor):
-    c = _contact(client, "Unlocked")
-    b = _booking(link, tutor, c["id"], c["id"])
-    inv = _generate(client)[0]
-
-    r = client.put(f"/bookings/{b['public_id']}?release_invoice_claim=true",
-                   json=_booking_payload(client, b["public_id"], charge=25))
     assert r.status_code == 200
     assert r.json()["charge"] == 25
-    assert client.get(f"/invoices/{inv['id']}").json()["lines"] == []
+    # The draft is untouched — frozen at generation, not re-derived.
+    assert _amounts(client.get(f"/invoices/{inv['id']}").json()) == [80]
 
 
-def test_a_rate_cannot_be_edited_while_a_draft_carries_its_plan_line(client):
-    """The monthly line has no booking or item of its own, so the guard matches on enrollment_id."""
-    c = _contact(client, "RateLocked")
+def test_rate_edits_freely_while_a_draft_carries_the_plan_line(client):
+    c = _contact(client, "RateEdit")
     _enroll(client, c["id"], rate=400, rate_unit="per_month")
-    _generate(client)
+    inv = _generate(client)[0]
 
-    r = client.put(f"/contacts/{c['id']}/enrollment",
-                   json={"started_on": "2026-01-01", "rate": 450, "rate_unit": "per_month"})
-    assert r.status_code == 409
-
-
-def test_an_unclaimed_rate_edits_freely(client):
-    c = _contact(client, "RateFree")
-    _enroll(client, c["id"], rate=400, rate_unit="per_month")
     r = client.put(f"/contacts/{c['id']}/enrollment",
                    json={"started_on": "2026-01-01", "rate": 450, "rate_unit": "per_month"})
     assert r.status_code == 200
     assert r.json()["rate"] == 450
+    assert _amounts(client.get(f"/invoices/{inv['id']}").json()) == [400]
 
 
-def test_editing_something_other_than_terms_is_never_blocked(client, link, tutor):
-    """Only the fields feeding a frozen line are guarded — a grade isn't one of them."""
-    c = _contact(client, "GradeEdit")
+def test_regenerating_picks_up_the_new_rate(client):
+    """The documented way to pull a drifted draft back in line: delete it and generate again."""
+    c = _contact(client, "Regenerated")
     _enroll(client, c["id"], rate=400, rate_unit="per_month")
-    _generate(client)
-    r = client.put(f"/contacts/{c['id']}/enrollment",
-                   json={"started_on": "2026-01-01", "rate": 400, "rate_unit": "per_month", "grade": 9})
-    assert r.status_code == 200
-    assert r.json()["grade"] == 9
+    inv = _generate(client)[0]
+    client.put(f"/contacts/{c['id']}/enrollment",
+               json={"started_on": "2026-01-01", "rate": 450, "rate_unit": "per_month"})
+
+    client.delete(f"/invoices/{inv['id']}")
+    assert _amounts(_generate(client)[0]) == [450]
 
 
 # --- status ---
@@ -831,29 +817,36 @@ def test_releasing_a_moved_booking_frees_the_live_row(client, link, tutor):
     r = client.delete(f"/invoices/{inv['id']}/lines/{inv['lines'][0]['id']}")
     assert r.status_code == 200
     assert r.json()["lines"] == []
-    # Freed, so the moved session is billable again rather than stranded.
-    assert _amounts(client.post("/invoices/", json={"payer_id": c["id"]}).json()) == [80]
+
+    # Freed, so the moved session is billable again rather than stranded. Named explicitly, since
+    # it now sits in the future and the blanket sweep deliberately stops at now.
+    with TestingSessionLocal() as db:
+        moved_id = db.query(Booking).filter(Booking.public_id == moved["id"]).first().id
+    again = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [moved_id]})
+    assert _amounts(again.json()) == [80]
 
 
-def test_cancelling_a_series_drops_draft_lines_for_its_future_occurrences(client, link, tutor):
-    """The series paths hard-delete future occurrences. A claimed one would leave the draft billing
-    a session that no longer exists, since InvoiceLine.booking_id just nulls out."""
+def test_cancelling_a_series_leaves_draft_lines_alone(client, link, tutor):
+    """Same as cancelling one occurrence: the line stands and the admin removes it if it shouldn't.
+    The row is hard-deleted, so booking_id nulls out, but the frozen amount survives."""
     from unittest.mock import MagicMock, patch
 
     c = _contact(client, "SeriesCancelled")
     sid = _series(link, tutor, c["id"], c["id"])
-    future = datetime(2026, 12, 9, 16, 0, tzinfo=UTC)
+    future = datetime.now(UTC) + timedelta(days=60)
     with TestingSessionLocal() as db:
-        db.add(Booking(
+        occ = Booking(
             public_id=str(uuid4()), tutor_id=tutor["id"], booking_link_id=link["id"],
             payer_id=c["id"], attendee_id=c["id"], series_id=sid,
-            start=future, end=future.replace(hour=17),
+            start=future, end=future + timedelta(hours=1),
             google_event_id="evt-series", price_id=link["price_id"],
-        ))
+        )
+        db.add(occ)
         db.commit()
+        occ_id = occ.id
 
-    # Ad-hoc sweep: no period, so it claims the future occurrence too.
-    inv = client.post("/invoices/", json={"payer_id": c["id"]}).json()
+    # Billed ahead, deliberately — which is the only way a future occurrence gets claimed.
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [occ_id]}).json()
     assert _amounts(inv) == [80]
 
     with TestingSessionLocal() as db:
@@ -867,5 +860,42 @@ def test_cancelling_a_series_drops_draft_lines_for_its_future_occurrences(client
     assert r.status_code in (200, 204), r.text
 
     after = client.get(f"/invoices/{inv['id']}").json()
-    assert after["lines"] == []
-    assert after["total"] == 0
+    assert _amounts(after) == [80]
+    assert after["lines"][0]["booking_id"] is None   # row gone, line stands
+
+
+# --- ad-hoc scope ---
+
+def _future_booking(link, tutor, payer_id, attendee_id):
+    with TestingSessionLocal() as db:
+        start = datetime.now(UTC) + timedelta(days=30)
+        b = Booking(
+            public_id=str(uuid4()), tutor_id=tutor["id"], booking_link_id=link["id"],
+            payer_id=payer_id, attendee_id=attendee_id, start=start,
+            end=start + timedelta(hours=1), google_event_id=f"evt-{uuid4().hex[:8]}",
+            price_id=link["price_id"],
+        )
+        db.add(b)
+        db.commit()
+        return b.id
+
+
+def test_blanket_adhoc_sweep_stops_at_now(client, link, tutor):
+    """Unbounded, this billed every occurrence a finite series had materialized — a year ahead —
+    and claimed them all, so the engagement read as settled."""
+    c = _contact(client, "NotYet")
+    _booking(link, tutor, c["id"], c["id"], day=10)     # March, delivered
+    _future_booking(link, tutor, c["id"], c["id"])      # a month out
+
+    inv = client.post("/invoices/", json={"payer_id": c["id"]}).json()
+    assert _amounts(inv) == [80]        # the delivered one only
+
+
+def test_a_named_future_booking_still_bills(client, link, tutor):
+    """Collecting before the session is the point of picking it by hand."""
+    c = _contact(client, "PrePaid")
+    future_id = _future_booking(link, tutor, c["id"], c["id"])
+
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [future_id]}).json()
+    assert _amounts(inv) == [80]
+    assert inv["lines"][0]["booking_id"] == future_id

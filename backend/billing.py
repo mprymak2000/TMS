@@ -1,9 +1,12 @@
 """Turning bookings and charges into invoices.
 
-A line is generated once and frozen, with the underlying source objects locked, so there is no drift
-as long as an invoice is drafted. To unlock editing, remove line in question or delete the draft and 
-regenerate draft. Corrections to an invoice's line live as separate columns on the line itself. They 
-don't affect the source object. 
+A line is generated once and frozen — nothing re-derives it, and the sources are NOT held still.
+Editing a booking's charge or a client's rate afterwards is allowed and never reaches the invoice;
+the draft just shows the older number until it's deleted and generated again. Corrections to a line
+live in its own adjustment columns and don't touch the source.
+
+What does follow a booking is the claim (`invoice_id`), because without it a rescheduled session
+gets swept and billed a second time — see move_claim and release_draft_claims.
 
 The rule, per booking:
 
@@ -17,8 +20,8 @@ The rule, per booking:
           ?? booking.price.amount by unit        link's price, frozen at creation; a monthly
                                                   client's extra, or no enrollment at all
 
-Plus one line per active per_month enrollment in the period, generated fresh from enrollment.rate
-each sweep, and one per swept InvoiceItem.
+Plus one line per active per_month enrollment in the period, generated fresh from the price its
+rate_id points at, and one per swept InvoiceItem.
 
 Lifecycle: bookings and InvoiceItems share one claim-based mechanism (invoice_id, nullable, set once
 swept). A booking's eligibility is additionally bounded by a period if the invoice has one; an
@@ -212,6 +215,12 @@ def _lines_for_payer(
         booking_query = booking_query.filter(Booking.start >= start_utc, Booking.start < end_utc)
     if booking_ids is not None:
         booking_query = booking_query.filter(Booking.id.in_(booking_ids))
+    elif start_utc is None:
+        # Blanket ad-hoc sweep: delivered sessions only. Unbounded, this bills every occurrence a
+        # finite series has already materialized — a year's worth — and claims them, so the whole
+        # engagement reads as settled. Billing ahead is fine, but it has to be asked for, which is
+        # what naming booking_ids above does.
+        booking_query = booking_query.filter(Booking.start < datetime.now(UTC))
     bookings = booking_query.all()
 
     for booking in bookings:
@@ -280,8 +289,8 @@ def draft_invoice_for_payer(
 
 def release_line(db: Session, invoice: Invoice, line: InvoiceLine) -> None:
     """Un-claims whatever the line billed (if anything — a monthly line claims nothing) and drops
-    the line itself. Shared by both escape hatches: deleting the line from the invoice side, and an
-    override on a blocked source-side edit."""
+    the line itself, so the source is billable again. Reached from the invoice side: one line via
+    DELETE, several via the membership PUT, or a series path about to delete its future rows."""
     if line.booking_id is not None:
         db.query(Booking).filter(Booking.id == line.booking_id).update({"invoice_id": None})
     elif line.invoice_item_id is not None:
@@ -291,52 +300,12 @@ def release_line(db: Session, invoice: Invoice, line: InvoiceLine) -> None:
     invoice.total = round(sum(line_charged_amount(l) for l in invoice.lines if l.id != line.id), 2)
 
 
-class ClaimedByDraft(Exception):
-    """Raised instead of silently allowing an edit that a draft invoice already froze a line from.
-    Carries the invoice so the caller can name it in the 409 — kept out of HTTPException so this
-    module stays free of FastAPI."""
-    def __init__(self, invoice: Invoice):
-        self.invoice = invoice
-
-
-def booking_draft_claim(booking: Booking) -> Invoice | None:
-    """The draft invoice claiming this booking, if any."""
-    if booking.invoice_id is not None and booking.invoice.status == "draft":
-        return booking.invoice
-    return None
-
-
-def enrollment_draft_claim(db: Session, enrollment: Enrollment) -> Invoice | None:
-    """The draft invoice claiming this enrollment, if any — either a claimed booking of its
-    contact's (per_session/per_hour), or a draft line pointing at the enrollment directly
-    (per_month, which has no booking/item row of its own to claim).
-
-    Not gated on the enrollment's current rate_unit: it's edited in place, so "current" could
-    already be the incoming edit. Existence of a claiming line is checked directly instead, which
-    stays correct no matter what the unit is changing to or from.
-    """
-    booking = (
-        db.query(Booking)
-        .join(Invoice, Booking.invoice_id == Invoice.id)
-        .filter(Booking.attendee_id == enrollment.contact_id, Invoice.status == "draft")
-        .first()
-    )
-    if booking is not None:
-        return booking.invoice
-    line = (
-        db.query(InvoiceLine)
-        .join(Invoice, InvoiceLine.invoice_id == Invoice.id)
-        .filter(InvoiceLine.enrollment_id == enrollment.id, Invoice.status == "draft")
-        .first()
-    )
-    return line.invoice if line is not None else None
-
-
 def release_booking_claim(db: Session, booking: Booking) -> None:
+    """Drop the line billing this booking. A booking can be claimed with no line of its own — see
+    move_claim, where a finalized invoice keeps its line on the original row — so clear the claim
+    and leave the sent document alone."""
     invoice = booking.invoice
     line = next((l for l in invoice.lines if l.booking_id == booking.id), None)
-    # A booking can be claimed with no line of its own: see move_claim, where a finalized invoice
-    # keeps its line on the original row. Clear the claim and leave the sent document alone.
     if line is None:
         booking.invoice_id = None
         return
@@ -374,28 +343,6 @@ def move_claim(old: Booking, new: Booking) -> None:
     line = next((l for l in invoice.lines if l.booking_id == old.id), None)
     if line is not None:
         line.booking_id = new.id
-
-
-def release_enrollment_claims(db: Session, enrollment: Enrollment) -> None:
-    """Releases everything currently claiming this enrollment — every claimed booking of its
-    contact's, plus the monthly line if one's present. Used when an admin overrides the guard
-    above instead of going to the invoice first."""
-    bookings = (
-        db.query(Booking)
-        .join(Invoice, Booking.invoice_id == Invoice.id)
-        .filter(Booking.attendee_id == enrollment.contact_id, Invoice.status == "draft")
-        .all()
-    )
-    for booking in bookings:
-        release_booking_claim(db, booking)
-    lines = (
-        db.query(InvoiceLine)
-        .join(Invoice, InvoiceLine.invoice_id == Invoice.id)
-        .filter(InvoiceLine.enrollment_id == enrollment.id, Invoice.status == "draft")
-        .all()
-    )
-    for line in lines:
-        release_line(db, line.invoice, line)
 
 
 def set_invoice_sources(

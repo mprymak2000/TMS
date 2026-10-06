@@ -218,25 +218,29 @@ rather than trips through the slot picker, so a retired link's rules are read by
       the enrollment and the link, and a working invoice generator. **Pass B** is the remodel plus
       the lifecycle fixes Pass A left open — see `.claude/plans/enrollment-pass-10b-billing-and-invoicing.md`.
 
-      **Pass B, in short** — the enrollment remodel plus an invoice lifecycle designed twice: once
-      cross-checked against Lago/Stripe's schemas (refresh + a separate `InvoiceAdjustment` table,
-      built and tested), then torn out and redesigned simpler after an extremely long session
-      surfaced that the first design was solving a problem no real platform actually has. See
-      CLAUDE.md's "Billing and invoicing" section for the authoritative final shape — this entry is
-      a pointer, not a spec. Enrollment becomes a sequence of stints (own PK, `contact_id`,
+      **Pass B, in short** — the enrollment remodel plus an invoice lifecycle designed three times:
+      refresh + a separate `InvoiceAdjustment` table (built and tested, then torn out); then frozen
+      lines protected by write guards on the sources (built and tested, then torn out); then frozen
+      lines with nothing held still, which is where it landed. The second teardown came from reading
+      actual competitor APIs rather than reasoning: Cliniko guards nothing and just marks the
+      appointment invoiced. See CLAUDE.md's "Billing and invoicing" section for the authoritative
+      final shape — this entry is a pointer, not a spec. Enrollment becomes a sequence of stints (own PK, `contact_id`,
       `started_on`/`ended_on`, `is_active` dropped, partial unique on the open one) because clients
       re-enroll annually — see the supersession note on 10a.
 
       On the invoicing side, final shape: bookings and `InvoiceItem`s share one claim-based lifecycle
       (`invoice_id`, polymorphic between the two); there is no refresh — a line is computed once, at
-      generation, and never regenerated, matching every platform actually checked (Stripe, Lago,
-      QuickBooks, Square, Xero — none re-derive a line from its source after creation); corrections
-      are `InvoiceLine.adjustment_amount`/`adjustment_percent` (mutually exclusive, `amount` never
-      overwritten), not a separate table, since nothing destroys-and-rebuilds a line anymore for an
-      adjustment to need to survive; a period-overlap-reject guard replaces per-line staleness
-      tracking; claim-based write-protection on the booking/enrollment side (edit rejected while
-      claimed by a draft, no lock, no timeout, explicit release as the escape hatch) replaces the
-      staleness flag entirely; the monthly `per_month` fee generates straight from the enrollment's
+      generation, and never regenerated, matching Stripe, QuickBooks, Square, Xero and Cliniko
+      (**not** Lago, which does refresh drafts during its grace period and needs `adjusted_fees` and
+      a `ready_to_be_refreshed` flag to make that safe — an earlier version of this entry wrongly
+      claimed no platform refreshes); corrections are `InvoiceLine.adjustment_amount`/
+      `adjustment_percent` (mutually exclusive, `amount` never overwritten), not a separate table,
+      since nothing destroys-and-rebuilds a line anymore for an adjustment to need to survive; a
+      period-overlap-reject guard replaces per-line staleness tracking; **nothing holds a source
+      still** — write guards on `Booking.charge` and enrollment terms were built and then deleted,
+      since a frozen line can't be corrupted by a later edit and the 409s only interrupted ordinary
+      work; a blanket ad-hoc sweep is bounded to delivered sessions, with explicit `booking_ids`
+      lifting the bound so billing ahead is deliberate; the monthly `per_month` fee generates straight from the enrollment's
       price (materializing it as an `InvoiceItem` was built, then reverted — both reasons for it were
       already covered by the overlap guard and the adjustment columns);
       `covered_by_enrollment_id` (a real FK) replaces the old bare `covered_by_subscription` boolean;
@@ -617,13 +621,25 @@ against what 10b built. Nothing here blocks anything; each is additive.
   manual window we have is the same thing with N unset, so it's a `Settings` field plus a daily job,
   not a change of model.
 
-- **`last_modified`-based version check, as a backstop if claim-based write-protection ever proves
-  too restrictive.** Not the staleness flag — that's gone, not deferred. Square's `PublishInvoice`
-  requires a matching `version`, confirmed as real precedent, but Square's drafts don't have a
-  claim-based source-locking mechanism the way ours do, so they need it and we currently don't. Only
-  worth building if the write-protection guard (reject editing a booking/enrollment while claimed by
-  a draft) turns out to be too restrictive in real use — a genuine possibility worth watching, not a
-  known gap today.
+- **Surfacing a stale draft — the one acknowledged gap in the current design.** Nothing holds a
+  source still any more, so a draft can show yesterday's numbers after a charge edit, a rate change,
+  or a session moving. Harmless to the invoice (lines are frozen, and delete-and-regenerate re-reads
+  everything) but nothing *tells* you. Two precedents, either of which would close it:
+  **Lago's `ready_to_be_refreshed`** — a source change marks affected drafts stale, and the draft is
+  explicitly refreshable within a grace period. The full Lago model needs `adjusted_fees` back too,
+  so overrides survive the rebuild. **Square's `PublishInvoice` `version`** — reject the finalize if
+  the invoice changed since the client read it; optimistic concurrency on the invoice, not a guard
+  on the sources. A cheaper third option was sketched and not built: no diff engine, just three
+  checks before finalize (a line's booking is now cancelled / moved out of the period / billable
+  work in the period isn't on the invoice). Deliberately deferred — the guards were a real cost in
+  daily use and staleness is so far hypothetical. Revisit if it actually bites.
+
+- **Blocking a customer from cancelling a session they've already paid for.** Cliniko's rule: a fully
+  paid, closed invoice disables the patient's online cancellation link, and an admin has to do it
+  manually. We have no equivalent, so a client can self-cancel a pre-paid session. **Blocked on
+  auth**: the manage links and the admin UI hit the same endpoints with nothing to tell them apart,
+  so the check would block the admin too — the one person who needs to act on it. Owner's current
+  call is that this is acceptable; if it's on an invoice and they cancel, they still owe it.
 
 - **`payer_id` targeting on generate** — already resolved by the final design: the single sweep
   function always takes an optional `payer_ids`/single `payer_id`, no separate "targeted mode" to add.

@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import tuple_
 
 from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, copy_pricing, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_attendee, resolve_payer, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
-from billing import booking_draft_claim, move_claim, release_booking_claim, release_draft_claims
+from billing import move_claim, release_draft_claims
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -747,24 +747,16 @@ def update_booking_series(id: str, booking_in: BookingSeriesUpdate, db: Session 
 
 
 @router.put("/{ref}", response_model=BookingResponse)
-def update_booking(
-    ref: str, booking_in: BookingUpdate, release_invoice_claim: bool = False,
-    db: Session = Depends(get_db), settings=Depends(get_settings),
-):
-    """Plain-column update: contact info, no-show flag, kind label, governing link."""
+def update_booking(ref: str, booking_in: BookingUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
+    """Plain-column update: contact info, no-show flag, kind label, governing link.
+
+    Editing `charge` while a draft invoice holds this booking is allowed and does **not** reach the
+    invoice — that line's amount was frozen when it was generated. The draft keeps the old number
+    until someone regenerates it. No platform checked guards this (Cliniko just marks the
+    appointment as invoiced), and guarding it meant a 409 during ordinary work.
+    """
     db_booking = resolve_ref(ref, db, settings)
     _validate_link_and_type(booking_in.booking_link_id, booking_in.booking_type_id, db)
-
-    if booking_in.charge != db_booking.charge:
-        invoice = booking_draft_claim(db_booking)
-        if invoice is not None:
-            if not release_invoice_claim:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Charge is claimed by draft invoice {invoice.public_id} — "
-                           f"retry with release_invoice_claim=true, or edit the line on the invoice instead",
-                )
-            release_booking_claim(db, db_booking)
 
     for key, value in booking_in.model_dump().items():
         setattr(db_booking, key, value)
@@ -918,10 +910,7 @@ def _cancel_series(db_series: BookingSeries, today: date, tz: ZoneInfo, db: Sess
         ).execute()
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to cancel future instances of the series on calendar") from e
-    doomed = db.query(Booking).filter(
-        Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC)
-    ).all()
-    release_draft_claims(db, doomed)
+    # Draft lines stand, same as cancelling one occurrence. The admin removes them if they should.
     db.query(Booking).filter(Booking.series_id == db_series.id, Booking.start >= datetime.now(UTC)).delete(synchronize_session=False)
     db_series.status = 'cancelled'
     # Truncating turns any rule into one that ends on a date — count and until can't coexist.
