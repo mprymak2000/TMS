@@ -3,12 +3,10 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 
-from billing import (
-    draft_invoice_for_payer, generate_invoices, line_charged_amount, money, release_line,
-    set_invoice_sources,
-)
+from billing import draft_invoice_for_payer, generate_invoices, money, retotal, release_line, set_invoice_sources
+from booking_utils import resolve_ref
 from database import get_db, get_settings
-from models import Invoice
+from models import Invoice, InvoiceLine
 from schemas import (
     InvoiceCreate, InvoiceGenerate, InvoiceLineAdjustmentInput, InvoicePagedResponse,
     InvoicePaymentUpdate, InvoiceResponse, InvoiceSourcesUpdate, InvoiceStatusUpdate,
@@ -37,6 +35,13 @@ def _editable_invoice(public_id: str, db: Session) -> Invoice:
     return invoice
 
 
+def _resolve_booking_refs(refs: list[str], db: Session, settings) -> list[int]:
+    """Refs to internal ids, materializing any not-yet-real series occurrence on the way — the
+    write-intent moment for a virtual occurrence is being put on an invoice, same as reschedule or
+    cancel is for the others. Not committed here; the caller's own commit covers it."""
+    return [resolve_ref(ref, db, settings).id for ref in refs]
+
+
 def _allocate_invoice_number(db: Session, year: int) -> str:
     """Next INV-{year}-{seq:04d}. Locked so two finalizes at once can't collide."""
     prefix = f"INV-{year}-"
@@ -63,7 +68,12 @@ def get_invoices(
     total and gets jumped around, not a feed scrolled to the end."""
     # The response reads payer_name and lines, so preload both — otherwise each invoice costs two
     # more queries at serialize time.
-    query = db.query(Invoice).options(joinedload(Invoice.payer), joinedload(Invoice.lines))
+    query = db.query(Invoice).options(
+        joinedload(Invoice.payer),
+        # lines -> booking as well: each line exposes its booking's ref, which is a query per line
+        # otherwise, times every invoice on the page.
+        joinedload(Invoice.lines).joinedload(InvoiceLine.booking),
+    )
     if payer_id is not None:
         query = query.filter(Invoice.payer_id == payer_id)
     if status is not None:
@@ -71,7 +81,9 @@ def get_invoices(
 
     total = query.count()
     invoices = (
-        query.order_by(Invoice.period_start.desc(), Invoice.id.desc())
+        # Newest first by when it was drawn up. Ordering on period_start instead would strand every
+        # ad-hoc invoice at one end of the list, since those have no period at all.
+        query.order_by(Invoice.created.desc(), Invoice.id.desc())
         .offset((page - 1) * page_size).limit(page_size).all()
     )
     return InvoicePagedResponse(items=invoices, total=total)
@@ -108,8 +120,9 @@ def create(
 ):
     """One invoice for one payer — the manual/ad-hoc counterpart to /generate. No period and no
     explicit ids sweeps everything currently outstanding for them."""
+    booking_ids = None if body.booking_ids is None else _resolve_booking_refs(body.booking_ids, db, settings)
     invoice = draft_invoice_for_payer(
-        db, body.payer_id, settings, body.period_start, body.period_end, body.booking_ids, body.item_ids,
+        db, body.payer_id, settings, body.period_start, body.period_end, booking_ids, body.item_ids,
     )
     if invoice is None:
         raise HTTPException(
@@ -160,6 +173,7 @@ def update_payment(public_id: str, body: InvoicePaymentUpdate, db: Session = Dep
     return invoice
 
 
+
 # ── lines ────────────────────────────────────────────────────────────────────
 @router.put("/{public_id}/lines", response_model=InvoiceResponse)
 def update_sources(public_id: str, body: InvoiceSourcesUpdate, db: Session = Depends(get_db), settings=Depends(get_settings)):
@@ -167,8 +181,9 @@ def update_sources(public_id: str, body: InvoiceSourcesUpdate, db: Session = Dep
     full set it ended up with, not a delta. Existing adjustments on lines that stay selected are
     preserved; the monthly line is untouched, since it isn't part of this set."""
     invoice = _editable_invoice(public_id, db)
+    booking_ids = _resolve_booking_refs(body.booking_ids, db, settings)
     try:
-        set_invoice_sources(db, invoice, settings, body.booking_ids, body.item_ids)
+        set_invoice_sources(db, invoice, settings, booking_ids, body.item_ids)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     db.commit()
@@ -189,8 +204,7 @@ def update_line(public_id: str, line_id: int, body: InvoiceLineAdjustmentInput, 
     # Decimal, not the float Pydantic parsed — the arithmetic below mixes it with amount.
     line.adjustment_amount = None if body.adjustment_amount is None else money(body.adjustment_amount)
     line.adjustment_percent = None if body.adjustment_percent is None else money(body.adjustment_percent)
-    db.flush()
-    invoice.total = round(sum(line_charged_amount(l) for l in invoice.lines), 2)
+    retotal(db, invoice)
     db.commit()
     db.refresh(invoice)
     return invoice

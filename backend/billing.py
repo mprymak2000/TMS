@@ -44,10 +44,10 @@ def money(value) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def _hours(booking: Booking) -> float:
+def _hours(start: datetime, end: datetime) -> float:
     # SQLite hands back naive datetimes; everything here is stored UTC. Same guard as booking_utils.
-    start = booking.start if booking.start.tzinfo else booking.start.replace(tzinfo=UTC)
-    end = booking.end if booking.end.tzinfo else booking.end.replace(tzinfo=UTC)
+    start = start if start.tzinfo else start.replace(tzinfo=UTC)
+    end = end if end.tzinfo else end.replace(tzinfo=UTC)
     return (end - start).total_seconds() / 3600
 
 
@@ -65,33 +65,54 @@ def resolve_price(db: Session, amount: float, unit: str) -> Price:
     return price
 
 
-def _by_unit(price: Price, booking: Booking) -> Decimal:
-    return price.amount * money(_hours(booking)) if price.unit == "per_hour" else price.amount
+def _by_unit(price: Price, start: datetime, end: datetime) -> Decimal:
+    return price.amount * money(_hours(start, end)) if price.unit == "per_hour" else price.amount
 
 
-def _price_amount(booking: Booking) -> Decimal | None:
-    """The link's price, frozen onto the booking at creation."""
-    return None if booking.price is None else _by_unit(booking.price, booking)
+def _resolve_amount(
+        charge: Decimal | None,
+        rate: Price | None,
+        price: Price | None,
+        covered_by_enrollment_id: int | None,
+        enrollment: Enrollment | None,
+        start: datetime,
+        end: datetime,
+    ) -> Decimal | None:
+    """What one occurrence bills: charge ?? rate ?? price. None means no line — covered by a
+    subscription, or unpriced. Takes plain values rather than a booking row, so a not-yet-
+    materialized series occurrence can be priced the same way with no real row to read."""
+    if charge is not None:
+        return charge
 
-
-def _line_amount(booking: Booking, enrollment: Enrollment | None) -> Decimal | None:
-    """What this one booking bills. None means no line — covered by a subscription, or unpriced.
-
-    Both pointers were frozen at creation, so nothing here reads a live rate or link price."""
-    if booking.charge is not None:
-        return booking.charge
-
-    if booking.rate is not None:
-        if booking.rate.unit in ("per_hour", "per_session"):
-            return _by_unit(booking.rate, booking)
+    if rate is not None:
+        if rate.unit in ("per_hour", "per_session"):
+            return _by_unit(rate, start, end)
         # Monthly plan covering this series: no line. A second series (extras on top of the usual
         # schedule) isn't covered, so it falls through and bills at the link's price. Coverage is
         # checked live on purpose — it's who's paying for what, not a price.
-        if booking.rate.unit == "per_month" and booking.series is not None and enrollment is not None \
-                and booking.series.covered_by_enrollment_id == enrollment.id:
+        if rate.unit == "per_month" and covered_by_enrollment_id is not None and enrollment is not None \
+                and covered_by_enrollment_id == enrollment.id:
             return None
 
-    return _price_amount(booking)
+    return None if price is None else _by_unit(price, start, end)
+
+
+def booking_amount(booking: Booking) -> Decimal | None:
+    """What this booking would bill if swept now."""
+    return _resolve_amount(
+        booking.charge, booking.rate, booking.price,
+        booking.series.covered_by_enrollment_id if booking.series else None,
+        booking.attendee.current_enrollment, booking.start, booking.end,
+    )
+
+
+def series_occurrence_amount(series, start: datetime, end: datetime) -> Decimal | None:
+    """What a not-yet-materialized occurrence of this series would bill — same resolution chain as
+    a real booking. Never has a charge override: nothing has created the row yet to put one on."""
+    return _resolve_amount(
+        None, series.rate, series.price, series.covered_by_enrollment_id,
+        series.attendee.current_enrollment, start, end,
+    )
 
 
 def line_charged_amount(line: InvoiceLine) -> Decimal:
@@ -156,7 +177,7 @@ def _overlapping_invoice_exists(db: Session, payer_id: int, period_start: date, 
 
 
 def _booking_line(booking: Booking, tz: ZoneInfo) -> InvoiceLine | None:
-    amount = _line_amount(booking, booking.attendee.current_enrollment)
+    amount = booking_amount(booking)
     if amount is None:
         return None
     start = booking.start if booking.start.tzinfo else booking.start.replace(tzinfo=UTC)
@@ -183,6 +204,16 @@ def _lock_payer(db: Session, payer_id: int) -> None:
         db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"invoice:{payer_id}"})
 
 
+def _billable_query(db: Session, payer_id: int):
+    """Unclaimed and chargeable: the eligibility half of the sweep, without the period or time
+    bounds. Shared so the candidate list can't drift from what generation would actually take."""
+    return db.query(Booking).filter(
+        Booking.payer_id == payer_id,
+        or_(Booking.status == "confirmed", Booking.charge.isnot(None)),
+        Booking.invoice_id.is_(None),
+    )
+
+
 def _lines_for_payer(
         db: Session,
         payer_id: int,
@@ -206,11 +237,7 @@ def _lines_for_payer(
     # period 2, it's under period 1). Not gated to status == "confirmed" alone — a cancelled booking
     # with a late-cancellation charge still owes that charge. invoice_id IS NULL: claimed bookings
     # are already billed, never swept again.
-    booking_query = db.query(Booking).filter(
-        Booking.payer_id == payer_id,
-        or_(Booking.status == "confirmed", Booking.charge.isnot(None)),
-        Booking.invoice_id.is_(None),
-    )
+    booking_query = _billable_query(db, payer_id)
     if start_utc is not None:
         booking_query = booking_query.filter(Booking.start >= start_utc, Booking.start < end_utc)
     if booking_ids is not None:
@@ -287,6 +314,15 @@ def draft_invoice_for_payer(
     return invoice
 
 
+def retotal(db: Session, invoice: Invoice) -> None:
+    """Sum the lines onto the invoice. Expires the collection first: deleting a child doesn't remove
+    it from the parent's loaded list, so summing straight after a release counts rows that are
+    already gone — which silently left the total at its pre-release figure."""
+    db.flush()
+    db.expire(invoice, ["lines"])
+    invoice.total = round(sum(line_charged_amount(l) for l in invoice.lines), 2)
+
+
 def release_line(db: Session, invoice: Invoice, line: InvoiceLine) -> None:
     """Un-claims whatever the line billed (if anything — a monthly line claims nothing) and drops
     the line itself, so the source is billable again. Reached from the invoice side: one line via
@@ -296,8 +332,7 @@ def release_line(db: Session, invoice: Invoice, line: InvoiceLine) -> None:
     elif line.invoice_item_id is not None:
         db.query(InvoiceItem).filter(InvoiceItem.id == line.invoice_item_id).update({"invoice_id": None})
     db.delete(line)
-    db.flush()
-    invoice.total = round(sum(line_charged_amount(l) for l in invoice.lines if l.id != line.id), 2)
+    retotal(db, invoice)
 
 
 def release_booking_claim(db: Session, booking: Booking) -> None:
@@ -385,8 +420,7 @@ def set_invoice_sources(
             invoice.lines.append(_item_line(item))
             item.invoice = invoice
 
-    db.flush()
-    invoice.total = round(sum(line_charged_amount(l) for l in invoice.lines), 2)
+    retotal(db, invoice)
 
 
 def generate_invoices(db: Session, period_start: date, period_end: date, settings,

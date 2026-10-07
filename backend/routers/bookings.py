@@ -11,10 +11,10 @@ from datetime import UTC, date, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import tuple_
+from sqlalchemy import or_, tuple_
 
 from booking_utils import active_series_filter, apply_booking_time_scope, apply_scope_filters, apply_series_time_scope, build_rrule, compute_series_facets, compute_timeline_facets, decode_cursor, encode_cursor, indefinite_series_filter, is_indefinite, is_series_active, copy_pricing, occurrence_policy, require_link_bookable, require_link_not_archived, require_slot_in_schedule, resolve_attendee, resolve_payer, resolve_ref, merge_occurrences, scoped_virtual_occurrences, series_inactive_reason, series_last_date, series_policy, series_step
-from billing import move_claim, release_draft_claims
+from billing import booking_amount, move_claim, release_draft_claims, series_occurrence_amount
 from database import get_db, get_settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from gcal import SCOPES, get_calendar_service
@@ -143,6 +143,8 @@ def get_bookings(
     booking_link_ids: list[int] = Query(default=[]), # facet scope
     booking_type_ids: list[int] = Query(default=[]), # facet scope
     attendee_ids: list[int] = Query(default=[]), # facet scope
+    payer_ids: list[int] = Query(default=[]), # no facet — the invoicing question, see apply_scope_filters
+    unbilled: bool = Query(default=False), # main scope - branch
     time_min: datetime | None = Query(default=None), # main scope - time
     time_max: datetime | None = Query(default=None), # main scope - time
     include_cancelled: bool = Query(default=False), # facet scope
@@ -154,15 +156,19 @@ def get_bookings(
     settings=Depends(get_settings),
 ):
     """Cursor-paginated, flat list of all bookings (materialized and virtual occurrences),
-    filtered by tutor_ids/booking_link_ids/booking_type_ids/attendee_ids/pending_only, scoped by
-    time_min/time_max. Facets returned alongside items. See GET /bookings/pages for the total/page-based
+    filtered by tutor_ids/booking_link_ids/booking_type_ids/attendee_ids/payer_ids/pending_only,
+    scoped by time_min/time_max. Facets returned alongside items.
+
+    unbilled=true narrows to what an invoice could still claim, virtual occurrences included — a
+    not-yet-materialized occurrence is unclaimed by construction, and putting one on an invoice is
+    what materializes it. Each row carries would_bill. See GET /bookings/pages for the total/page-based
     equivalent, kept for API completeness only, not called by the frontend."""
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
 
     decoded_cursor = None
     if cursor is not None:
-        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, pending_only, include_cancelled)
+        decoded_cursor = decode_cursor(cursor, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, pending_only, include_cancelled, payer_ids=payer_ids, unbilled=unbilled)
 
     today = datetime.now(ZoneInfo(settings.business_timezone)).date()
     materialized_query = db.query(Booking)
@@ -171,7 +177,7 @@ def get_bookings(
     ## branch on pending-only: if true, only materialized bookings with a pending request are returned. else main branch runs
     if pending_only:
         base_query = materialized_query.filter(Booking.request.has(BookingRequest.status == 'pending'))
-        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
+        scoped_query = apply_scope_filters(base_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, payer_ids=payer_ids)
         # seek direction and sort order must flip together based on `order` - "next page" means
         # "after" when ascending but "before" when descending
         booking_key = tuple_(Booking.start, Booking.public_id)
@@ -184,7 +190,7 @@ def get_bookings(
         booking_rows = scoped_query.order_by(*sort_cols).limit(page_size + 1).all()
         facets = compute_timeline_facets(base_query, None, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, None, None, settings, db) # no series scoping for pending-only request
         items = [BookingResponse.model_validate(booking) for booking in booking_rows[:page_size]]
-        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, pending_only, include_cancelled) if len(booking_rows) > page_size else None
+        next_cursor = encode_cursor(items[-1].start, items[-1].id, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, pending_only, include_cancelled, payer_ids=payer_ids, unbilled=unbilled) if len(booking_rows) > page_size else None
         return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
 
     ## main branch
@@ -194,8 +200,14 @@ def get_bookings(
     facets = compute_timeline_facets(materialized_query, series_query, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, time_min, time_max, settings, db)
 
     # scope Bookings and BookingSeries by tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, using cursor as a start point
-    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
-    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids)
+    scoped_materialized_query = apply_scope_filters(materialized_query, Booking, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, payer_ids=payer_ids)
+    scoped_series_query = apply_scope_filters(series_query, BookingSeries, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, payer_ids=payer_ids)
+    # Unclaimed and chargeable
+    if unbilled:
+        scoped_materialized_query = scoped_materialized_query.filter(
+            Booking.invoice_id.is_(None),
+            or_(Booking.status == "confirmed", Booking.charge.isnot(None)),
+        )
     # seek direction must flip with `order` - "next page" means "after" ascending, "before" descending
     if decoded_cursor is not None:
         cursor_start, cursor_public_id = decoded_cursor
@@ -204,11 +216,49 @@ def get_bookings(
         past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
         scoped_materialized_query = scoped_materialized_query.filter(past_cursor)
 
+    # Sort and cap in SQL, same as the pending_only branch. The merge below can never consume more
+    # than page_size + 1 from either side, so fetching the whole seeked remainder is pure waste —
+    # a year of history on every page request. Not capped under unbilled, which drops rows in Python
+    # after the fetch (covered-by-plan sessions) and would otherwise hand back a short page.
+    sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
+    scoped_materialized_query = scoped_materialized_query.order_by(*sort_cols)
+    if not unbilled:
+        scoped_materialized_query = scoped_materialized_query.limit(page_size + 1)
+
     # execute queries, generate virtual occurrences from series rules (indefinite only — a bounded
     # series has every occurrence materialized, so it's already in scoped_materialized_bookings)
-    scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
+    if unbilled:
+        # Priced and filtered rather than just fetched: a session covered by a monthly plan would
+        # claim with no line (set_invoice_sources silently no-ops it), so it doesn't belong in a
+        # list of things that are actually addable. would_bill is what the picker shows per row.
+        scoped_materialized_bookings = []
+        for b in scoped_materialized_query.all():
+            amount = booking_amount(b)
+            if amount is None:
+                continue
+            resp = BookingResponse.model_validate(b)
+            resp.would_bill = float(amount)
+            scoped_materialized_bookings.append(resp)
+    else:
+        scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
+
     scoped_series = scoped_series_query.filter(indefinite_series_filter()).all()
     scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, page_size + 1, settings, decoded_cursor)
+
+    if unbilled:
+        # A virtual occurrence has no row yet — nothing has claimed it, so every one is eligible by
+        # construction. It's still priced and filtered the same way: not-yet-materialized is exactly
+        # the bill-ahead case, and resolve_ref materializes it the moment it's actually selected.
+        series_by_public_id = {s.public_id: s for s in scoped_series}
+        priced_virtuals = []
+        for resp in scoped_virtual_bookings:
+            series = series_by_public_id.get(resp.series_id)
+            amount = series_occurrence_amount(series, resp.start, resp.end) if series else None
+            if amount is None:
+                continue
+            resp.would_bill = float(amount)
+            priced_virtuals.append(resp)
+        scoped_virtual_bookings = priced_virtuals
 
     # merge into a sorted list, take first page_size's worth, encode a cursor as a bookmark and discard the tail
     # (the merge generates up to page_size's worth of materialized bookings and virtual occurrences generate up to 
@@ -225,7 +275,9 @@ def get_bookings(
         time_min,
         time_max,
         pending_only,
-        include_cancelled
+        include_cancelled,
+        payer_ids=payer_ids,
+        unbilled=unbilled,
     ) if len(merged) > page_size else None
 
     return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)

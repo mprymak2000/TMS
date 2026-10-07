@@ -72,6 +72,8 @@ const Clients = () => {
     // Two independent booleans, not one mode: a payer can also be enrolled, and ticking both finds them.
     const enrolled = params.get('enrolled') === 'true'
     const manages = params.get('manages') === 'true'
+    // 'enrolled' is ever-enrolled, this is an open stint. Different questions, so two boxes.
+    const currentlyEnrolled = params.get('currently_enrolled') === 'true'
 
     // setParams replaces the whole query string, so merge onto the previous one. An empty value is
     // deleted rather than written, otherwise clearing the search box leaves a trailing "?search=".
@@ -144,6 +146,7 @@ const Clients = () => {
             if (search.trim()) query.set('search', search.trim())
             if (enrolled) query.set('enrolled', 'true')
             if (manages) query.set('manages', 'true')
+            if (currentlyEnrolled) query.set('currently_enrolled', 'true')
             const res = await fetch(`${API}/contacts/?${query}`)
             if (!res.ok) {
                 setLoadError(extractError(await res.json(), 'Failed to load clients'))
@@ -163,10 +166,10 @@ const Clients = () => {
     useEffect(() => {
         loadContacts()
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [search, sort, direction, page, enrolled, manages])
+    }, [search, sort, direction, page, enrolled, manages, currentlyEnrolled])
 
     // Flipping a filter drops the page: page 3 of one set means nothing in another.
-    const toggleFilter = (key: 'enrolled' | 'manages', on: boolean) =>
+    const toggleFilter = (key: 'enrolled' | 'manages' | 'currently_enrolled', on: boolean) =>
         updateParams({ [key]: on ? 'true' : null, page: null })
 
     // Clicking the active column flips direction; a new column starts ascending. Either way the
@@ -271,6 +274,8 @@ const Clients = () => {
                         className="w-80"
                     />
                     <Checkbox label="Enrolled" checked={enrolled} onChange={e => toggleFilter('enrolled', e.currentTarget.checked)} />
+                    <Checkbox label="Currently enrolled" checked={currentlyEnrolled}
+                        onChange={e => toggleFilter('currently_enrolled', e.currentTarget.checked)} />
                     {/* "Payers" in the UI, `manages` on the wire: the column is booking authority,
                         but the person it describes is the one an invoice goes to. */}
                     <Checkbox label="Payers" checked={manages} onChange={e => toggleFilter('manages', e.currentTarget.checked)} />

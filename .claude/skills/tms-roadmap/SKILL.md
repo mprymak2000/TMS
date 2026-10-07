@@ -216,7 +216,16 @@ rather than trips through the slot picker, so a retired link's rules are read by
       **`rate` stayed a single float.** 10b replaced it — see the `prices` note below.
     - **10b — billing and invoicing.** Two passes. **Pass A shipped** (commit `8067859`): terms on
       the enrollment and the link, and a working invoice generator. **Pass B** is the remodel plus
-      the lifecycle fixes Pass A left open — see `.claude/plans/enrollment-pass-10b-billing-and-invoicing.md`.
+      the lifecycle fixes Pass A left open. **Both shipped.** Plans:
+      `done-enrollment-pass-10b-billing-and-invoicing.md`, and
+      `done-enrollment-pass-10c-billing-frontend.md` for the UI, **also shipped** — `/invoices`,
+      `/invoices/:id`, `/prices` and a first `/settings` page, plus the charge control, stint history
+      and `currently_enrolled` filter on existing pages. Two things changed in the building: the
+      invoicing API takes **refs rather than integer PKs**, because `?unbilled=true` lists an
+      indefinite series' *virtual* occurrences and putting one on an invoice is what materializes it
+      (billing a recurring client ahead of `extend_all_series` was otherwise impossible — it 409'd);
+      and `GET /invoices/candidates` was built and deleted in favour of that collection filter, the
+      Stripe shape, so filters/facets/cursor aren't reimplemented.
 
       **Pass B, in short** — the enrollment remodel plus an invoice lifecycle designed three times:
       refresh + a separate `InvoiceAdjustment` table (built and tested, then torn out); then frozen
@@ -249,7 +258,7 @@ rather than trips through the slot picker, so a retired link's rules are read by
       point at, so a raise can't reprice a past session and a bulk change is one `UPDATE` with
       grandfathering for free; automation drafts only, fanned out one job per payer. `invoice_type`/one-off-invoices-via-booking,
       the staleness flag, and locking were all designed and explicitly dropped — see CLAUDE.md for
-      why each one specifically didn't survive. Frontend slides to Pass C.
+      why each one specifically didn't survive. Frontend shipped as Pass C.
 
       **What shipped, and where it diverged from the original spec.** The spec called for
       `rate_per_session` XOR `rate_per_hour` XOR `rate_per_month` as three exclusive columns. That

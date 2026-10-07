@@ -39,6 +39,7 @@ interface FormState {
     bufferMinutes: number | null
     intervalMinutes: number | null
     price: number | null
+    priceUnit: string | null
     cancelMode: string
     cancelNoticeMinutes: number | null
     rescheduleMode: string
@@ -63,6 +64,7 @@ interface FormErrors {
     tutorRows?: string
     cancelNoticeMinutes?: string
     rescheduleNoticeMinutes?: string
+    priceUnit?: string
 }
 
 interface FormTouched {
@@ -91,6 +93,7 @@ const buildInitial = (link: BookingLink | null): FormState => ({
     bufferMinutes: link?.buffer_minutes ?? null,
     intervalMinutes: link?.interval_minutes ?? null,
     price: link?.price ?? null,
+    priceUnit: link?.price_unit ?? null,
     cancelMode: link?.cancel_mode ?? 'auto',
     cancelNoticeMinutes: link?.cancel_notice_minutes ?? null,
     rescheduleMode: link?.reschedule_mode ?? 'auto',
@@ -124,6 +127,8 @@ const validate = (f: FormState): FormErrors => {
         errs.cancelNoticeMinutes = 'Notice period is required'
     if (f.rescheduleMode && WINDOW_MODES.includes(f.rescheduleMode) && !(f.rescheduleNoticeMinutes && f.rescheduleNoticeMinutes > 0))
         errs.rescheduleNoticeMinutes = 'Notice period is required'
+    // The backend rejects an amount with no unit: 60 says nothing without per-session or per-hour.
+    if (f.price !== null && !f.priceUnit) errs.priceUnit = 'Pick a unit'
     return errs
 }
 
@@ -257,6 +262,7 @@ const LinkPage = () => {
         buffer_minutes: form.bufferMinutes,
         interval_minutes: form.intervalMinutes,
         price: form.price,
+        price_unit: form.priceUnit,
         cancel_mode: form.cancelMode,
         cancel_notice_minutes: form.cancelNoticeMinutes,
         reschedule_mode: form.rescheduleMode,
@@ -326,6 +332,7 @@ const LinkPage = () => {
         recurrence: !!(errors.recurCount),
         hosts: !!errors.tutorRows,
         cancellation: !!(errors.cancelNoticeMinutes || errors.rescheduleNoticeMinutes),
+        booking: !!errors.priceUnit,
     }
 
     const NAV_ITEMS = [
@@ -339,7 +346,7 @@ const LinkPage = () => {
         { tab: 'cancellation', label: 'reschedule & cancel', icon: IconBan,             hasError: tabHasError.cancellation },
         { tab: 'limits',       label: 'limits',       icon: IconAdjustmentsHorizontal },
         { heading: 'Booking' },
-        { tab: 'booking',      label: 'booking',      icon: IconCreditCard },
+        { tab: 'booking',      label: 'booking',      icon: IconCreditCard, hasError: tabHasError.booking },
     ] as const
 
     if (loading) return (
@@ -791,15 +798,29 @@ const LinkPage = () => {
                         {/* BOOKING */}
                         {activeTab === 'booking' && <>
                             <Group title="Pricing">
-                                <div className="p-4">
+                                <div className="p-4 flex gap-3 items-start">
                                     <NumberInput
                                         label="Price ($)"
-                                        description="Displayed on the booking page"
+                                        description="Charged when the client has no rate of their own"
                                         placeholder="Free / contact for pricing"
                                         size="sm"
                                         value={form.price ?? ''}
                                         onChange={val => handleNumericField('price', val)}
                                         min={0} decimalScale={2} className="w-44"
+                                    />
+                                    <Select
+                                        label="Per"
+                                        placeholder="Pick one"
+                                        size="sm"
+                                        data={[
+                                            { value: 'per_session', label: 'Session' },
+                                            { value: 'per_hour', label: 'Hour' },
+                                        ]}
+                                        value={form.priceUnit}
+                                        onChange={val => setForm(f => ({ ...f, priceUnit: val }))}
+                                        clearable
+                                        className="w-40"
+                                        error={errors.priceUnit}
                                     />
                                 </div>
                             </Group>

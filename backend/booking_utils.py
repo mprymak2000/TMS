@@ -272,8 +272,13 @@ def _ensure_occurrence(series: BookingSeries, start_utc: datetime, db: Session, 
         raise ValueError("Datetime is past the end of this series")
     # Must land exactly on the rule's grid: a whole number of steps from dtstart, same time of day.
     # Matching weekday alone would let an off-week date through once interval > 1.
+    #
+    # Compared at whole-second resolution, because a composite ref carries int(timestamp) — so a
+    # dtstart with microseconds (a client posting "…T16:00:00.123Z" at creation) would otherwise make
+    # every one of that series' virtual occurrences permanently unmaterializable.
     days_from_start = (start_local.date() - series.dtstart.date()).days
-    if days_from_start % series_step(series).days != 0 or start_local.time() != series.dtstart.time():
+    if days_from_start % series_step(series).days != 0 \
+            or start_local.time().replace(microsecond=0) != series.dtstart.time().replace(microsecond=0):
         raise ValueError("Datetime does not match series schedule")
     earliest = db.query(func.min(Booking.start)).filter(Booking.series_id == series.id).scalar()
     if earliest is not None:
@@ -635,8 +640,11 @@ def apply_series_time_scope(query, time_min: datetime | None, time_max: datetime
     return query
 
 
-def apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude=None):
-    """Take in a query and attach filters to it based on the provided scope parameters. Return the modified query."""
+def apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_ids, attendee_ids, exclude=None, payer_ids=None):
+    """Take in a query and attach filters to it based on the provided scope parameters. Return the modified query.
+
+    payer_ids has no facet of its own — it exists for the invoicing question ("everything this payer
+    is on"), which the attendee facet can't answer when one payer covers two dependents."""
     if tutor_ids and exclude != "tutor":
         query = query.filter(model.tutor_id.in_(tutor_ids))
     if booking_link_ids and exclude != "booking_link":
@@ -645,6 +653,8 @@ def apply_scope_filters(query, model, tutor_ids, booking_link_ids, booking_type_
         query = query.filter(model.booking_type_id.in_(booking_type_ids))
     if attendee_ids and exclude != "attendee":
         query = query.filter(model.attendee_id.in_(attendee_ids))
+    if payer_ids:
+        query = query.filter(model.payer_id.in_(payer_ids))
     return query
 
 
@@ -778,6 +788,8 @@ def _filters_fingerprint(
     pending_only,
     include_cancelled,
     series_id: str | None = None,
+    payer_ids=None,
+    unbilled: bool = False,
 ) -> str:
     """Compute a fingerprint of everything the current query is scoped to, to be included in the cursor for pagination. This allows the
     backend to detect when a cursor is being used against a different query than it was generated for, and reject
@@ -797,6 +809,8 @@ def _filters_fingerprint(
         "pending_only": pending_only,
         "include_cancelled": include_cancelled,
         "series_id": series_id,
+        "payer_ids": sorted(payer_ids or []),
+        "unbilled": unbilled,
     }, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
@@ -813,6 +827,8 @@ def encode_cursor(
     pending_only: bool,
     include_cancelled: bool,
     series_id: str | None = None,
+    payer_ids=None,
+    unbilled: bool = False,
 ) -> str:
     """Encode a cursor for pagination. Opaque token wrapping containing start timestamp, public_id tiebreaker and filter fingerprint"""
     fingerprint = _filters_fingerprint(
@@ -825,6 +841,8 @@ def encode_cursor(
         pending_only,
         include_cancelled,
         series_id,
+        payer_ids,
+        unbilled,
     )
     start_utc = start if start.tzinfo else start.replace(tzinfo=UTC)
     payload = {"start": int(start_utc.timestamp()), "public_id": public_id, "fingerprint": fingerprint}
@@ -844,6 +862,8 @@ def decode_cursor(
     pending_only,
     include_cancelled,
     series_id: str | None = None, # only used when getting occurrences of a series
+    payer_ids=None,
+    unbilled: bool = False,
 ) -> tuple[datetime, str]:
     """Decode a cursor for pagination. Extract start timestamp, public_id tiebreaker and filter fingerprint from opaque token"""
     try:
@@ -863,6 +883,8 @@ def decode_cursor(
         pending_only,
         include_cancelled,
         series_id,
+        payer_ids,
+        unbilled,
     )
     if fingerprint != expected_fingerprint:
         raise HTTPException(status_code=400, detail="Cursor does not match current filters")

@@ -102,6 +102,7 @@ def _series(link, tutor, payer_id, attendee_id, covered_by_enrollment_id=None):
             dtstart=datetime(2026, 3, 3, 16, 0), dtend=datetime(2026, 3, 3, 17, 0),
             price_id=link["price_id"], rate_id=_rate_id(db, attendee_id),
             covered_by_enrollment_id=covered_by_enrollment_id,
+            google_event_id=f"evt-series-{uuid4().hex[:8]}",
         )
         db.add(s)
         db.commit()
@@ -381,7 +382,7 @@ def test_new_work_is_selected_onto_the_draft(client, link, tutor):
 
     assert _generate(client) == []   # the invoice exists, so generate leaves it alone
     r = client.put(f"/invoices/{inv['id']}/lines", json={
-        "booking_ids": [first["id"], second["id"]], "item_ids": [],
+        "booking_ids": [first["public_id"], second["public_id"]], "item_ids": [],
     })
     assert _amounts(r.json()) == [80, 80]
 
@@ -394,11 +395,11 @@ def test_deselecting_releases_the_booking(client, link, tutor):
     assert len(inv["lines"]) == 2
 
     r = client.put(f"/invoices/{inv['id']}/lines", json={
-        "booking_ids": [first["id"]], "item_ids": [],
+        "booking_ids": [first["public_id"]], "item_ids": [],
     })
     assert _amounts(r.json()) == [80]
     # Released, so a fresh ad-hoc invoice can pick the dropped one up again.
-    again = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [second["id"]]})
+    again = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [second["public_id"]]})
     assert _amounts(again.json()) == [80]
 
 
@@ -820,9 +821,7 @@ def test_releasing_a_moved_booking_frees_the_live_row(client, link, tutor):
 
     # Freed, so the moved session is billable again rather than stranded. Named explicitly, since
     # it now sits in the future and the blanket sweep deliberately stops at now.
-    with TestingSessionLocal() as db:
-        moved_id = db.query(Booking).filter(Booking.public_id == moved["id"]).first().id
-    again = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [moved_id]})
+    again = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [moved["id"]]})
     assert _amounts(again.json()) == [80]
 
 
@@ -843,10 +842,10 @@ def test_cancelling_a_series_leaves_draft_lines_alone(client, link, tutor):
         )
         db.add(occ)
         db.commit()
-        occ_id = occ.id
+        occ_ref = occ.public_id
 
     # Billed ahead, deliberately — which is the only way a future occurrence gets claimed.
-    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [occ_id]}).json()
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [occ_ref]}).json()
     assert _amounts(inv) == [80]
 
     with TestingSessionLocal() as db:
@@ -877,7 +876,7 @@ def _future_booking(link, tutor, payer_id, attendee_id):
         )
         db.add(b)
         db.commit()
-        return b.id
+        return {"id": b.id, "public_id": b.public_id}
 
 
 def test_blanket_adhoc_sweep_stops_at_now(client, link, tutor):
@@ -894,8 +893,158 @@ def test_blanket_adhoc_sweep_stops_at_now(client, link, tutor):
 def test_a_named_future_booking_still_bills(client, link, tutor):
     """Collecting before the session is the point of picking it by hand."""
     c = _contact(client, "PrePaid")
-    future_id = _future_booking(link, tutor, c["id"], c["id"])
+    future = _future_booking(link, tutor, c["id"], c["id"])
 
-    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [future_id]}).json()
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [future["public_id"]]}).json()
     assert _amounts(inv) == [80]
-    assert inv["lines"][0]["booking_id"] == future_id
+    assert inv["lines"][0]["booking_id"] == future["id"]
+
+
+# --- the link's price round-trips ---
+
+def test_a_links_price_survives_the_round_trip(client, tutor):
+    """BookingLink.price_id resolved fine but the response read it through a relationship that
+    didn't exist, so every link came back unpriced and the editor loaded blank."""
+    schedule = client.post("/schedules", json={
+        "tutor_id": tutor["id"], "name": "All", "is_default": True, "timezone": "UTC",
+        "days": [{"day_of_week": d, "start_time": "00:00:00", "end_time": "23:59:00"} for d in range(7)],
+    }).json()
+    body = {
+        "slug": f"priced-{uuid4().hex[:6]}", "duration_minutes": 60,
+        "price": 80, "price_unit": "per_session",
+        "availability": [{"tutor_id": tutor["id"], "schedule_id": schedule["id"]}],
+    }
+    created = client.post("/booking_links/", json=body).json()
+    assert (created["price"], created["price_unit"]) == (80, "per_session")
+
+    fetched = client.get(f"/booking_links/{created['id']}").json()
+    assert (fetched["price"], fetched["price_unit"]) == (80, "per_session")
+
+
+def test_a_price_with_no_unit_is_rejected(client, tutor):
+    """What the link editor used to send. 80 says nothing without per-session or per-hour."""
+    schedule = client.post("/schedules", json={
+        "tutor_id": tutor["id"], "name": "All2", "is_default": True, "timezone": "UTC",
+        "days": [{"day_of_week": 0, "start_time": "00:00:00", "end_time": "23:59:00"}],
+    }).json()
+    r = client.post("/booking_links/", json={
+        "slug": "unitless", "duration_minutes": 60, "price": 80,
+        "availability": [{"tutor_id": tutor["id"], "schedule_id": schedule["id"]}],
+    })
+    assert r.status_code == 422
+
+
+def test_an_enrollments_payer_round_trips(client):
+    """payer_id decides who the invoice goes to; the client panel used to drop it from the payload."""
+    parent = _contact(client, "Payer")
+    kid = _contact(client, "Dependent")
+    enrolled = _enroll(client, kid["id"], rate=55, rate_unit="per_session", payer_id=parent["id"])
+    assert enrolled["payer_id"] == parent["id"]
+    assert client.get(f"/contacts/{kid['id']}").json()["enrollment"]["payer_id"] == parent["id"]
+
+
+# --- unbilled list and retotalling ---
+
+def test_unbilled_offers_what_else_could_be_billed(client, link, tutor):
+    """Feeds the pick-what's-included panel. A future session shows up so billing ahead is a tick."""
+    c = _contact(client, "Candidates")
+    _booking(link, tutor, c["id"], c["id"], day=5)
+    later = _booking(link, tutor, c["id"], c["id"], day=12)
+    future = _future_booking(link, tutor, c["id"], c["id"])
+
+    # Draft on one session only, so the other is still unclaimed and on offer.
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [later["public_id"]]}).json()
+    # Added after the draft existed — the case that has no other way onto it.
+    item = client.post("/invoice-items/", json={"payer_id": c["id"], "description": "Books", "amount": 25}).json()
+
+    offered = client.get(f"/bookings/?unbilled=true&payer_ids={c['id']}").json()["items"]
+    offered_ids = {b["id"] for b in offered}
+    assert later["public_id"] not in offered_ids    # already on the invoice
+    assert future["public_id"] in offered_ids
+    row = next(b for b in offered if b["id"] == future["public_id"])
+    assert row["would_bill"] == 80
+
+    pending = client.get(f"/invoice-items/?payer_id={c['id']}&pending=true").json()
+    assert [i["id"] for i in pending] == [item["id"]]
+
+
+def test_unbilled_offers_a_virtual_occurrence_and_materializes_it_on_add(client, link, tutor):
+    """The not-yet-materialized future of an indefinite series is real unbilled work — it shows up
+    unmaterialized, and only turns into a row at the moment it's actually selected (same
+    materialize-on-write-intent rule as reschedule/cancel), not just for being listed."""
+    c = _contact(client, "Indefinite")
+    sid = _series(link, tutor, c["id"], c["id"])
+    now = datetime.now(UTC)
+
+    offered = client.get("/bookings/", params={
+        "unbilled": "true", "payer_ids": c["id"],
+        "time_min": now.isoformat(), "time_max": (now + timedelta(days=90)).isoformat(),
+    }).json()["items"]
+    assert len(offered) >= 1
+    virtual = offered[0]
+    assert ":" in virtual["id"]         # composite ref — not a real row yet
+    assert virtual["would_bill"] == 80
+
+    with TestingSessionLocal() as db:
+        assert db.query(Booking).filter(Booking.series_id == sid).count() == 0
+
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [virtual["id"]]}).json()
+    assert _amounts(inv) == [80]
+    with TestingSessionLocal() as db:
+        # Selecting it is what turned the ref into a row.
+        assert db.query(Booking).filter(Booking.series_id == sid, Booking.public_id == virtual["id"]).count() == 1
+
+
+def test_unticking_recomputes_the_total(client, link, tutor):
+    """Deleting a child doesn't drop it from the parent's loaded collection, so summing straight
+    after a release left the total at its pre-release figure."""
+    c = _contact(client, "Retotal")
+    first = _booking(link, tutor, c["id"], c["id"], day=5)
+    _booking(link, tutor, c["id"], c["id"], day=12)
+    _booking(link, tutor, c["id"], c["id"], day=19)
+    inv = _generate(client)[0]
+    assert inv["total"] == 240
+
+    r = client.put(f"/invoices/{inv['id']}/lines", json={"booking_ids": [first["public_id"]], "item_ids": []}).json()
+    assert len(r["lines"]) == 1
+    assert r["total"] == 80
+
+    gone = client.delete(f"/invoices/{inv['id']}/lines/{r['lines'][0]['id']}").json()
+    assert gone["lines"] == []
+    assert gone["total"] == 0
+
+
+def test_a_fresh_database_can_still_invoice(client):
+    """get_settings used to 500 if nothing had touched /settings/ yet, which took out every route
+    needing a timezone — including invoice creation on a new deployment."""
+    c = _contact(client, "FreshDb")
+    r = client.post("/invoices/", json={"payer_id": c["id"]})
+    assert r.status_code == 409   # nothing to bill, but reached the sweep rather than crashing
+
+
+def test_a_series_with_sub_second_dtstart_can_still_materialize(client, link, tutor):
+    """A composite ref carries int(timestamp), so the grid check has to compare at whole seconds.
+    Comparing microseconds made every virtual occurrence of such a series unbillable forever."""
+    c = _contact(client, "Microseconds")
+    now = datetime.now(UTC)
+    with TestingSessionLocal() as db:
+        s = BookingSeries(
+            public_id=str(uuid4()), tutor_id=tutor["id"], booking_link_id=link["id"],
+            payer_id=c["id"], attendee_id=c["id"], price_id=link["price_id"],
+            # Sub-second precision, as a client posting "…T16:00:00.123456Z" would produce.
+            dtstart=(now + timedelta(days=3)).replace(tzinfo=None, microsecond=123456),
+            dtend=(now + timedelta(days=3, hours=1)).replace(tzinfo=None, microsecond=123456),
+            google_event_id="evt-micro",
+        )
+        db.add(s)
+        db.commit()
+
+    offered = client.get("/bookings/", params={
+        "unbilled": "true", "payer_ids": c["id"],
+        "time_max": (now + timedelta(days=30)).isoformat(),
+    }).json()["items"]
+    virtual = next(b for b in offered if ":" in b["id"])
+
+    inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [virtual["id"]]})
+    assert inv.status_code == 201, inv.text
+    assert _amounts(inv.json()) == [80]

@@ -75,6 +75,9 @@ export const bookingPayload = (b: Booking) => ({
     reschedule_mode: b.reschedule_mode,
     reschedule_notice_minutes: b.reschedule_notice_minutes,
     is_no_show: b.is_no_show,
+    // Carried for the same reason as the rest: left out, BookingUpdate defaults it to null, so
+    // marking a no-show or changing the type would quietly erase a charge override.
+    charge: b.charge,
 })
 
 export const seriesPayload = (s: BookingSeries) => ({

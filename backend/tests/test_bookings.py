@@ -2451,3 +2451,81 @@ def test_series_level_policy_is_independent_of_occurrence_policy(client):
     assert created["cancel_action"] == "auto", "one session is freely cancellable"
     series = client.get(f"/bookings/manage-series/{created['series_id']}").json()
     assert series["cancel_action"] == "request", "the whole series needs approval"
+
+
+def test_unbilled_cursor_round_trips(client):
+    """Regression test: the main branch's next_cursor must carry payer_ids/unbilled in its
+    fingerprint. Minted without them, decode_cursor rejects the cursor it just handed out, so an
+    unbilled list longer than one page could never be paged past the first."""
+    tutor, availability = make_tutor_with_schedule(client)
+    # Priced, or booking_amount returns None and the unbilled filter drops both rows.
+    link = client.post("/booking_links/", json={
+        **booking_link_standalone, "availability": availability, "price": 80, "price_unit": "per_session",
+    }).json()
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        for day in (10, 11):
+            client.post("/bookings/", json={
+                **booking_payload, "tutor_id": tutor["id"], "booking_link_id": link["id"],
+                "start": f"2099-06-{day}T16:00:00", "end": f"2099-06-{day}T17:00:00",
+            })
+
+    payer_id = client.get("/bookings/?time_min=2099-01-01T00:00:00").json()["items"][0]["payer"]["id"]
+    base = f"/bookings/?time_min=2099-01-01T00:00:00&unbilled=true&payer_ids={payer_id}&page_size=1"
+    page1 = client.get(base).json()
+    assert len(page1["items"]) == 1
+    assert page1["next_cursor"] is not None
+
+    page2 = client.get(f"{base}&cursor={page1['next_cursor']}")
+    assert page2.status_code == 200
+    body = page2.json()
+    assert len(body["items"]) == 1
+    assert body["items"][0]["id"] != page1["items"][0]["id"]
+
+
+def test_business_timezone_is_locked_while_a_series_runs(client):
+    """BookingSeries.dtstart is a naive business-local wall clock and Booking.start is absolute UTC;
+    Settings.business_timezone is the only thing tying them together. Moving it slides the rule's grid
+    off the rows already materialized from it, which duplicates occurrences in every listing and makes
+    emailed manage links for unmaterialized ones fail _ensure_occurrence's grid check. Rejected rather
+    than auto-shifted, since correcting a mislabelled zone and relocating the business want opposite
+    migrations and look identical here."""
+    before = client.get("/settings/").json()
+    assert before["timezone_locked"] is False
+    # Freely changeable until a series exists.
+    assert client.put("/settings/", json={
+        "business_timezone": "America/Chicago", "billing_automation_enabled": False,
+    }).status_code == 200
+
+    tutor, link = setup_recurring(client)
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        created = client.post("/bookings/", json={
+            **booking_payload, "tutor_id": tutor["id"], "booking_link_id": link["id"],
+        }).json()
+
+    assert client.get("/settings/").json()["timezone_locked"] is True
+    blocked = client.put("/settings/", json={
+        "business_timezone": "America/New_York", "billing_automation_enabled": False,
+    })
+    assert blocked.status_code == 409
+    assert "anchored" in blocked.json()["detail"]
+    assert client.get("/settings/").json()["business_timezone"] == "America/Chicago"
+
+    # The other field is unaffected — only the zone is anchored to anything.
+    assert client.put("/settings/", json={
+        "business_timezone": "America/Chicago", "billing_automation_enabled": True,
+    }).status_code == 200
+
+    # Cancelling the series releases the lock: it generates nothing and resolves no refs any more.
+    with patch("routers.bookings.get_calendar_service", return_value=mock_calendar_service()):
+        assert client.delete(f"/bookings/booking-series/{created['series_id']}").status_code == 200
+    assert client.get("/settings/").json()["timezone_locked"] is False
+    assert client.put("/settings/", json={
+        "business_timezone": "America/New_York", "billing_automation_enabled": True,
+    }).status_code == 200
+
+
+def test_an_invalid_business_timezone_is_rejected(client):
+    r = client.put("/settings/", json={
+        "business_timezone": "Mars/Olympus_Mons", "billing_automation_enabled": False,
+    })
+    assert r.status_code == 422

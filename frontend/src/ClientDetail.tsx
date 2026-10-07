@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { TextInput, NumberInput, Select, Button, Menu } from '@mantine/core'
-import { IconDotsVertical, IconTrash, IconPlus } from '@tabler/icons-react'
-import type { Contact, ContactListRow, ContactRelationships, Enrollment } from './types'
+import { IconDotsVertical, IconTrash, IconPlus, IconReceipt } from '@tabler/icons-react'
+import type { Contact, ContactListRow, ContactRelationships, Enrollment, InvoiceItem } from './types'
 import { extractError } from './utils'
+import ContactPicker from './ContactPicker'
+import AppModal, { ModalFooter } from './AppModal'
 
 const API = import.meta.env.VITE_API_URL
 
@@ -54,6 +56,16 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
             .catch(() => setRelationships(null))
     }, [client.id])
 
+    // Every stint, newest first. The roster and the section above carry only the open one, so this
+    // is the only place a closed stint's old rate is visible.
+    const [stints, setStints] = useState<Enrollment[]>([])
+    useEffect(() => {
+        fetch(`${API}/contacts/${client.id}/enrollments`)
+            .then(res => (res.ok ? res.json() : []))
+            .then(setStints)
+            .catch(() => setStints([]))
+    }, [client.id])
+
     const [first, setFirst] = useState(client.first_name)
     const [last, setLast] = useState(client.last_name)
     const [email, setEmail] = useState(client.email ?? '')
@@ -68,6 +80,9 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
     const [startedOn, setStartedOn] = useState(client.enrollment?.started_on ?? '')
     // Setting this closes the stint. The next save then opens a new one, which is what re-enrolling is.
     const [endedOn, setEndedOn] = useState(client.enrollment?.ended_on ?? '')
+    // Who gets the invoice. Null means they pay for themselves.
+    const [payerId, setPayerId] = useState<number | null>(client.enrollment?.payer_id ?? null)
+    const [charging, setCharging] = useState(false)
     const [grade, setGrade] = useState<number | string>(client.enrollment?.grade ?? '')
     const [birthday, setBirthday] = useState(client.enrollment?.birthday ?? '')
 
@@ -78,6 +93,7 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
         setEnrolling(withEnrollment || client.enrollment !== null)
         setRate(client.enrollment?.rate ?? ''); setRateUnit(client.enrollment?.rate_unit ?? null)
         setStartedOn(client.enrollment?.started_on ?? ''); setEndedOn(client.enrollment?.ended_on ?? '')
+        setPayerId(client.enrollment?.payer_id ?? null)
         setGrade(client.enrollment?.grade ?? ''); setBirthday(client.enrollment?.birthday ?? '')
         setFormError(null)
         setEditing(true)
@@ -85,7 +101,7 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
 
     // Both sides of the dirty check go through here, so the field list and key order match and
     // JSON.stringify can compare them. Only the fields EnrollmentInput accepts — it forbids extras,
-    // so `id`, `contact_id` and `payer_id` stay out.
+    // so `id` and `contact_id` stay out.
     const buildPayload = (
         c: Pick<ContactListRow, 'first_name' | 'last_name' | 'email' | 'phone'>,
         e: Enrollment | null,
@@ -100,6 +116,7 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                 ended_on: e.ended_on,
                 rate_unit: e.rate_unit,
                 rate: e.rate,
+                payer_id: e.payer_id,
                 grade: e.grade,
                 birthday: e.birthday,
             },
@@ -115,7 +132,8 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
         const payload = buildPayload(
             { first_name: first.trim(), last_name: last.trim(), email: email.trim(), phone: phone.trim() },
             enrolling ? {
-                id: 0, contact_id: client.id, payer_id: null,   // not sent; buildPayload drops them
+                id: 0, contact_id: client.id, rate_id: null,   // not sent; buildPayload drops them
+                payer_id: payerId,
                 started_on: startedOn,
                 ended_on: endedOn || null,
                 rate_unit: (rateUnit as Enrollment['rate_unit']) ?? null,
@@ -167,6 +185,13 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                             </Row>
                             <Row label="Started">{e.started_on}</Row>
                             {e.ended_on && <Row label="Ended">{e.ended_on}</Row>}
+                            {e.payer_id !== null && (
+                                <Row label="Billed to">
+                                    <button onClick={() => onSelect(e.payer_id!)} className="text-indigo-600 hover:underline">
+                                        View payer
+                                    </button>
+                                </Row>
+                            )}
                             {e.grade !== null && <Row label="Grade">{e.grade}</Row>}
                             {e.birthday && <Row label="Birthday">{e.birthday}</Row>}
                         </>
@@ -174,6 +199,23 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                         <p className="text-sm text-gray-400">Not enrolled — no negotiated rate, bookings use the link's price.</p>
                     )}
                 </Section>
+                {/* Only worth a section once there's more than the open stint showing above. */}
+                {stints.length > 1 && (
+                    <Section title="History">
+                        {stints.map(st => (
+                            <div key={st.id} className="flex items-baseline justify-between text-sm py-0.5">
+                                <span className={st.ended_on === null ? 'text-gray-700' : 'text-gray-400'}>
+                                    {st.started_on} → {st.ended_on ?? 'now'}
+                                </span>
+                                <span className={st.ended_on === null ? 'text-gray-700' : 'text-gray-400'}>
+                                    {st.rate === null
+                                        ? 'no rate'
+                                        : `$${st.rate}${st.rate_unit ? RATE_LABEL[st.rate_unit] : ''}`}
+                                </span>
+                            </div>
+                        ))}
+                    </Section>
+                )}
                 {/* Written by bookings, so shown only when there's something to show. */}
                 {relationships && relationships.manages.length > 0 && (
                     <Section title="Pays for">
@@ -206,12 +248,16 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                                     Enroll
                                 </Menu.Item>
                             )}
+                            <Menu.Item leftSection={<IconReceipt size={14} />} onClick={() => setCharging(true)}>
+                                Add a charge
+                            </Menu.Item>
                             <Menu.Item leftSection={<IconTrash size={14} />} color="red" onClick={onDelete}>
                                 Delete client
                             </Menu.Item>
                         </Menu.Dropdown>
                     </Menu>
                 </div>
+                {charging && <ChargeModal payerId={client.id} onClose={() => setCharging(false)} />}
             </>
         )
     }
@@ -244,6 +290,14 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                         <TextInput label="Started" type="date" value={startedOn} onChange={e => setStartedOn(e.target.value)} />
                         {/* Setting this closes the stint. Saving again afterwards opens a new one. */}
                         <TextInput label="Ended" type="date" value={endedOn} onChange={e => setEndedOn(e.target.value)} />
+                        <div className="col-span-2">
+                            <ContactPicker
+                                value={payerId}
+                                onChange={setPayerId}
+                                label="Billed to"
+                                placeholder="They pay for themselves"
+                            />
+                        </div>
                         <NumberInput label="Grade" value={grade} onChange={setGrade} min={0} />
                         <TextInput label="Birthday" type="date" value={birthday} onChange={e => setBirthday(e.target.value)} />
                     </div>
@@ -254,7 +308,63 @@ const ClientDetail = ({ client, onSaved, onSelect, onDelete, onRemoveEnrollment 
                 <Button variant="subtle" color="gray" onClick={() => setEditing(false)}>Cancel</Button>
                 <Button loading={saving} onClick={handleSave}>Save</Button>
             </div>
+            {charging && <ChargeModal payerId={client.id} onClose={() => setCharging(false)} />}
         </>
+    )
+}
+
+// A charge with no booking behind it: materials, a goodwill credit, a late fee. It sits pending
+// until the next invoice for this payer sweeps it, so there's nothing to pick a date for.
+const ChargeModal = ({ payerId, onClose }: { payerId: number; onClose: () => void }) => {
+    const [description, setDescription] = useState('')
+    const [amount, setAmount] = useState<number | string>('')
+    const [error, setError] = useState<string | null>(null)
+    const [saving, setSaving] = useState(false)
+    const [saved, setSaved] = useState<InvoiceItem | null>(null)
+
+    const submit = async () => {
+        if (!description.trim()) { setError('Say what it is for.'); return }
+        if (amount === '') { setError('An amount is required.'); return }
+        setSaving(true)
+        setError(null)
+        try {
+            const res = await fetch(`${API}/invoice-items/`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ payer_id: payerId, description: description.trim(), amount: Number(amount) }),
+            })
+            if (!res.ok) throw new Error(extractError(await res.json(), 'Failed to add charge'))
+            setSaved(await res.json())
+        } catch (e) {
+            setError(e instanceof Error ? e.message : 'Failed to add charge')
+        } finally {
+            setSaving(false)
+        }
+    }
+
+    return (
+        <AppModal opened onClose={onClose} title="Add a charge"
+            caption="Lands on the next invoice drawn up for this client. Negative for a credit.">
+            {saved ? (
+                <>
+                    <p className="text-sm text-gray-600">Added — it'll appear on their next invoice.</p>
+                    <ModalFooter>
+                        <Button onClick={onClose}>Done</Button>
+                    </ModalFooter>
+                </>
+            ) : (
+                <>
+                    <TextInput label="What for" placeholder="Workbook" value={description}
+                        onChange={e => setDescription(e.target.value)} mb="sm" />
+                    <NumberInput label="Amount ($)" value={amount} onChange={setAmount} decimalScale={2} />
+                    {error && <p className="text-sm text-red-500 mt-3">{error}</p>}
+                    <ModalFooter>
+                        <Button variant="default" onClick={onClose}>Cancel</Button>
+                        <Button onClick={submit} loading={saving}>Add</Button>
+                    </ModalFooter>
+                </>
+            )}
+        </AppModal>
     )
 }
 

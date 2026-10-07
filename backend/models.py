@@ -363,6 +363,7 @@ class BookingLink(Base):
     interval_minutes = Column(Integer, nullable=True)  # step between slot start times; null = fall back to duration_minutes (slots don't overlap). e.g. 3hr window + 90min session + 30min interval = 3 possible start times
 
     booking_type = relationship("BookingType")
+    price = relationship("Price")
     availability = relationship("BookingLinkAvailability", back_populates="booking_link", cascade="all, delete-orphan")
 
 
@@ -703,6 +704,9 @@ class InvoiceLine(Base):
     adjustment_percent = Column(Numeric(5, 2), nullable=True)
 
     invoice = relationship("Invoice", back_populates="lines")
+    # Read-only, so the response can expose the booking's ref. The picker sends refs back (a virtual
+    # occurrence has no int id to send), and a line only knows its internal booking_id otherwise.
+    booking = relationship("Booking")
 
 
 class InvoiceItem(Base):

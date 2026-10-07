@@ -33,6 +33,9 @@ class SettingsResponse(BaseModel):
     id: int
     business_timezone: str
     billing_automation_enabled: bool
+    # Set by the router, not a column: whether an active series currently anchors to the zone. Lets
+    # the UI disable the field with a reason instead of offering a change that would 409.
+    timezone_locked: bool = False
 
 
 class TutorCreate(_Input):
@@ -594,6 +597,16 @@ class BookingLinkResponse(BaseModel):
 
     availability: list[BookingLinkAvailabilityResponse] = []
 
+    @computed_field
+    @property
+    def price(self) -> float | None:
+        return self.price_row.amount if self.price_row else None
+
+    @computed_field
+    @property
+    def price_unit(self) -> str | None:
+        return self.price_row.unit if self.price_row else None
+
 
 _VALID_REQUEST_TYPES = ('cancel_occurrence', 'reschedule_occurrence', 'cancel_series', 'reschedule_series')
 _RESCHEDULE_TYPES = ('reschedule_occurrence', 'reschedule_series')
@@ -682,6 +695,10 @@ class BookingResponse(BaseModel):
     cancel_notice_minutes: int | None = None
     reschedule_mode: str
     reschedule_notice_minutes: int | None = None
+    # Set only by GET /bookings/?unbilled=true — what this session would bill if put on an invoice
+    # now. None everywhere else; not a computed_field, since a virtual occurrence has no price/rate
+    # relationship on the response to compute it from.
+    would_bill: float | None = None
 
     # On the schema, not the model, so virtual occurrences get it too — they're built in memory and
     # never have a row to read a property off.
@@ -950,11 +967,15 @@ class InvoiceGenerate(_Input):
 class InvoiceCreate(_Input):
     """Draft one invoice for one payer. With no period and no explicit ids, sweeps everything
     currently outstanding for them, whenever it's from. A period, if given, scopes which bookings
-    are eligible; booking_ids/item_ids narrow further within it, never escape it."""
+    are eligible; booking_ids/item_ids narrow further within it, never escape it.
+
+    booking_ids are refs (public_id, or the composite form for a not-yet-materialized series
+    occurrence) — resolve_ref materializes one if needed, which is how billing ahead of a session
+    that only exists virtually actually works."""
     payer_id: int
     period_start: date | None = None
     period_end: date | None = None
-    booking_ids: list[int] | None = None
+    booking_ids: list[str] | None = None
     item_ids: list[int] | None = None
 
     @model_validator(mode="after")
@@ -977,6 +998,14 @@ class InvoicePaymentUpdate(_Input):
     payment_status: Literal["unpaid", "paid"]
 
 
+class BookingRefOnly(BaseModel):
+    """Just enough of a Booking to name it. Lets an invoice line expose its booking's ref without
+    pulling the whole BookingResponse (which needs policy, contacts and a computed verdict)."""
+    model_config = ConfigDict(from_attributes=True)
+
+    public_id: str
+
+
 class InvoiceLineResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -989,11 +1018,19 @@ class InvoiceLineResponse(BaseModel):
     enrollment_id: int | None = None
     booking_id: int | None = None
     invoice_item_id: int | None = None
+    # The booking's ref, so the picker can send this line back as still-selected. Null once the
+    # booking is gone (series cancel hard-deletes), same as booking_id.
+    booking_row: BookingRefOnly | None = Field(default=None, validation_alias="booking", exclude=True)
 
     @computed_field
     @property
     def charged_amount(self) -> float:
         return line_charged_amount(self)
+
+    @computed_field
+    @property
+    def booking_ref(self) -> str | None:
+        return self.booking_row.public_id if self.booking_row else None
 
 
 class InvoiceResponse(BaseModel):
@@ -1032,11 +1069,29 @@ class InvoiceLineAdjustmentInput(_Input):
         return self
 
 
+class InvoiceCandidate(BaseModel):
+    """One thing that could be added to an invoice. `label` is built here rather than on the client
+    so the list and the generated line read the same way."""
+    id: int
+    label: str
+    amount: float | None = None   # null when nothing prices it yet
+    occurred_on: date | None = None   # null for an item, which is dateless
+    is_future: bool = False
+
+
+class InvoiceCandidatesResponse(BaseModel):
+    bookings: list[InvoiceCandidate]
+    items: list[InvoiceCandidate]
+
+
 class InvoiceSourcesUpdate(_Input):
     """The complete desired set of claimed bookings/items on a draft, not a delta — matches the
     full-replacement PUT convention used elsewhere. The monthly line isn't included here; it isn't
-    selectable."""
-    booking_ids: list[int]
+    selectable.
+
+    booking_ids are refs, same as InvoiceCreate — ticking a virtual occurrence in the picker
+    materializes it via resolve_ref before it's claimed."""
+    booking_ids: list[str]
     item_ids: list[int]
 
 

@@ -5,6 +5,10 @@ import Clients from './Clients'
 import Availability from './Availability'
 import Links from './Links'
 import LinkPage from './LinkPage'
+import Invoices from './Invoices'
+import Prices from './Prices'
+import Settings from './Settings'
+import InvoicePage from './InvoicePage'
 import BookingPage from './BookingPage'
 import BookingsLayout from './BookingsLayout'
 import ScheduleTab from './ScheduleTab'
@@ -27,6 +31,9 @@ const navItems = [
   { to: '/availability', label: 'Availability' },
   { to: '/links', label: 'Links' },
   { to: '/bookings', label: 'Bookings' },
+  { to: '/invoices', label: 'Invoices' },
+  { to: '/prices', label: 'Prices' },
+  { to: '/settings', label: 'Settings' },
 ]
 
 function App() {
@@ -108,6 +115,10 @@ function App() {
                 <Route path="/availability" element={<Availability />} />
                 <Route path="/links" element={<Links />} />
                 <Route path="/links/:id" element={<LinkPage />} />
+                <Route path="/invoices" element={<Invoices />} />
+                <Route path="/invoices/:id" element={<InvoicePage />} />
+                <Route path="/prices" element={<Prices />} />
+                <Route path="/settings" element={<Settings />} />
                 <Route path="/bookings" element={<BookingsLayout />}>
                   <Route index element={<ScheduleTab />} />
                   <Route path="recurring" element={<RecurringTab />} />

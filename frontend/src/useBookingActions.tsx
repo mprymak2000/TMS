@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { Button, Menu, Select } from '@mantine/core'
+import { Button, Menu, NumberInput, Select } from '@mantine/core'
 import AppModal, { ModalFooter } from './AppModal'
-import { IconCalendarEvent, IconRefresh, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink, IconShieldCog } from '@tabler/icons-react'
+import { IconCalendarEvent, IconRefresh, IconBan, IconTrash, IconUserOff, IconAlertCircle, IconLink, IconShieldCog, IconCurrencyDollar } from '@tabler/icons-react'
 import { useNavigate } from 'react-router-dom'
 import type { Booking, BookingLink, BookingType } from './types'
 import { formatDate, extractError, attendeeName, bookingPayload } from './utils'
@@ -42,6 +42,9 @@ export const useBookingActions = ({
     const [reassigning, setReassigning] = useState(false)
     const [reassignTarget, setReassignTarget] = useState<string | null>(null)
     const [editingPolicy, setEditingPolicy] = useState(false)
+    const [editingCharge, setEditingCharge] = useState(false)
+    // '' is "bill it normally" (null on the wire); 0 is a deliberate freebie. Two different things.
+    const [charge, setCharge] = useState<number | string>(booking.charge ?? '')
 
     // The roster includes archived links so existing rows can resolve their source — but an
     // archived link is never a valid target to move a booking onto.
@@ -176,6 +179,33 @@ export const useBookingActions = ({
         }
     }
 
+    const handleCharge = async () => {
+        setIsSubmitting(true)
+        try {
+            const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    ...bookingPayload(booking),
+                    charge: charge === '' ? null : Number(charge),
+                }),
+            })
+            if (!res.ok) {
+                onError(extractError(await res.json(), 'Failed to set the charge.'))
+                return
+            }
+            const updated = await res.json()
+            setEditingCharge(false)
+            if (onBookingUpdated) onBookingUpdated(updated)
+            else onRefresh('Charge updated')
+        } catch (error) {
+            console.error(error)
+            onError('Failed to set the charge.')
+        } finally {
+            setIsSubmitting(false)
+        }
+    }
+
     const handleNoShow = async () => {
         try {
             const res = await fetch(`${import.meta.env.VITE_API_URL}/bookings/${booking.id}`, {
@@ -255,6 +285,11 @@ export const useBookingActions = ({
             <Menu.Item leftSection={<IconShieldCog size={14} />} disabled={booking.status !== 'confirmed'} onClick={() => setEditingPolicy(true)}>
                 Change policy
             </Menu.Item>
+            {/* Allowed even once this session is on a draft invoice — that line's amount was frozen
+                when it was generated, so this only affects what a later invoice would bill. */}
+            <Menu.Item leftSection={<IconCurrencyDollar size={14} />} onClick={() => { setCharge(booking.charge ?? ''); setEditingCharge(true) }}>
+                {booking.charge === null ? 'Set a charge' : 'Change the charge'}
+            </Menu.Item>
             <Menu.Item leftSection={<IconUserOff size={14} />} color="orange" disabled={booking.status !== 'confirmed'} onClick={handleNoShow}>
                 Mark as no-show
             </Menu.Item>
@@ -279,6 +314,24 @@ export const useBookingActions = ({
 
     const modals = (
         <>
+            <AppModal opened={editingCharge} onClose={() => setEditingCharge(false)}
+                title="Charge for this session"
+                caption="Overrides the client's rate and the link's price for this one session. Leave it empty to bill normally; 0 makes it free.">
+                <NumberInput
+                    label="Charge ($)"
+                    placeholder="Bill normally"
+                    value={charge}
+                    onChange={setCharge}
+                    min={0}
+                    decimalScale={2}
+                    className="w-44"
+                />
+                <ModalFooter>
+                    <Button variant="subtle" color="gray" onClick={() => setEditingCharge(false)}>Cancel</Button>
+                    <Button loading={isSubmitting} onClick={handleCharge}>Save</Button>
+                </ModalFooter>
+            </AppModal>
+
             <AppModal opened={reassigning} onClose={() => setReassigning(false)}
                 title="Reassign booking link"
                 caption="This booking's link was archived, so its scheduling rules no longer apply and it can't be rescheduled. Pointing it at an active link restores that. Nothing else about the booking changes.">

@@ -38,6 +38,7 @@ export interface Enrollment {
   ended_on: string | null
   rate_unit: 'per_session' | 'per_hour' | 'per_month' | null
   rate: number | null
+  rate_id: number | null
   payer_id: number | null
   grade: number | null
   birthday: string | null
@@ -124,6 +125,7 @@ export interface BookingLink {
   booker_can_set_recur_until: boolean
   booker_can_set_count: boolean
   price: number | null
+  price_unit: 'per_session' | 'per_hour' | null
   buffer_minutes: number | null
   interval_minutes: number | null
   cancel_mode: string
@@ -176,6 +178,9 @@ export interface Booking {
   cancel_action: 'auto' | 'request' | 'blocked'
   reschedule_action: 'auto' | 'request' | 'blocked'
   request: BookingRequest | null
+  charge: number | null
+  // Only set by GET /bookings/?unbilled=true — what this session would bill if invoiced now.
+  would_bill: number | null
 }
 
 export interface BookingSeries {
@@ -272,4 +277,70 @@ export interface BookingRequest {
   requested_tutor_id: number | null
   reason: string | null
   created_at: string
+}
+// A line is generated once and frozen. `amount` is what it was computed at and never changes;
+// `charged_amount` applies whichever adjustment is set. "Was $80, now $60" reads off both.
+// Exactly one of the three source ids is set, and all three can go null if the source is deleted.
+export interface InvoiceLine {
+  id: number
+  description: string
+  amount: number
+  adjustment_amount: number | null
+  adjustment_percent: number | null
+  charged_amount: number
+  enrollment_id: number | null
+  booking_id: number | null
+  invoice_item_id: number | null
+  // The booking's ref, for sending this line back as still-selected. Null once the booking is gone.
+  booking_ref: string | null
+}
+
+export interface Invoice {
+  id: string              // public_id
+  payer_id: number
+  payer_name: string
+  period_start: string | null   // null = ad-hoc, not tied to a period
+  period_end: string | null
+  status: 'draft' | 'finalized' | 'void'
+  payment_status: 'unpaid' | 'paid'
+  number: string | null   // allocated at finalize, so null on a draft
+  total: number
+  sent_at: string | null
+  paid_at: string | null
+  created: string
+  lines: InvoiceLine[]
+}
+
+export interface InvoicePagedResponse {
+  items: Invoice[]
+  total: number
+}
+
+// A charge with no booking behind it. invoice_id null means still pending.
+export interface InvoiceItem {
+  id: number
+  payer_id: number
+  description: string
+  amount: number
+  invoice_id: number | null
+  created: string
+}
+
+// Immutable: a change inserts a new row. Nameless by design.
+export interface Price {
+  id: number
+  amount: number
+  unit: 'per_session' | 'per_hour' | 'per_month'
+  archived_at: string | null
+}
+
+
+
+// Business-wide singleton. billing_automation_enabled gates the monthly drafting job.
+export interface Settings {
+  id: number
+  business_timezone: string
+  billing_automation_enabled: boolean
+  // True while a running series anchors to the zone, which makes changing it a 409.
+  timezone_locked: boolean
 }
