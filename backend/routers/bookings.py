@@ -216,23 +216,29 @@ def get_bookings(
         past_cursor = booking_key < cursor_key if order == "desc" else booking_key > cursor_key
         scoped_materialized_query = scoped_materialized_query.filter(past_cursor)
 
-    # Sort and cap in SQL, same as the pending_only branch. The merge below can never consume more
-    # than page_size + 1 from either side, so fetching the whole seeked remainder is pure waste —
-    # a year of history on every page request. Not capped under unbilled, which drops rows in Python
-    # after the fetch (covered-by-plan sessions) and would otherwise hand back a short page.
+    # Sort and cap in SQL unconditionally — unbilled used to skip this because the Python filter
+    # below (covered-by-plan sessions) can shrink survivors under page_size even when the raw fetch
+    # was full, but that's now handled by tracking "did we hit the cap" separately from "how many
+    # survived", not by fetching everything. See the has_more logic below.
     sort_cols = (Booking.start.desc(), Booking.public_id.desc()) if order == "desc" else (Booking.start.asc(), Booking.public_id.asc())
-    scoped_materialized_query = scoped_materialized_query.order_by(*sort_cols)
-    if not unbilled:
-        scoped_materialized_query = scoped_materialized_query.limit(page_size + 1)
+    scoped_materialized_query = scoped_materialized_query.order_by(*sort_cols).limit(page_size + 1)
 
     # execute queries, generate virtual occurrences from series rules (indefinite only — a bounded
     # series has every occurrence materialized, so it's already in scoped_materialized_bookings)
+    raw_materialized = scoped_materialized_query.all()
+    materialized_hit_limit = len(raw_materialized) > page_size
     if unbilled:
         # Priced and filtered rather than just fetched: a session covered by a monthly plan would
         # claim with no line (set_invoice_sources silently no-ops it), so it doesn't belong in a
         # list of things that are actually addable. would_bill is what the picker shows per row.
+        #
+        # This filter runs after the cap, so survivors can come up short of page_size even though
+        # materialized_hit_limit (captured above, before filtering) says there's more past the cap
+        # we never looked at — a payer whose only activity is one long-running fully-covered monthly
+        # series will filter an entire raw batch to nothing. has_more below is what carries that
+        # signal forward instead of the (now unreliable) survivor count.
         scoped_materialized_bookings = []
-        for b in scoped_materialized_query.all():
+        for b in raw_materialized:
             amount = booking_amount(b)
             if amount is None:
                 continue
@@ -240,18 +246,22 @@ def get_bookings(
             resp.would_bill = float(amount)
             scoped_materialized_bookings.append(resp)
     else:
-        scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in scoped_materialized_query.all()]
+        scoped_materialized_bookings = [BookingResponse.model_validate(b) for b in raw_materialized]
 
     scoped_series = scoped_series_query.filter(indefinite_series_filter()).all()
-    scoped_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, page_size + 1, settings, decoded_cursor)
+    raw_virtual_bookings = scoped_virtual_occurrences(scoped_series, time_min, time_max, page_size + 1, settings, decoded_cursor)
+    virtual_hit_limit = len(raw_virtual_bookings) > page_size
+    scoped_virtual_bookings = raw_virtual_bookings
 
     if unbilled:
         # A virtual occurrence has no row yet — nothing has claimed it, so every one is eligible by
         # construction. It's still priced and filtered the same way: not-yet-materialized is exactly
         # the bill-ahead case, and resolve_ref materializes it the moment it's actually selected.
+        # Same post-cap-filter shape as materialized above — virtual_hit_limit was captured before
+        # this runs, for the same reason.
         series_by_public_id = {s.public_id: s for s in scoped_series}
         priced_virtuals = []
-        for resp in scoped_virtual_bookings:
+        for resp in raw_virtual_bookings:
             series = series_by_public_id.get(resp.series_id)
             amount = series_occurrence_amount(series, resp.start, resp.end) if series else None
             if amount is None:
@@ -265,9 +275,47 @@ def get_bookings(
     # page_size's worth of virtual bookings. Generate each in parallel, merge and order, cut off the tail)
     merged = merge_occurrences(scoped_virtual_bookings, scoped_materialized_bookings, order)
     items = merged[:page_size]
+
+    # Two independent "more might exist" signals, OR'd together:
+    #   - len(merged) > page_size: we already fetched more than we're serving this page (true
+    #     whenever the raw fetch itself was bigger than page_size, filtering or not — the shape this
+    #     always worked on).
+    #   - materialized_hit_limit / virtual_hit_limit: the raw fetch hit its own cap, so there may be
+    #     unexamined rows past it, even though the post-filter survivor count alone doesn't show it.
+    # Both are needed: the first alone misses the all-filtered-out-batch case above; capping without
+    # the second would silently truncate pagination the moment a filtered batch came up short.
+    has_more = len(merged) > page_size or materialized_hit_limit or virtual_hit_limit
+
+    if not has_more:
+        cursor_start = cursor_id = None
+    elif items:
+        cursor_start, cursor_id = items[-1].start, items[-1].id
+    else:
+        # Degenerate case: every row/occurrence this page examined got filtered out, so there's
+        # nothing to serve, but more may exist past where we stopped looking (has_more is true).
+        # Resume from the EARLIER of the two raw batches' own last position, not from a served item
+        # (there isn't one) — safe because it's at or before both subsystems' actual stopping point,
+        # so neither can skip data; it may redundantly re-examine a little already-filtered ground on
+        # whichever side went further, which costs a bit, never correctness.
+        #
+        # This mirrors Google Calendar's own documented events.list contract for the identical
+        # reason (recurring-event expansion plus a post-expansion filter): "[a page] may include...
+        # none at all, even if there are more events matching the query," alongside a valid
+        # nextPageToken — an empty page with a cursor is a normal, expected shape here too.
+        # SQLite (tests only) drops tzinfo on read, so raw_materialized's start can come back naive
+        # while raw_virtual_bookings' is always built tz-aware — guard before comparing, same idiom
+        # used throughout booking_utils.py.
+        raw_positions = []
+        if raw_materialized:
+            raw_start = raw_materialized[-1].start
+            raw_positions.append((raw_start if raw_start.tzinfo else raw_start.replace(tzinfo=UTC), raw_materialized[-1].public_id))
+        if raw_virtual_bookings:
+            raw_positions.append((raw_virtual_bookings[-1].start, raw_virtual_bookings[-1].id))
+        cursor_start, cursor_id = min(raw_positions)
+
     next_cursor = encode_cursor(
-        items[-1].start,
-        items[-1].id,
+        cursor_start,
+        cursor_id,
         tutor_ids,
         booking_link_ids,
         booking_type_ids,
@@ -278,7 +326,7 @@ def get_bookings(
         include_cancelled,
         payer_ids=payer_ids,
         unbilled=unbilled,
-    ) if len(merged) > page_size else None
+    ) if cursor_start is not None else None
 
     return BookingListResponse(items=items, next_cursor=next_cursor, facets=facets)
 

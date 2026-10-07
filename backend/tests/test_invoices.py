@@ -1048,3 +1048,39 @@ def test_a_series_with_sub_second_dtstart_can_still_materialize(client, link, tu
     inv = client.post("/invoices/", json={"payer_id": c["id"], "booking_ids": [virtual["id"]]})
     assert inv.status_code == 201, inv.text
     assert _amounts(inv.json()) == [80]
+
+
+def test_unbilled_pagination_survives_an_entirely_covered_batch(client, link, tutor):
+    """Regression test: a payer whose nearest activity is all covered-by-plan sessions used to
+    terminate pagination after one short/empty page, because next_cursor was minted off the
+    post-filter survivor count. A real billable booking sitting further out never surfaced.
+
+    booking_amount drops covered rows after the SQL fetch, so capping that fetch at page_size + 1
+    can produce a raw batch that filters down to nothing — this reproduces exactly that, with the
+    cap set low enough (page_size=2) that the five covered bookings don't fit in one raw batch."""
+    payer = _contact(client, "Covered")
+    enrollment = _enroll(client, payer["id"], rate=100, rate_unit="per_month")
+    series_id = _series(link, tutor, payer["id"], payer["id"], covered_by_enrollment_id=enrollment["id"])
+    with TestingSessionLocal() as db:
+        # Bounded, not indefinite: a finite covered plan has every occurrence already materialized
+        # (see "A bounded series materializes every occurrence at creation" elsewhere), so it
+        # contributes nothing through scoped_virtual_occurrences. Keeps this test isolated to the
+        # materialized-side fix rather than also exercising the indefinite-series virtual walk.
+        db.query(BookingSeries).filter(BookingSeries.id == series_id).update({"count": 10})
+        db.commit()
+
+    for day in range(3, 7):  # 4 covered sessions, days 3-6
+        _booking(link, tutor, payer["id"], payer["id"], day=day, series_id=series_id,
+                  rate_id=enrollment["rate_id"])
+    billable = _booking(link, tutor, payer["id"], payer["id"], day=20)  # genuinely billable, later
+
+    params = {"unbilled": "true", "payer_ids": payer["id"], "page_size": 2,
+              "time_min": "2026-03-01T00:00:00Z", "time_max": "2026-04-01T00:00:00Z"}
+    page1 = client.get("/bookings/", params=params).json()
+    assert page1["items"] == []
+    assert page1["next_cursor"] is not None  # more to look at, even though this batch served nothing
+
+    page2 = client.get("/bookings/", params={**params, "cursor": page1["next_cursor"]}).json()
+    ids = [b["id"] for b in page2["items"]]
+    assert billable["public_id"] in ids
+    assert page2["next_cursor"] is None  # genuinely exhausted now
